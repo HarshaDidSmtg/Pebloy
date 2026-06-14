@@ -1,0 +1,28 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="BDeploy logo">
+  <!-- Outer rounded square -->
+  <rect width="256" height="256" rx="48" fill="#0f172a"/>
+  <!-- Inner glow ring -->
+  <rect x="8" y="8" width="240" height="240" rx="42" fill="none" stroke="#334155" stroke-width="2"/>
+
+  <!-- Left database cylinder -->
+  <ellipse cx="76" cy="96" rx="32" ry="10" fill="#38bdf8"/>
+  <rect x="44" y="96" width="64" height="44" fill="#0284c7"/>
+  <ellipse cx="76" cy="140" rx="32" ry="10" fill="#38bdf8"/>
+  <!-- DB shine -->
+  <ellipse cx="76" cy="96" rx="24" ry="7" fill="#7dd3fc" opacity="0.35"/>
+
+  <!-- Right database cylinder -->
+  <ellipse cx="180" cy="96" rx="32" ry="10" fill="#34d399"/>
+  <rect x="148" y="96" width="64" height="44" fill="#059669"/>
+  <ellipse cx="180" cy="140" rx="32" ry="10" fill="#34d399"/>
+  <!-- DB shine -->
+  <ellipse cx="180" cy="96" rx="24" ry="7" fill="#6ee7b7" opacity="0.35"/>
+
+  <!-- Bridge / arrows between DBs -->
+  <path d="M114 118 L142 118" stroke="#f8fafc" stroke-width="5" stroke-linecap="round"/>
+  <path d="M132 110 L144 118 L132 126" fill="none" stroke="#f8fafc" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M124 110 L112 118 L124 126" fill="none" stroke="#94a3b8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Label: DB -->
+  <text x="128" y="196" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="26" font-weight="700" fill="#f8fafc" letter-spacing="3">BDeploy</text>
+</svg>

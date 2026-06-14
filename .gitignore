@@ -1,0 +1,49 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build output
+dist/
+out/
+build/*.ico
+build/*.icns
+build/*.png
+
+# Runtime data
+data/app-state.json
+data/profiles.json
+data/secrets.json
+data/server-info.json
+data/settings.json
+
+# Artifacts generated at runtime
+artifacts/
+
+# Vendored PowerShell modules (installed at runtime via Save-Module)
+vendor/ps-modules/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Temp files
+artifacts/temp/
+
+# Editor / OS
+.vscode/settings.json
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code internal
+.claude/
+
+# Test results
+coverage/
+junit.xml

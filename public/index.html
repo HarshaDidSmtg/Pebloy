@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BDeploy</title>
+    <link rel="stylesheet" href="style.css" />
+    <link rel="icon" href="logo.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand-wrap">
+        <img src="logo.svg" alt="BDeploy logo" class="app-logo" />
+        <div>
+          <h1>BDeploy</h1>
+          <p>Streamlined SQL Server schema management</p>
+        </div>
+      </div>
+      <div class="header-tools">
+        <div class="theme-picker" id="themePicker"></div>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="credentials">Connections</button>
+      <button class="tab" data-tab="objects">Objects</button>
+      <button class="tab" data-tab="diff">Code Diff</button>
+      <button class="tab" data-tab="backup">Backup</button>
+      <button class="tab" data-tab="deploy">Deployment</button>
+      <button class="tab" data-tab="logs">Logs</button>
+      <button class="tab" data-tab="customize">Settings</button>
+    </nav>
+
+    <main>
+      <section class="panel active" id="tab-credentials">
+        <h2>Connections</h2>
+        <form id="profileForm" class="grid-form">
+          <input type="hidden" id="profileId" />
+          <label>Connection Alias <input id="profileLabel" required /></label>
+          <label>SQL Server <input id="serverName" required /></label>
+          <label>Database <input id="databaseName" required /></label>
+          <label>
+            Authentication
+            <select id="authenticationType">
+              <option value="Windows">Windows</option>
+              <option value="Sql">SQL</option>
+            </select>
+          </label>
+          <label id="usernameField" class="credentials-sql-only">Username <input id="username" /></label>
+          <label id="passwordField" class="credentials-sql-only">Password <input id="password" type="password" autocomplete="new-password" /></label>
+          <label>Environment <input id="environmentTag" placeholder="DEV/QA/UAT/PROD" /></label>
+          <div class="row-actions">
+            <button type="submit">Save Profile</button>
+            <button type="button" id="clearProfile">Clear</button>
+          </div>
+        </form>
+        <div class="row-actions">
+          <button id="exportProfiles" type="button" class="btn-ghost">Export Connections</button>
+          <button id="importProfilesBtn" type="button" class="btn-ghost">Import Connections</button>
+          <input type="file" id="importProfilesFile" accept=".json" hidden />
+        </div>
+        <div id="profilesTable"></div>
+        <h3>Connection Diagnostics</h3>
+        <pre id="diagnosticsResult" class="result">Run diagnostics from a connection row.</pre>
+      </section>
+
+      <section class="panel" id="tab-diff">
+        <h2>Code Diff</h2>
+        <p class="muted">Object-level side-by-side comparison of live definitions between source and target connections.</p>
+        <p id="diffObjectSummary" class="muted"></p>
+        <div class="inline-form">
+          <label>Source Connection <select id="diffSourceProfile"></select></label>
+          <label>Target Connection <select id="diffDestProfile"></select></label>
+          <button id="goToObjectsFromDiff" type="button">Select Objects</button>
+          <button id="runDiff">Run Diff</button>
+          <label>Export Format
+            <select id="diffExportFormat">
+              <option value="md">Markdown</option>
+              <option value="html">HTML</option>
+            </select>
+          </label>
+          <button id="exportDiff" type="button">Export</button>
+        </div>
+        <div class="task-progress-wrap">
+          <div class="task-progress-track"><div id="diffProgressBar" class="task-progress-fill"></div></div>
+          <div id="diffProgressText" class="task-progress-label muted">Idle</div>
+        </div>
+        <div id="diffSummary" class="summary-cards"></div>
+        <div class="maximizable-wrap" id="diffMaxWrap">
+          <div class="maximizable-header">
+            <span>Diff Viewer</span>
+            <button class="panel-toggle" id="diffViewerToggle" type="button" title="Maximize">&#x2197;</button>
+          </div>
+          <div id="diffList"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="tab-objects">
+        <h2>Object Selection</h2>
+        <p class="muted">This selection is reused by Code Diff, Backup, and Deployment.</p>
+
+        <div class="inline-form">
+          <label>Source Connection <select id="objectsProfile"></select></label>
+          <label>
+            Selection Method
+            <select id="objectsMode">
+              <option value="Specify">Manual Entry</option>
+              <option value="Discover">Browse Database</option>
+            </select>
+          </label>
+          <button id="clearSharedObjects" type="button">Clear Selection</button>
+        </div>
+
+        <div class="maximizable-wrap" id="specifyWrap">
+          <div class="maximizable-header">
+            <span>Manual Object Entry</span>
+            <button class="panel-toggle" id="specifyToggle" type="button" title="Maximize">&#x2197;</button>
+          </div>
+          <div id="editorFindBar" class="editor-find-bar hidden">
+            <div class="find-bar-row">
+              <input id="findBarQuery" placeholder="Find…" class="find-bar-input" />
+              <span id="findBarCount" class="find-bar-count muted"></span>
+              <button id="findBarPrev" type="button" class="btn-icon" title="Previous (Shift+Enter)">↑</button>
+              <button id="findBarNext" type="button" class="btn-icon" title="Next (Enter)">↓</button>
+              <button id="findBarToggleReplace" type="button" class="btn-icon" title="Toggle Replace">⇄</button>
+              <button id="findBarClose" type="button" class="btn-icon" title="Close (Escape)">✕</button>
+            </div>
+            <div id="findBarReplaceRow" class="find-bar-row hidden">
+              <input id="findBarReplace" placeholder="Replace with…" class="find-bar-input" />
+              <button id="findBarReplaceOne" type="button" class="btn-icon">Replace</button>
+              <button id="findBarReplaceAll" type="button" class="btn-icon">Replace All</button>
+            </div>
+          </div>
+        <div id="objectsSpecifySection">
+          <div class="upload-row">
+            <div class="upload-field">
+              <div class="upload-field-label">Import Object List</div>
+              <div class="path-input-row">
+                <button id="sharedObjectFileBrowse" type="button">Choose File</button>
+                <span id="sharedObjectFileName" class="muted">No file selected</span>
+              </div>
+            </div>
+            <input type="file" id="sharedObjectFile" accept=".txt,.csv" hidden />
+            <textarea id="sharedObjectText" placeholder="Paste schema.name or object name (one per line)&#10;Example: dbo.MyProc&#10;         vw_Orders&#10;         reporting.usp_get_summary&#10;&#10;Shortcut: Ctrl+D to Resolve &amp; Add Objects"></textarea>
+          </div>
+          <button id="resolveAndAddObjects" type="button">Resolve &amp; Add Objects</button>
+        </div>
+        </div><!-- /specifyWrap -->
+
+        <div id="objectsDiscoverSection" class="hidden">
+          <div class="inline-form">
+            <label>Object Type <select id="sharedTypeFilter"></select></label>
+            <label>Schema <select id="sharedSchemaFilter"></select></label>
+            <label>Object Name <input id="sharedNameFilter" placeholder="contains object name" /></label>
+            <button id="discoverSharedObjects" type="button">Search</button>
+            <button id="addDiscoveredObjects" type="button">Add Selected</button>
+          </div>
+          <div id="sharedObjectPicker"></div>
+        </div>
+
+        <h3>Selected Objects</h3>
+        <div class="inline-form objects-filter-row">
+          <input id="objectsFilterInput" class="objects-filter-input" placeholder="Filter by type, schema, or name…" />
+          <button id="saveObjectList" type="button" class="btn-ghost">Save List</button>
+        </div>
+        <div id="sharedSelectionTable"></div>
+      </section>
+
+      <section class="panel" id="tab-backup">
+        <h2>Backup</h2>
+        <p class="muted">Scripts selected objects to SQL files, preserving schema folder structure for restore readiness.</p>
+        <p id="backupObjectSummary" class="muted"></p>
+        <div class="inline-form">
+          <label>Source Connection <select id="backupProfile"></select></label>
+          <label>Output Folder <input id="backupPath" placeholder="C:/Backups" /></label>
+          <button id="backupPathBrowse" type="button">Choose Folder</button>
+          <button id="goToObjectsFromBackup" type="button">Select Objects</button>
+          <button id="runBackup" type="button">Run Backup</button>
+        </div>
+        <div class="task-progress-wrap">
+          <div class="task-progress-track"><div id="backupProgressBar" class="task-progress-fill"></div></div>
+          <div id="backupProgressText" class="task-progress-label muted">Idle</div>
+        </div>
+        <pre id="backupResult" class="result"></pre>
+      </section>
+
+      <section class="panel" id="tab-deploy">
+        <h2>Deployment</h2>
+        <p class="muted">Generates object scripts from the source connection, computes table schema deltas, then applies changes to the target connection.</p>
+        <p id="deployObjectSummary" class="muted"></p>
+        <div class="inline-form">
+          <label>Source Connection <select id="deploySourceProfile"></select></label>
+          <label>Target Connection <select id="deployDestProfile"></select></label>
+          <label>
+            Execution Mode
+            <select id="deployMode">
+              <option value="ExecuteDirectly" selected>Apply Changes</option>
+              <option value="Rollback">Validate Only (Rollback)</option>
+            </select>
+          </label>
+          <label>Script Output Folder <input id="deployScriptPath" placeholder="C:/ScriptExports" /></label>
+          <button id="deployPathBrowse" type="button">Choose Folder</button>
+          <label class="flag-label"><input type="checkbox" id="continueOnError" /> Continue On Error</label>
+          <label class="flag-label"><input type="checkbox" id="allowSameSource" /> Allow Same Source and Target</label>
+          <button id="goToObjects" type="button">Select Objects</button>
+        </div>
+        <div id="deployModeHint" class="deploy-mode-hint muted"></div>
+        <div class="task-progress-wrap">
+          <div class="task-progress-track"><div id="deployProgressBar" class="task-progress-fill"></div></div>
+          <div id="deployProgressText" class="task-progress-label muted">Idle</div>
+        </div>
+        <div class="deploy-actions-row">
+          <button id="runDeployment" type="button">Run Deployment</button>
+          <button id="previewDeployPlan" type="button" class="btn-ghost">Preview Plan</button>
+        </div>
+        <div id="deployPlanPreview" class="deploy-plan-preview hidden"></div>
+        <div id="deployObjectProgress" class="deploy-object-progress hidden"></div>
+        <div id="deployResult"></div>
+        <div id="deployRetryRow" class="hidden">
+          <button id="retryFailedObjects" type="button" class="btn-ghost">Retry Failed Objects</button>
+        </div>
+      </section>
+
+      <section class="panel" id="tab-customize">
+        <div class="settings-header">
+          <div>
+            <h2>Settings</h2>
+            <p class="muted">Personalize appearance, behavior, and deployment settings. Press Enter to save all.</p>
+          </div>
+          <div class="settings-actions">
+            <button id="resetCustomize" type="button" class="btn-ghost">Reset Defaults</button>
+            <button id="restoreBackupBtn" type="button" class="btn-ghost">Restore Backup</button>
+            <button id="factoryResetApp" type="button" class="btn-danger">Factory Reset</button>
+            <button id="saveAllSettings" type="button" class="btn-primary">Save All</button>
+            <input type="file" id="restoreBackupFile" accept=".json" hidden />
+          </div>
+        </div>
+
+        <div class="customize-grid">
+          <!-- Appearance -->
+          <div class="customize-card">
+            <h3>Appearance</h3>
+            <p class="muted">Font and display preferences.</p>
+            <div class="customize-field">
+              <label for="fontSelector">Font Family</label>
+              <select id="fontSelector">
+                <option value="Space Grotesk">Space Grotesk</option>
+                <option value="Inter">Inter</option>
+                <option value="JetBrains Mono">JetBrains Mono</option>
+                <option value="Fira Code">Fira Code</option>
+                <option value="Segoe UI">Segoe UI</option>
+                <option value="Roboto">Roboto</option>
+                <option value="Poppins">Poppins</option>
+                <option value="Arial">Arial</option>
+                <option value="Times New Roman">Times New Roman</option>
+              </select>
+            </div>
+            <div class="customize-field">
+              <label for="fontSizeRange">Font Size <span id="fontSizeLabel" class="muted"></span></label>
+              <input type="range" id="fontSizeRange" min="11" max="20" step="1" value="14" />
+            </div>
+            <div class="customize-field">
+              <label>Theme</label>
+              <div class="theme-picker-inline" id="themePickerInline"></div>
+              <div class="theme-preview-panel" id="themePreviewPanel"></div>
+            </div>
+          </div>
+
+          <!-- Behavior -->
+          <div class="customize-card">
+            <h3>Behavior</h3>
+            <p class="muted">Application behavior preferences.</p>
+            <div class="customize-field toggle-field">
+              <label for="notificationsToggle">Desktop Notifications</label>
+              <label class="toggle-switch" aria-label="Desktop Notifications">
+                <input type="checkbox" id="notificationsToggle" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="customize-field">
+              <label for="defaultBackupPath">Default Backup Folder</label>
+              <div class="path-input-row">
+                <input id="defaultBackupPath" placeholder="C:/Backups" />
+                <button id="defaultBackupBrowse" type="button">Choose Folder</button>
+              </div>
+            </div>
+            <div class="customize-field">
+              <label for="defaultScriptPath">Default Script Output Folder</label>
+              <div class="path-input-row">
+                <input id="defaultScriptPath" placeholder="C:/ScriptExports" />
+                <button id="defaultScriptBrowse" type="button">Choose Folder</button>
+              </div>
+            </div>
+            <div class="customize-field">
+              <label for="logLevelSelect">Log Detail Level</label>
+              <select id="logLevelSelect">
+                <option value="Verbose">Verbose (all events)</option>
+                <option value="Normal" selected>Normal (INFO/WARN/ERROR)</option>
+                <option value="ErrorsOnly">Errors Only</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Keyboard Shortcuts -->
+        <div class="customize-section-title">Keyboard Shortcuts</div>
+        <div class="customize-card shortcuts-card">
+          <h3>Shortcuts</h3>
+          <p class="muted">Click a shortcut, press the new key combo, then press <strong>Enter</strong> to save. Press Escape to cancel.</p>
+          <table class="table" id="shortcutsTable">
+            <thead><tr><th>Action</th><th>Shortcut</th></tr></thead>
+            <tbody id="shortcutsBody"></tbody>
+          </table>
+        </div>
+
+        <!-- Script Generation -->
+        <div class="customize-section-title">Script Generation</div>
+        <div class="customize-grid">
+          <div class="customize-card">
+            <h3>Folder Names</h3>
+            <p class="muted">Rename the output folders for each object type (used when generating scripts).</p>
+            <table class="table customize-table" id="folderNamesTable">
+              <thead><tr><th>Object Type</th><th>Folder Name</th></tr></thead>
+              <tbody id="folderNamesBody"></tbody>
+            </table>
+          </div>
+
+          <div class="customize-card">
+            <h3>Deployment Order</h3>
+            <p class="muted">Use arrows to reorder how object types are deployed (top = first).</p>
+            <ul class="deploy-order-list" id="deployOrderList"></ul>
+          </div>
+        </div>
+
+      </section>
+
+      <section class="panel" id="tab-logs">
+        <h2>Task Logs</h2>
+        <div class="inline-form log-filters">
+          <label>Type
+            <select id="logFilterType">
+              <option value="">All Types</option>
+              <option value="Backup">Backup</option>
+              <option value="Deploy">Deploy</option>
+              <option value="Diff">Diff</option>
+            </select>
+          </label>
+          <label>Status
+            <select id="logFilterStatus">
+              <option value="">All Statuses</option>
+              <option value="Success">Success</option>
+              <option value="Failed">Failed</option>
+              <option value="Running">Running</option>
+            </select>
+          </label>
+          <label>Event Level
+            <select id="logFilterLevel">
+              <option value="">All Events</option>
+              <option value="ERROR">Error</option>
+              <option value="WARN">Warning</option>
+              <option value="INFO">Info</option>
+            </select>
+          </label>
+          <label>Date <input type="date" id="logFilterDate" /></label>
+          <button id="refreshLogs">Refresh</button>
+          <button id="clearAllLogs" class="btn-ghost" type="button">Clear All Logs</button>
+          <button id="clearLogDetail" class="btn-ghost" type="button">Clear Detail</button>
+          <span id="logAutoRefreshLabel" class="log-autorefresh-label"></span>
+        </div>
+        <div id="logsTable"></div>
+        <pre id="logDetail" class="result hidden"></pre>
+      </section>
+    </main>
+
+    <div id="toast"></div>
+
+    <!-- Bottom taskbar: shows in-progress tasks + last completed task summary -->
+    <div id="taskbar" class="taskbar">
+      <div id="taskbarRunning" class="taskbar-running"></div>
+      <div id="taskbarSummary" class="taskbar-summary"></div>
+    </div>
+
+    <script src="editorHelpers.js"></script>
+    <script src="themeRegistry.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
