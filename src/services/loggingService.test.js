@@ -5,7 +5,7 @@ const os = require("os");
 const path = require("path");
 
 function makeTempDirs() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bdeploy-logs-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pebloy-logs-"));
   return {
     root,
     logs: path.join(root, "logs"),

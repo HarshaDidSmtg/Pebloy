@@ -1,10 +1,10 @@
-# BDeploy
+# Pebloy
 
 > Streamlined SQL Server schema management — built for Windows developers and DBAs.
 
-BDeploy is a **Windows desktop tool** (Electron + Node.js) that simplifies comparing, backing up, and deploying SQL Server database objects across environments (DEV -> QA -> UAT -> PROD).
+Pebloy is a **Windows desktop tool** (Electron + Node.js) that simplifies comparing, backing up, and deploying SQL Server database objects across environments (DEV -> QA -> UAT -> PROD).
 
-Repository: [SriHarshaSpidey/BDeploy](https://github.com/SriHarshaSpidey/BDeploy)
+Repository: [SriHarshaSpidey/Pebloy](https://github.com/SriHarshaSpidey/Pebloy)
 
 ---
 
@@ -44,15 +44,15 @@ Repository: [SriHarshaSpidey/BDeploy](https://github.com/SriHarshaSpidey/BDeploy
 Clone the repository, then from the repository root run:
 
 ```powershell
-git clone https://github.com/SriHarshaSpidey/BDeploy.git
-cd BDeploy
+git clone https://github.com/SriHarshaSpidey/Pebloy.git
+cd Pebloy
 npm install
 npm start
 ```
 
-Open `http://localhost:5089` or double-click **Launch-BDeploy.cmd**.
+Open `http://localhost:5089` or double-click **Launch-Pebloy.cmd**.
 
-`Launch-BDeploy.cmd` starts the Electron desktop app and refreshes the `BDeploy.lnk` desktop shortcut.
+`Launch-Pebloy.cmd` starts the Electron desktop app and refreshes the `Pebloy.lnk` desktop shortcut.
 
 For the Electron desktop app directly: `npm run electron`
 
@@ -73,7 +73,7 @@ See [INSTALLATION.md](INSTALLATION.md) for full setup options including the Wind
 ## Project Structure
 
 ```text
-bdeploy/
+pebloy/
 ├── src/
 │   ├── server.js                       # Express routes
 │   ├── electron/main.js                # Electron entry point
@@ -97,7 +97,7 @@ bdeploy/
 │   └── powershell/
 │       ├── CompareTablesGenerateDelta.ps1 # Table schema delta generator
 │       ├── DBObjectsBulkScriptGenerator.ps1 # Bulk object script generator
-│       └── Launch-BDeploy.ps1          # Desktop launcher
+│       └── Launch-Pebloy.ps1           # Desktop launcher
 ├── public/                             # Frontend (vanilla HTML/CSS/JS)
 ├── data/                               # Runtime: profiles + encrypted secrets
 ├── artifacts/                          # Runtime: logs, scripts, reports

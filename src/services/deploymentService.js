@@ -26,11 +26,31 @@ function buildTypeOrder() {
 }
 
 function normalizeSelection(items = []) {
-  return items.map((x) => ({
-    objectType: String(x.objectType || "").toUpperCase(),
-    schemaName: x.schemaName,
-    objectName: x.objectName,
-  }));
+  return items.map((x) => {
+    const normalized = {
+      objectType: String(x.objectType || "").toUpperCase(),
+      schemaName: x.schemaName,
+      objectName: x.objectName,
+    };
+
+    const createdDate = x.createdDate || x.createDate;
+    if (createdDate) {
+      normalized.createdDate = createdDate;
+    }
+
+    const modifiedDate = x.modifiedDate || x.modifyDate;
+    if (modifiedDate) {
+      normalized.modifiedDate = modifiedDate;
+    }
+
+    return normalized;
+  });
+}
+
+function toSortableTimestamp(value) {
+  if (!value) return null;
+  const timestamp = Date.parse(String(value));
+  return Number.isFinite(timestamp) ? timestamp : null;
 }
 
 function dedupeSelection(items = []) {
@@ -51,6 +71,15 @@ function sortedByDependency(items) {
     const ao = TYPE_ORDER[a.objectType] || 999;
     const bo = TYPE_ORDER[b.objectType] || 999;
     if (ao !== bo) return ao - bo;
+
+    const aCreated = toSortableTimestamp(a.createdDate || a.createDate);
+    const bCreated = toSortableTimestamp(b.createdDate || b.createDate);
+    if (aCreated != null && bCreated != null && aCreated !== bCreated) {
+      return aCreated - bCreated;
+    }
+    if (aCreated != null && bCreated == null) return -1;
+    if (aCreated == null && bCreated != null) return 1;
+
     if (a.schemaName !== b.schemaName) return a.schemaName.localeCompare(b.schemaName);
     return a.objectName.localeCompare(b.objectName);
   });

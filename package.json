@@ -1,18 +1,18 @@
 {
-  "name": "bdeploy",
+  "name": "pebloy",
   "version": "1.3.1",
   "description": "SQL Server schema diff, backup, and deployment tool for Windows",
   "main": "src/electron/main.js",
-  "author": "BDeploy Contributors",
+  "author": "Pebloy Contributors",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/SriHarshaSpidey/BDeploy.git"
+    "url": "git+https://github.com/SriHarshaSpidey/Pebloy.git"
   },
   "bugs": {
-    "url": "https://github.com/SriHarshaSpidey/BDeploy/issues"
+    "url": "https://github.com/SriHarshaSpidey/Pebloy/issues"
   },
-  "homepage": "https://github.com/SriHarshaSpidey/BDeploy#readme",
+  "homepage": "https://github.com/SriHarshaSpidey/Pebloy#readme",
   "keywords": [
     "sql-server",
     "database",
@@ -46,9 +46,9 @@
     "nodemon": "^3.1.14"
   },
   "build": {
-    "appId": "com.bdeploy.app",
-    "productName": "BDeploy",
-    "copyright": "Copyright © 2025 BDeploy Contributors",
+    "appId": "com.pebloy.app",
+    "productName": "Pebloy",
+    "copyright": "Copyright © 2025 Pebloy Contributors",
     "directories": {
       "buildResources": "build",
       "output": "dist"
@@ -81,10 +81,10 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "BDeploy"
+      "shortcutName": "Pebloy"
     },
     "portable": {
-      "artifactName": "BDeploy-${version}-portable.exe"
+      "artifactName": "Pebloy-${version}-portable.exe"
     }
   }
 }

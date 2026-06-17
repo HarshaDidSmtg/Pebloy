@@ -40,7 +40,7 @@ function buildClientError(error, fallbackStatus = 400) {
     resolutionSteps = [
       "Check write permissions for the selected output or artifact folder.",
       "If a file is open in another process, close it and retry.",
-      "Run BDeploy with an account that can access the target path.",
+      "Run Pebloy with an account that can access the target path.",
     ];
   } else if (/sqlserver module install failed|save-module/.test(lower)) {
     resolutionSteps = [

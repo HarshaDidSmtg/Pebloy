@@ -126,7 +126,7 @@ function writeServerInfo(port) {
     SERVER_INFO_FILE,
     JSON.stringify(
       {
-        app: "BDeploy",
+        app: "Pebloy",
         port,
         url: `http://localhost:${port}`,
         pid: process.pid,
@@ -512,8 +512,8 @@ app.post("/api/logs/:taskId/open", async (req, res) => {
       return httpError(res, new Error("Log file path not found."), 404);
     }
 
-    await openPath(openCandidates[0]);
-    res.json({ opened: true, path: openCandidates[0] });
+    await openPath(openCandidates[0], { promptForApp: true });
+    res.json({ opened: true, path: openCandidates[0], promptForApp: true });
   } catch (error) {
     httpError(res, error);
   }
@@ -593,7 +593,7 @@ app.post("/api/data-import", (req, res) => {
 
 app.get("/api/status", (req, res) => {
   res.json({
-    app: "BDeploy",
+    app: "Pebloy",
     version: "1.0.0",
     runningTasks: runningTasks.size,
     profiles: listProfiles().length,
@@ -607,12 +607,12 @@ listenOnAvailablePort(app, desiredPort)
   .then(({ port }) => {
     writeServerInfo(port);
     const fallbackMessage = port === desiredPort ? "" : ` (requested ${desiredPort}; selected next available port)`;
-    console.log(`BDeploy listening on http://localhost:${port}${fallbackMessage}`);
+    console.log(`Pebloy listening on http://localhost:${port}${fallbackMessage}`);
     ensureSqlServerModule()
       .then(() => console.log("SqlServer PowerShell module ready."))
       .catch((err) => console.warn(`SqlServer module setup: ${err.message}`));
   })
   .catch((error) => {
-    console.error(`BDeploy failed to start: ${error.message}`);
+    console.error(`Pebloy failed to start: ${error.message}`);
     process.exit(1);
   });

@@ -152,6 +152,36 @@ function Clean-SqlScript($text) {
     return ($out -join "`r`n")
 }
 
+function Format-ModuleDefinitionText {
+    param(
+        [Parameter(Mandatory)][string]$DefinitionText,
+        $UsesAnsiNulls = $null,
+        $UsesQuotedIdentifier = $null
+    )
+
+    $text = Format-DdlKeywords $DefinitionText
+    $text = $text.Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return ""
+    }
+
+    $parts = @()
+    $hasAnsiHeader = $text -match '(?im)^\s*SET\s+ANSI_NULLS\s+(?:ON|OFF)\s*;?\s*$'
+    $hasQuotedHeader = $text -match '(?im)^\s*SET\s+QUOTED_IDENTIFIER\s+(?:ON|OFF)\s*;?\s*$'
+
+    if (-not $hasAnsiHeader -and $null -ne $UsesAnsiNulls -and "$UsesAnsiNulls" -ne "") {
+        $parts += "SET ANSI_NULLS $(if ([bool]$UsesAnsiNulls) { 'ON' } else { 'OFF' })"
+        $parts += "GO"
+    }
+    if (-not $hasQuotedHeader -and $null -ne $UsesQuotedIdentifier -and "$UsesQuotedIdentifier" -ne "") {
+        $parts += "SET QUOTED_IDENTIFIER $(if ([bool]$UsesQuotedIdentifier) { 'ON' } else { 'OFF' })"
+        $parts += "GO"
+    }
+
+    $parts += $text
+    return ($parts -join "`r`n").Trim()
+}
+
 function Set-ScriptingOptionIfAvailable {
     param(
         [Parameter(Mandatory)]$Options,
@@ -622,21 +652,14 @@ WHERE tt.name IN ($nameList)
     elseif ($typeKey -eq "User Defined Types") { $obj = $db.UserDefinedTableTypes[$resolvedObjectName, $resolvedSchema] }
 
         $text = ""
-        if ($obj) {
-            # Generate script using SMO when available
-            if ($typeKey -eq "Tables") {
-                $text = Format-DacpacTableScript -ScriptLines ($tableScripter.Script($obj)) -ObjectName "$resolvedSchema.$resolvedObjectName"
-            }
-            else {
-                $text = Clean-SqlScript (Convert-Script ($scripter.Script($obj)))
-            }
-        }
-        elseif ($typeKey -in @("Stored Procedures", "Views", "Functions")) {
-            # Fallback: read module definition directly from SQL when SMO object binding fails.
+        if ($typeKey -in @("Stored Procedures", "Views", "Functions")) {
+            # Prefer the database module definition so source exports preserve the authored formatting.
             $escapedSchema = $resolvedSchema.Replace("'", "''")
             $escapedName = $resolvedObjectName.Replace("'", "''")
             $definitionQuery = @"
 SELECT TOP 1 m.definition AS DefinitionText
+    , m.uses_ansi_nulls AS UsesAnsiNulls
+    , m.uses_quoted_identifier AS UsesQuotedIdentifier
 FROM sys.objects o
 INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
 LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
@@ -647,11 +670,21 @@ WHERE s.name = N'$escapedSchema'
             try {
                 $defRow = $db.ExecuteWithResults($definitionQuery).Tables[0].Rows | Select-Object -First 1
                 if ($defRow -and $defRow.DefinitionText) {
-                    $text = Clean-SqlScript ([string]$defRow.DefinitionText)
+                    $text = Format-ModuleDefinitionText -DefinitionText ([string]$defRow.DefinitionText) -UsesAnsiNulls $defRow.UsesAnsiNulls -UsesQuotedIdentifier $defRow.UsesQuotedIdentifier
                 }
             }
             catch {
-                # Will be handled below if text remains empty.
+                # Fall back to SMO scripting below if the definition query fails.
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($text) -and $obj) {
+            # Fall back to SMO scripting for tables, synonyms, sequences, types, or when a module definition is unavailable.
+            if ($typeKey -eq "Tables") {
+                $text = Format-DacpacTableScript -ScriptLines ($tableScripter.Script($obj)) -ObjectName "$resolvedSchema.$resolvedObjectName"
+            }
+            else {
+                $text = Clean-SqlScript (Convert-Script ($scripter.Script($obj)))
             }
         }
 
@@ -670,7 +703,7 @@ WHERE s.name = N'$escapedSchema'
         if ($shouldWriteCombinedArtifacts -and $type -eq "Stored Procedures") {
             $spScript = $text
             $spScript = $spScript -replace "(?im)^\s*CREATE\s+(?:OR\s+ALTER\s+)?(?:PROCEDURE|PROC)\b", "CREATE OR ALTER PROCEDURE"
-            $spScript = $spScript -replace "(?im)^\s*GO\s*$", ""
+            $spScript = [regex]::Replace($spScript.Trim(), "(?im)(?:\r?\n)?GO\s*$", "")
 
             $allSPContent += $spScript.Trim()
             $allSPContent += "GO"

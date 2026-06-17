@@ -79,6 +79,18 @@ describe("normalizeExecutableSql — CREATE OR ALTER conversion", () => {
     expect(out).toMatch(/CREATE OR ALTER FUNCTION/);
   });
 
+  it("splits leading SET options into a separate batch for procedures", () => {
+    const sql = [
+      "SET QUOTED_IDENTIFIER OFF",
+      "/*** header ***/",
+      "CREATE PROCEDURE [dbo].[foo] AS SELECT 1",
+    ].join("\n");
+
+    const out = normalizeExecutableSql(sql, "PROCEDURE");
+
+    expect(out).toContain("SET QUOTED_IDENTIFIER OFF\nGO\n/*** header ***/\nCREATE OR ALTER PROCEDURE [dbo].[foo] AS SELECT 1");
+  });
+
   it("leaves TABLE DDL unchanged (no OR ALTER for tables)", () => {
     const sql = "CREATE TABLE [dbo].[t] (id INT NOT NULL)";
     const out = normalizeExecutableSql(sql, "TABLE");

@@ -20,7 +20,7 @@ jest.mock("./scriptAutomationService", () => ({
 const { EventEmitter } = require("events");
 const fs = require("fs");
 const { execFile } = require("child_process");
-const { executeSqlScriptsIndividually, resolveObjectTypes } = require("./sqlService");
+const { executeSqlScriptsIndividually, fetchObjectDefinitionMap, resolveObjectTypes } = require("./sqlService");
 
 describe("executeSqlScriptsIndividually", () => {
   beforeEach(() => {
@@ -51,7 +51,7 @@ describe("executeSqlScriptsIndividually", () => {
 
     expect(results).toEqual([{ key: "PROCEDURE|dbo|ProcA", ok: true, error: null }]);
     expect(fs.writeFileSync).toHaveBeenCalledWith(
-      expect.stringContaining("bdeploy_uuid-1234.ps1"),
+      expect.stringContaining("pebloy_uuid-1234.ps1"),
       expect.stringContaining("function Get-TransactionCount($connection)"),
       "utf8"
     );
@@ -91,5 +91,46 @@ describe("executeSqlScriptsIndividually", () => {
     expect(decodedQuery).toContain("NULLIF(LTRIM(RTRIM(io.schemaName)), '') IS NULL");
     expect(decodedQuery).toContain("ELSE N'Ambiguous'");
     expect(decodedQuery).toContain("inputSchemaName");
+  });
+
+  it("formats module definitions with metadata-backed session-setting batches", async () => {
+    execFile.mockImplementation((_command, _args, _options, callback) => {
+      const stdout = new EventEmitter();
+      const child = { stdout };
+
+      process.nextTick(() => {
+        callback(null, JSON.stringify([
+          {
+            objectType: "PROCEDURE",
+            schemaName: "dbo",
+            objectName: "ProcA",
+            definition: "CREATE PROCEDURE dbo.ProcA AS SELECT 1",
+            usesAnsiNulls: 1,
+            usesQuotedIdentifier: 0,
+          },
+        ]), "");
+      });
+
+      return child;
+    });
+
+    const result = await fetchObjectDefinitionMap(
+      {
+        serverName: "srcServer",
+        databaseName: "srcDb",
+        authenticationType: "Windows",
+      },
+      [{ objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcA" }]
+    );
+
+    const scriptText = fs.writeFileSync.mock.calls[0][1];
+    const base64Query = scriptText.match(/FromBase64String\('([^']+)'\)/)?.[1];
+    const decodedQuery = Buffer.from(base64Query, "base64").toString("utf8");
+
+    expect(decodedQuery).toContain("m.uses_ansi_nulls AS usesAnsiNulls");
+    expect(decodedQuery).toContain("m.uses_quoted_identifier AS usesQuotedIdentifier");
+    expect(result.get("PROCEDURE|dbo|ProcA").definition).toBe(
+      "SET ANSI_NULLS ON\nGO\nSET QUOTED_IDENTIFIER OFF\nGO\nCREATE PROCEDURE dbo.ProcA AS SELECT 1"
+    );
   });
 });

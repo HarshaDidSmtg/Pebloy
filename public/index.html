@@ -3,16 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>BDeploy</title>
+    <title>Pebloy</title>
     <link rel="stylesheet" href="style.css" />
     <link rel="icon" href="logo.svg" type="image/svg+xml" />
   </head>
   <body>
     <header class="app-header">
       <div class="brand-wrap">
-        <img src="logo.svg" alt="BDeploy logo" class="app-logo" />
+        <img src="logo.svg" alt="Pebloy logo" class="app-logo" />
         <div>
-          <h1>BDeploy</h1>
+          <h1>Pebloy</h1>
           <p>Streamlined SQL Server schema management</p>
         </div>
       </div>
@@ -156,6 +156,11 @@
             <button id="addDiscoveredObjects" type="button">Add Selected</button>
           </div>
           <div id="sharedObjectPicker"></div>
+        </div>
+
+        <div class="task-progress-wrap">
+          <div class="task-progress-track"><div id="objectsProgressBar" class="task-progress-fill"></div></div>
+          <div id="objectsProgressText" class="task-progress-label muted">Idle</div>
         </div>
 
         <h3>Selected Objects</h3>

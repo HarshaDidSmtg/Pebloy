@@ -70,7 +70,7 @@
         muted: "#8b8b8b",
         accent: "#ff2340",
         "accent-2": "#cc1a30",
-        "accent-fg": "#ffffff",
+        "accent-fg": "#17090c",
         danger: "#ff5068",
         success: "#22c55e",
         warning: "#f59e0b",
@@ -83,7 +83,7 @@
         radius: "6px",
         "radius-lg": "10px",
         "tab-active-bg": "#ff2340",
-        "tab-active-fg": "#ffffff",
+        "tab-active-fg": "#17090c",
         "input-bg": "#0d0d0d",
         "card-bg": "#0d0d0d",
         "progress-track": "#1a1a1a",
@@ -315,7 +315,7 @@
         muted: "#b6c9f0",
         accent: "#ff3b30",
         "accent-2": "#ff6b4a",
-        "accent-fg": "#ffffff",
+        "accent-fg": "#0b1220",
         danger: "#ff6b6b",
         success: "#34d399",
         warning: "#f59e0b",
@@ -328,7 +328,7 @@
         radius: "8px",
         "radius-lg": "14px",
         "tab-active-bg": "#ff3b30",
-        "tab-active-fg": "#ffffff",
+        "tab-active-fg": "#0b1220",
         "input-bg": "#10203e",
         "card-bg": "#10203e",
         "progress-track": "#22365f",
@@ -396,5 +396,5 @@
     }
   ];
 
-  globalThis.BDeployThemes = themes;
+  globalThis.PebloyThemes = themes;
 })();

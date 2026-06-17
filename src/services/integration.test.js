@@ -39,7 +39,7 @@ function splitSqlBatches(sqlText) {
 
 async function executeSqlBatches(profile, sqlText) {
   const batches = splitSqlBatches(sqlText);
-  const tempScriptPath = path.join(os.tmpdir(), `bdeploy_fixture_${randomUUID()}.ps1`);
+  const tempScriptPath = path.join(os.tmpdir(), `pebloy_fixture_${randomUUID()}.ps1`);
   const payload = Buffer.from(
     JSON.stringify({
       profile,
@@ -64,7 +64,7 @@ try {
   $builder['TrustServerCertificate'] = $true
   $builder['Encrypt'] = $false
   $builder['Connect Timeout'] = 10
-  $builder['Application Name'] = 'BDeployIntegrationTests'
+  $builder['Application Name'] = 'PebloyIntegrationTests'
 
   if ([string]::Equals([string]$profile.authenticationType, 'Windows', [System.StringComparison]::OrdinalIgnoreCase)) {
     $builder['Integrated Security'] = $true

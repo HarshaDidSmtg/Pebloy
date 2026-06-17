@@ -390,10 +390,55 @@ function normalizeDdlKeywords(text) {
   return text;
 }
 
+function normalizeModuleBatchHeaders(text, objectType) {
+  const type = String(objectType || "").toUpperCase();
+  if (!["PROCEDURE", "VIEW", "FUNCTION", "TRIGGER"].includes(type)) {
+    return String(text || "").trim();
+  }
+
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  const headerLines = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const trimmed = lines[index].trim();
+    if (!trimmed) {
+      if (!headerLines.length) {
+        index += 1;
+        continue;
+      }
+      break;
+    }
+
+    if (/^SET\s+(?:ANSI_NULLS|QUOTED_IDENTIFIER)\s+(?:ON|OFF)\s*;?$/i.test(trimmed)) {
+      headerLines.push(trimmed.replace(/;$/, ""));
+      index += 1;
+      continue;
+    }
+
+    break;
+  }
+
+  if (!headerLines.length) {
+    return String(text || "").trim();
+  }
+
+  const body = lines.slice(index).join("\n").trim();
+  if (!body) {
+    return headerLines.join("\n");
+  }
+
+  if (/^GO\s*(?:\n|$)/i.test(body)) {
+    return `${headerLines.join("\n")}\n${body}`.trim();
+  }
+
+  return `${headerLines.join("\n")}\nGO\n${body}`.trim();
+}
+
 function normalizeExecutableSql(sqlText, objectType, context = {}, options = {}) {
   let text = String(sqlText || "");
   text = normalizeDdlKeywords(text);
-  text = text.replace(/^\s*GO\s*$/gim, "").trim();
+  text = text.trim();
 
   const type = String(objectType || "").toUpperCase();
   const strategy = options.strategy || "createOrAlter";
@@ -406,6 +451,8 @@ function normalizeExecutableSql(sqlText, objectType, context = {}, options = {})
       .replace(/\bCREATE\s+FUNCTION\b/i, "CREATE OR ALTER FUNCTION")
       .replace(/\bCREATE\s+TRIGGER\b/i, "CREATE OR ALTER TRIGGER");
   }
+
+  text = normalizeModuleBatchHeaders(text, type);
 
   const { schemaName, objectName } = context;
   if (schemaName && objectName) {

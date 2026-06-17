@@ -1,4 +1,4 @@
-# BDeploy — Installation Guide
+# Pebloy — Installation Guide
 
 ## Prerequisites
 
@@ -17,15 +17,15 @@
 Clone the repository and run from the repository root:
 
 ```powershell
-git clone https://github.com/SriHarshaSpidey/BDeploy.git
-cd BDeploy
+git clone https://github.com/SriHarshaSpidey/Pebloy.git
+cd Pebloy
 npm install
 npm start
 ```
 
 Open `http://localhost:5089` in your browser.
 
-To launch the desktop app directly, use **Launch-BDeploy.cmd** or **scripts/powershell/Launch-BDeploy.ps1**. The launcher verifies Electron dependencies, starts the Electron shell, and refreshes the `BDeploy.lnk` desktop shortcut.
+To launch the desktop app directly, use **Launch-Pebloy.cmd** or **scripts/powershell/Launch-Pebloy.ps1**. The launcher verifies Electron dependencies, starts the Electron shell, and refreshes the `Pebloy.lnk` desktop shortcut.
 
 ---
 
@@ -35,9 +35,9 @@ To launch the desktop app directly, use **Launch-BDeploy.cmd** or **scripts/powe
 npm run electron
 ```
 
-Launches BDeploy as a native desktop window (no browser needed).
+Launches Pebloy as a native desktop window (no browser needed).
 
-If you want the full desktop shortcut refresh flow, prefer `scripts/powershell/Launch-BDeploy.ps1`.
+If you want the full desktop shortcut refresh flow, prefer `scripts/powershell/Launch-Pebloy.ps1`.
 
 For development with hot-reload:
 
@@ -62,7 +62,7 @@ npm run electron:dev
 npm run build
 ```
 
-Output: `dist/BDeploy Setup <version>.exe`
+Output: `dist/Pebloy Setup <version>.exe`
 
 ---
 
@@ -84,7 +84,7 @@ If `.env` is not present, defaults defined in the source are used.
 
 ## First-Run Setup
 
-1. Open BDeploy in the browser or Electron window.
+1. Open Pebloy in the browser or Electron window.
 2. Go to the **Connections** tab.
 3. Click **New Profile**, fill in server, database, and authentication details.
 4. Click **Test** to confirm connectivity.
@@ -102,7 +102,7 @@ Generated script output now nests under the selected Connection Alias before the
 
 ## Installing the SQL Server PowerShell Module
 
-BDeploy requires the `SqlServer` module for all database operations:
+Pebloy requires the `SqlServer` module for all database operations:
 
 ```powershell
 Install-Module -Name SqlServer -Scope CurrentUser -Force
@@ -126,7 +126,7 @@ If you see a version listed, the module is ready.
 | Port 5089 already in use | The launcher auto-selects the next port. Check `data/server-info.json` for the active URL. |
 | PowerShell script blocked by execution policy | Run: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 | `SqlServer` module not found | Run: `Install-Module -Name SqlServer -Scope CurrentUser` |
-| Electron app does not open | Run `scripts/powershell/Launch-BDeploy.ps1` or `Launch-BDeploy.cmd` so dependency checks and Electron startup happen in one path. |
-| Electron window is blank | Run `npm start` first to check for server errors, then retry `npm run electron`, `scripts/powershell/Launch-BDeploy.ps1`, or `Launch-BDeploy.cmd`. |
+| Electron app does not open | Run `scripts/powershell/Launch-Pebloy.ps1` or `Launch-Pebloy.cmd` so dependency checks and Electron startup happen in one path. |
+| Electron window is blank | Run `npm start` first to check for server errors, then retry `npm run electron`, `scripts/powershell/Launch-Pebloy.ps1`, or `Launch-Pebloy.cmd`. |
 
 For runtime issues, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).

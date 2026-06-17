@@ -75,7 +75,7 @@ function cleanPowerShellError(raw) {
 }
 
 function runPowerShell(scriptText, maxBuffer = 1024 * 1024 * 20) {
-  const tempFile = path.join(os.tmpdir(), `bdeploy_${randomUUID()}.ps1`);
+  const tempFile = path.join(os.tmpdir(), `pebloy_${randomUUID()}.ps1`);
   fs.writeFileSync(tempFile, scriptText, "utf8");
 
   return new Promise((resolve, reject) => {
@@ -111,7 +111,7 @@ function runPowerShellLines(
   maxBuffer = 1024 * 1024 * 20,
   timeoutMs = POWERSHELL_TIMEOUT_MS
 ) {
-  const tempFile = path.join(os.tmpdir(), `bdeploy_${randomUUID()}.ps1`);
+  const tempFile = path.join(os.tmpdir(), `pebloy_${randomUUID()}.ps1`);
   fs.writeFileSync(tempFile, scriptText, "utf8");
 
   return new Promise((resolve, reject) => {
@@ -210,7 +210,7 @@ foreach ($candidate in $serverCandidates) {
     $builder['TrustServerCertificate'] = $true
     $builder['Encrypt'] = $false
     $builder['Connect Timeout'] = 10
-    $builder['Application Name'] = 'BDeploy'
+    $builder['Application Name'] = 'Pebloy'
 
     if ('${authType}' -eq 'Windows') {
       $builder['Integrated Security'] = $true
@@ -503,6 +503,54 @@ function normalizeDefinition(value) {
   return normalizeDdlKeywords(String(value || "").replace(/\r\n/g, "\n").trim());
 }
 
+const MODULE_DEFINITION_OBJECT_TYPES = new Set(["PROCEDURE", "VIEW", "FUNCTION", "TRIGGER"]);
+
+function normalizeBitFlag(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return null;
+}
+
+function composeModuleDefinition(definition, usesAnsiNulls, usesQuotedIdentifier) {
+  const body = normalizeDefinition(definition);
+  if (!body) {
+    return "";
+  }
+
+  const parts = [];
+  const ansiFlag = normalizeBitFlag(usesAnsiNulls);
+  const quotedFlag = normalizeBitFlag(usesQuotedIdentifier);
+  const hasAnsiHeader = /^\s*SET\s+ANSI_NULLS\s+(?:ON|OFF)\s*;?$/im.test(body);
+  const hasQuotedHeader = /^\s*SET\s+QUOTED_IDENTIFIER\s+(?:ON|OFF)\s*;?$/im.test(body);
+
+  if (ansiFlag !== null && !hasAnsiHeader) {
+    parts.push(`SET ANSI_NULLS ${ansiFlag ? "ON" : "OFF"}`, "GO");
+  }
+  if (quotedFlag !== null && !hasQuotedHeader) {
+    parts.push(`SET QUOTED_IDENTIFIER ${quotedFlag ? "ON" : "OFF"}`, "GO");
+  }
+
+  parts.push(body);
+  return parts.join("\n").trim();
+}
+
 async function fetchObjectDefinitionMap(profile, selectedObjects = []) {
   const selectedConditions = (selectedObjects || [])
     .map((item) => ({
@@ -532,7 +580,9 @@ SELECT
   END AS objectType,
   s.name AS schemaName,
   o.name AS objectName,
-  m.definition AS definition
+  m.definition AS definition,
+  m.uses_ansi_nulls AS usesAnsiNulls,
+  m.uses_quoted_identifier AS usesQuotedIdentifier
 FROM sys.objects o
 INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
 LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
@@ -598,7 +648,9 @@ SELECT
       ORDER BY idx.is_primary_key DESC, idx.name
       FOR XML PATH(''), TYPE
     ).value('.', 'nvarchar(max)'), 1, 1, '')
-  ), '') AS definition
+  ), '') AS definition,
+  CAST(NULL AS bit) AS usesAnsiNulls,
+  CAST(NULL AS bit) AS usesQuotedIdentifier
 FROM sys.tables t
 INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
 
@@ -608,7 +660,9 @@ SELECT
   'SYNONYM',
   s.name,
   sn.name,
-  sn.base_object_name
+  sn.base_object_name,
+  CAST(NULL AS bit),
+  CAST(NULL AS bit)
 FROM sys.synonyms sn
 INNER JOIN sys.schemas s ON s.schema_id = sn.schema_id
 
@@ -623,7 +677,9 @@ SELECT
     CONVERT(nvarchar(100), sq.start_value),
     '; INCREMENT BY ',
     CONVERT(nvarchar(100), sq.increment)
-  )
+  ),
+  CAST(NULL AS bit),
+  CAST(NULL AS bit)
 FROM sys.sequences sq
 INNER JOIN sys.schemas s ON s.schema_id = sq.schema_id
 
@@ -633,13 +689,15 @@ SELECT
   'USER_DEFINED_TYPE',
   s.name,
   ty.name,
-  CONCAT(ty.name, ' based on ', bty.name)
+  CONCAT(ty.name, ' based on ', bty.name),
+  CAST(NULL AS bit),
+  CAST(NULL AS bit)
 FROM sys.types ty
 INNER JOIN sys.types bty ON bty.user_type_id = ty.system_type_id AND bty.user_type_id = bty.system_type_id
 INNER JOIN sys.schemas s ON s.schema_id = ty.schema_id
 WHERE ty.is_user_defined = 1
 )
-SELECT objectType, schemaName, objectName, definition
+SELECT objectType, schemaName, objectName, definition, usesAnsiNulls, usesQuotedIdentifier
 FROM ObjectDefinitions
 ${selectedFilterSql};
 `;
@@ -654,11 +712,17 @@ ${selectedFilterSql};
   const map = new Map();
   rows.forEach((row) => {
     const key = `${row.objectType}|${row.schemaName}|${row.objectName}`;
+    const definition = MODULE_DEFINITION_OBJECT_TYPES.has(String(row.objectType || "").toUpperCase())
+      ? composeModuleDefinition(row.definition, row.usesAnsiNulls, row.usesQuotedIdentifier)
+      : normalizeDefinition(row.definition);
+
     map.set(key, {
       objectType: row.objectType,
       schemaName: row.schemaName,
       objectName: row.objectName,
-      definition: normalizeDefinition(row.definition),
+      definition,
+      usesAnsiNulls: normalizeBitFlag(row.usesAnsiNulls),
+      usesQuotedIdentifier: normalizeBitFlag(row.usesQuotedIdentifier),
     });
   });
   return map;
@@ -725,7 +789,7 @@ foreach ($candidate in $serverCandidates) {
     $builder['TrustServerCertificate'] = $true
     $builder['Encrypt'] = $false
     $builder['Connect Timeout'] = 10
-    $builder['Application Name'] = 'BDeploy'
+    $builder['Application Name'] = 'Pebloy'
 
     if ('${authType}' -eq 'Windows') {
       $builder['Integrated Security'] = $true
@@ -881,7 +945,7 @@ foreach ($candidate in $serverCandidates) {
     $builder['TrustServerCertificate'] = $true
     $builder['Encrypt'] = $false
     $builder['Connect Timeout'] = 10
-    $builder['Application Name'] = 'BDeploy'
+    $builder['Application Name'] = 'Pebloy'
 
     if ('${authType}' -eq 'Windows') {
       $builder['Integrated Security'] = $true
