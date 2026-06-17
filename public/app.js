@@ -13,7 +13,7 @@ let _lastDeployResults = []; // for retry failed
 let _selectionSort  = { col: null, dir: "asc" };
 let _discoveredSort = { col: null, dir: "asc" };
 let _logSort = { col: "startedAt", dir: "desc" };
-const editorHelpers = globalThis.BDeployEditorHelpers || {
+const editorHelpers = globalThis.PebloyEditorHelpers || {
   normalizeFindMatchIndex(matchIdx, matchCount) {
     if (!matchCount) return -1;
     if (matchIdx < 0) return -1;
@@ -301,6 +301,13 @@ function readLegacyPreference(key, fallback = "") {
   }
 }
 
+function readAppPreference(key, fallback = "") {
+  return readLegacyPreference(
+    `pebloy.${key}`,
+    readLegacyPreference(`bdeploy.${key}`, readLegacyPreference(`dbbridge.${key}`, fallback))
+  );
+}
+
 async function loadPersistedAppState() {
   appState = await api("/api/app-state");
   return appState;
@@ -391,8 +398,8 @@ function applyPersistedUiState() {
   isApplyingAppState = true;
   try {
     if ($("notificationsToggle")) $("notificationsToggle").checked = Boolean(prefs.notificationsEnabled);
-    if ($("defaultBackupPath")) $("defaultBackupPath").value = prefs.defaultBackupPath || readLegacyPreference("bdeploy.defaultBackupPath", readLegacyPreference("dbbridge.defaultBackupPath", ""));
-    if ($("defaultScriptPath")) $("defaultScriptPath").value = prefs.defaultScriptPath || readLegacyPreference("bdeploy.defaultScriptPath", readLegacyPreference("dbbridge.defaultScriptPath", ""));
+    if ($("defaultBackupPath")) $("defaultBackupPath").value = prefs.defaultBackupPath || readAppPreference("defaultBackupPath", "");
+    if ($("defaultScriptPath")) $("defaultScriptPath").value = prefs.defaultScriptPath || readAppPreference("defaultScriptPath", "");
     if ($("logLevelSelect") && prefs.logLevel) $("logLevelSelect").value = prefs.logLevel;
 
     if ($("objectsProfile")) $("objectsProfile").value = ui.objectsProfileId || "";
@@ -1231,6 +1238,7 @@ function applyObjectModeUI() {
 async function discoverSharedObjects() {
   const profileId = $("objectsProfile").value;
   if (!profileId) {
+    endTaskProgress("objects", false, "Objects");
     showToast("Choose a source connection on the Objects tab", true);
     return;
   }
@@ -1242,9 +1250,12 @@ async function discoverSharedObjects() {
     search: $("sharedNameFilter").value,
   });
 
+  beginTaskProgress("objects", "Loading database objects...");
   showToast("Loading database objects...", false);
   sharedDiscoveredObjects = dedupeObjects(await api(`/api/objects?${params.toString()}`));
+  updateTaskProgress("objects", `Rendering ${sharedDiscoveredObjects.length} discovered objects...`, 85);
   renderSharedObjectPicker();
+  endTaskProgress("objects", true, "Objects");
   showToast(`Discovered ${sharedDiscoveredObjects.length} objects`);
 }
 
@@ -1266,16 +1277,19 @@ async function populateDiscoverDropdowns() {
 async function resolveAndAdd() {
   const profileId = $("objectsProfile").value;
   if (!profileId) {
+    endTaskProgress("objects", false, "Objects");
     showToast("Choose a source connection first", true);
     return;
   }
   const parsed = parseObjectLines($("sharedObjectText").value);
   if (!parsed.length) {
+    endTaskProgress("objects", false, "Objects");
     showToast("No valid object names found", true);
     return;
   }
 
   try {
+    beginTaskProgress("objects", `Resolving ${parsed.length} object type${parsed.length === 1 ? "" : "s"}...`);
     showToast("Resolving object types...", false);
     const resolved = await api("/api/objects/resolve-types", {
       method: "POST",
@@ -1311,7 +1325,9 @@ async function resolveAndAdd() {
         o.modifiedDate = res.modifiedDate;
       }
     }
+    updateTaskProgress("objects", "Applying resolved object metadata...", 80);
   } catch (error) {
+    endTaskProgress("objects", false, "Objects");
     showToast(`Type resolution failed: ${error.message}`, true);
     return;
   }
@@ -1319,6 +1335,7 @@ async function resolveAndAdd() {
   const valid = parsed.filter((o) => o.objectType && o.schemaName && o.objectName);
   const unresolved = parsed.length - valid.length;
   if (!valid.length) {
+    endTaskProgress("objects", false, "Objects");
     showToast("No objects could be resolved. Check the profile and object names.", true);
     return;
   }
@@ -1326,6 +1343,7 @@ async function resolveAndAdd() {
   addToSharedSelection(valid);
   $("sharedObjectText").value = "";
   persistCurrentAppState({ delay: 0 });
+  endTaskProgress("objects", true, "Objects");
   showToast(
     unresolved > 0
       ? `Added ${valid.length} objects (${unresolved} unresolved: use schema-qualified names when duplicates exist or verify missing objects in Discover mode.)`
@@ -1835,6 +1853,8 @@ function setupBackup() {
         `Objects backed up : ${result.objectCount}`,
         `Output folder     : ${result.generatedRoot || result.backupFolder}`,
         `Build path file   : ${result.buildPathFile || "(none)"}`,
+        `Exact SQL sync    : ${result.exactDefinitionsApplied || 0} programmable object${(result.exactDefinitionsApplied || 0) === 1 ? "" : "s"}`,
+        `Exact SQL warning : ${result.exactDefinitionWarning || "(none)"}`,
         `Generated at      : ${formatDateTime(result.restoreReadiness?.generatedAt || new Date())}`,
         `Task ID           : ${result.taskId}`,
       ].join("\n");
@@ -1851,11 +1871,43 @@ function setupBackup() {
 
 function setupDeployment() {
   $("goToObjects").onclick = () => setActiveTab("objects");
+  const progressEl = $("deployObjectProgress");
+  const retryRow = $("deployRetryRow");
+  const previewBtn = $("previewDeployPlan");
+  const previewEl = $("deployPlanPreview");
+  const deployResultEl = $("deployResult");
 
   const deployModeHints = {
     ExecuteDirectly: "",
     Rollback: "Validate Only: scripts run in a transaction that is always rolled back, so no database changes are committed.",
   };
+
+  function syncPreviewButtonLabel() {
+    if (!previewBtn) return;
+    previewBtn.textContent = previewEl && !previewEl.classList.contains("hidden") ? "Hide Preview" : "Preview Plan";
+  }
+
+  function hideDeployPlanPreview() {
+    if (!previewEl) return;
+    previewEl.classList.add("hidden");
+    previewEl.innerHTML = "";
+    syncPreviewButtonLabel();
+  }
+
+  function resetDeployRunArtifacts() {
+    if (progressEl) {
+      progressEl.innerHTML = "";
+      progressEl.classList.add("hidden");
+    }
+    if (retryRow) {
+      retryRow.classList.add("hidden");
+    }
+    if (deployResultEl) {
+      deployResultEl.innerHTML = "";
+    }
+    _lastDeployResults = [];
+    hideDeployPlanPreview();
+  }
 
   function updateDeployModeHint() {
     const hint = deployModeHints[$("deployMode").value] || "";
@@ -1875,7 +1927,16 @@ function setupDeployment() {
   };
 
   $("previewDeployPlan").onclick = async function () {
-    const restore = setButtonLoading(this, "Loading…");
+    if (previewEl && !previewEl.classList.contains("hidden")) {
+      hideDeployPlanPreview();
+      return;
+    }
+
+    const button = this;
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.classList.add("btn-loading");
+    button.textContent = "Loading…";
     try {
       if (!sharedSelectedObjects.length) {
         showToast("No objects selected.", true);
@@ -1888,6 +1949,7 @@ function setupDeployment() {
       const actionLabels = {
         AlterDelta: "Generate and apply table delta",
         ExecuteIndividually: "Execute object script individually",
+        CreateOrAlterIndividually: "Create or alter object script individually",
         DropAndCreate: "Drop and recreate object",
       };
       const rows = plan.map((item, i) => `<tr>
@@ -1896,36 +1958,38 @@ function setupDeployment() {
 <td>${escapeHtml(item.schemaName)}.${escapeHtml(item.objectName)}</td>
 <td class="muted">${escapeHtml(actionLabels[item.action] || item.action)}</td>
 </tr>`).join("");
-      const el = $("deployPlanPreview");
-      el.innerHTML = `<h4 style="margin:0 0 0.4rem">Execution Plan (${plan.length} objects)</h4>
+      previewEl.innerHTML = `<h4 style="margin:0 0 0.4rem">Execution Plan (${plan.length} objects)</h4>
 <table class="table"><thead><tr><th>#</th><th>Type</th><th>Object</th><th>Action</th></tr></thead>
 <tbody>${rows}</tbody></table>`;
-      el.classList.remove("hidden");
+      previewEl.classList.remove("hidden");
     } catch (error) {
       showToast(error.message, true);
     } finally {
-      restore();
+      button.disabled = false;
+      button.classList.remove("btn-loading");
+      button.textContent = originalText;
+      syncPreviewButtonLabel();
     }
   };
 
+  syncPreviewButtonLabel();
+
   $("runDeployment").onclick = async function () {
     const restoreBtn = setButtonLoading(this, "Running…");
-
-    // Clear previous progress and retry state
-    const progressEl = $("deployObjectProgress");
-    const retryRow = $("deployRetryRow");
-    progressEl.innerHTML = "";
-    progressEl.classList.remove("hidden");
-    retryRow.classList.add("hidden");
-    $("deployPlanPreview").classList.add("hidden");
+    resetDeployRunArtifacts();
 
     try {
       beginTaskProgress("deploy", "Preparing deployment...");
       showToast("Processing deployment...", false);
       if (sharedSelectedObjects.length === 0) {
         endTaskProgress("deploy", false, "Deployment");
+        if (progressEl) progressEl.classList.add("hidden");
         showToast("No objects selected. Use the Object Selection tab first.", true);
         return;
+      }
+
+      if (progressEl) {
+        progressEl.classList.remove("hidden");
       }
 
       // Environment guardrail
@@ -1966,11 +2030,11 @@ function setupDeployment() {
       endTaskProgress("deploy", true, "Deployment");
       _lastDeployResults = result.itemResults || [];
       renderDeployResult(result);
-      progressEl.classList.add("hidden");
+      if (progressEl) progressEl.classList.add("hidden");
 
       // Show retry button if any failed
       if ((result.summary?.failed ?? 0) > 0) {
-        retryRow.classList.remove("hidden");
+        if (retryRow) retryRow.classList.remove("hidden");
       }
 
       if (result.rollbackApplied) {
@@ -1985,7 +2049,7 @@ function setupDeployment() {
       await refreshLogs();
     } catch (error) {
       endTaskProgress("deploy", false, "Deployment");
-      progressEl.classList.add("hidden");
+      if (progressEl) progressEl.classList.add("hidden");
       showToast(error.message, true);
     } finally {
       restoreBtn();
@@ -2229,7 +2293,7 @@ function sendDesktopNotification(data) {
   if (!("Notification" in window)) return;
   _notificationPermission = Notification.permission;
   if (_notificationPermission !== "granted") return;
-  const title = `BDeploy — ${data.taskType} ${data.status}`;
+  const title = `Pebloy — ${data.taskType} ${data.status}`;
   let body = "";
   if (data.status === "Success" && data.summary) {
     if (data.taskType === "Deploy") body = `${data.summary.success ?? 0} succeeded, ${data.summary.failed ?? 0} failed`;
@@ -2273,7 +2337,7 @@ async function refreshLogs(page = 1, pageSize = 20) {
   const { items, pages } = paginate(sortedLogs, page, pageSize);
 
   function statusBadge(s) {
-    const map = { Success: "#16a34a", Failed: "#dc2626", Running: "#2563eb" };
+    const map = { Success: "var(--success-ink)", Failed: "var(--danger-ink)", Running: "var(--info-ink)" };
     const color = map[s] || "#888";
     return `<span style="color:${color};font-weight:600;font-size:0.8rem">${escapeHtml(s || "")}</span>`;
   }
@@ -2281,7 +2345,7 @@ async function refreshLogs(page = 1, pageSize = 20) {
   function eventBadge(log) {
     const level = String(log.highestLevel || "").toUpperCase();
     const label = level || "—";
-    const colors = { ERROR: "var(--danger)", WARN: "var(--warning)", INFO: "var(--text-2)" };
+    const colors = { ERROR: "var(--danger-ink)", WARN: "var(--warning-ink)", INFO: "var(--text-2)" };
     return `<span style="color:${colors[level] || "var(--muted)"};font-weight:600;font-size:0.78rem">${escapeHtml(label)}</span>`;
   }
 
@@ -2299,7 +2363,7 @@ async function refreshLogs(page = 1, pageSize = 20) {
 <td style="font-size:0.78rem">${dur}</td>
 <td style="white-space:nowrap">
   <button class="btn-ghost" style="padding:0.2rem 0.5rem;font-size:0.76rem" data-log-view='${escapeHtml(l.taskId)}'>Detail</button>
-  <button class="btn-ghost" style="padding:0.2rem 0.5rem;font-size:0.76rem" data-log-open='${escapeHtml(l.taskId)}'>Open File</button>
+  <button class="btn-ghost" style="padding:0.2rem 0.5rem;font-size:0.76rem" data-log-open='${escapeHtml(l.taskId)}'>Open With…</button>
 </td>
 </tr>`;
   }).join("");
@@ -2350,7 +2414,7 @@ ${paginationHtml}`;
     btn.onclick = async () => {
       try {
         const opened = await api(`/api/logs/${btn.dataset.logOpen}/open`, { method: "POST" });
-        showToast(`Opened: ${opened.path}`);
+        showToast(opened.promptForApp ? `Choose an app for: ${opened.path}` : `Opened: ${opened.path}`);
       } catch (error) {
         showToast(error.message, true);
       }
@@ -2426,13 +2490,13 @@ function formatLogDetail(detail) {
 }
 
 function setupTheme() {
-  const themes = Array.isArray(globalThis.BDeployThemes) && globalThis.BDeployThemes.length
-    ? globalThis.BDeployThemes
+  const themes = Array.isArray(globalThis.PebloyThemes) && globalThis.PebloyThemes.length
+    ? globalThis.PebloyThemes
     : [];
   const themeMap = new Map(themes.map((theme) => [theme.id, theme]));
   const fallbackThemeId = themeMap.has("dark") ? "dark" : themes[0]?.id;
   const validThemes = themes.map((theme) => theme.id);
-  const savedTheme = appState?.preferences?.theme || readLegacyPreference("bdeploy.theme", readLegacyPreference("dbbridge.theme", "dark"));
+  const savedTheme = appState?.preferences?.theme || readAppPreference("theme", "dark");
   const saved = validThemes.includes(savedTheme) ? savedTheme : fallbackThemeId;
 
   const headerPicker = $("themePicker");
@@ -2836,8 +2900,8 @@ function setupCustomize() {
       }
     });
   }
-  if (defBackupInput) defBackupInput.value = appState?.preferences?.defaultBackupPath || readLegacyPreference("bdeploy.defaultBackupPath", readLegacyPreference("dbbridge.defaultBackupPath", ""));
-  if (defScriptInput) defScriptInput.value = appState?.preferences?.defaultScriptPath || readLegacyPreference("bdeploy.defaultScriptPath", readLegacyPreference("dbbridge.defaultScriptPath", ""));
+  if (defBackupInput) defBackupInput.value = appState?.preferences?.defaultBackupPath || readAppPreference("defaultBackupPath", "");
+  if (defScriptInput) defScriptInput.value = appState?.preferences?.defaultScriptPath || readAppPreference("defaultScriptPath", "");
 
   // Browse buttons for default paths
   const defBackupBrowse = $("defaultBackupBrowse");
@@ -2888,7 +2952,7 @@ function setupCustomize() {
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = `bdeploy-backup-${date}.json`;
+        a.download = `pebloy-backup-${date}.json`;
         a.click();
         URL.revokeObjectURL(url);
         showToast("Backup downloaded. Proceeding with reset…", false);
@@ -3104,10 +3168,10 @@ function setupFontSelector() {
     if (persist) scheduleAppStateSave({ preferences: { fontSize: size } }, { delay: 0 });
   }
 
-  const savedFont = appState?.preferences?.fontFamily || readLegacyPreference("bdeploy.font", readLegacyPreference("dbbridge.font", "Space Grotesk"));
+  const savedFont = appState?.preferences?.fontFamily || readAppPreference("font", "Space Grotesk");
   if (savedFont) applyFont(savedFont, false);
 
-  const savedSize = appState?.preferences?.fontSize || Number(readLegacyPreference("bdeploy.fontSize", readLegacyPreference("dbbridge.fontSize", 14)));
+  const savedSize = appState?.preferences?.fontSize || Number(readAppPreference("fontSize", 14));
   if (savedSize) applyFontSize(Number(savedSize), false);
   else if (sizeLabel) sizeLabel.textContent = sizeEl ? sizeEl.value + "px" : "14px";
 
@@ -3128,7 +3192,7 @@ function setupProfileImportExport() {
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = "bdeploy-connections.json";
+        a.download = "pebloy-connections.json";
         a.click();
         URL.revokeObjectURL(url);
         showToast(`Exported ${profiles.length} connection(s)`);

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to BDeploy are documented here.
+All notable changes to Pebloy are documented here.
 
 ## [1.3.1] — 2026-05-28
 
@@ -68,11 +68,11 @@ All notable changes to BDeploy are documented here.
 - **Script whitespace trimming** — generated `.sql` files trimmed before storing or diffing; no leading/trailing blank lines in artifacts
 - **Factory Reset** button clears saved profiles, preferences, logs, generated scripts, exports, reports, and temp artifacts
 - **Persistent app-state file** stores UI preferences and working inputs in `data/app-state.json`
-- **Desktop launcher refresh** — `Launch-BDeploy.ps1` / `Launch-BDeploy.cmd` now create or refresh the `BDeploy.lnk` desktop shortcut during launch
+- **Desktop launcher refresh** — `Launch-Pebloy.ps1` / `Launch-Pebloy.cmd` now create or refresh the `Pebloy.lnk` desktop shortcut during launch
 
 ### Changed
 
-- App renamed from DBBridge / EasyDeploy to **BDeploy** across all files
+- App renamed from DBBridge / EasyDeploy to **Pebloy** across all files
 - Broken logo reference (`new-logo.svg`) fixed — reverted to `logo.svg`
 - Nothing OS UI redesign: pure black background, `#ff2340` red accent, flat buttons (no gradients), dot-grid texture, 4px border radius
 - Dark theme updated to match Nothing OS palette; light theme preserved as independent theme

@@ -73,7 +73,7 @@ function startExpressServer() {
     });
 
     const startTimeout = setTimeout(() => {
-      reject(new Error("BDeploy server failed to start within 30 seconds."));
+      reject(new Error("Pebloy server failed to start within 30 seconds."));
     }, 30000);
 
     serverProcess.stdout.on("data", (chunk) => {
@@ -119,7 +119,7 @@ function createWindow(port) {
     height: 900,
     minWidth: 960,
     minHeight: 640,
-    title: "BDeploy",
+    title: "Pebloy",
     icon: LOGO_PATH,
     backgroundColor: "#f4f4f4",
     webPreferences: {

@@ -1,4 +1,4 @@
-# BDeploy — Security Notes
+# Pebloy — Security Notes
 
 ## Password Storage
 
@@ -42,7 +42,7 @@ These are listed in `.gitignore`.
 
 - The Express API currently listens on localhost only (not exposed to the network in default configuration).
 - HTTPS is not enabled by default but is recommended for any deployment accessible over a network.
-- No authentication layer is currently implemented — BDeploy is designed for single-user local use.
+- No authentication layer is currently implemented — Pebloy is designed for single-user local use.
 
 ## Reporting Security Issues
 

@@ -169,7 +169,7 @@ async function pickFile(options = {}) {
   }
 }
 
-function openPath(targetPath) {
+function openPath(targetPath, options = {}) {
   return new Promise((resolve, reject) => {
     if (!targetPath) {
       reject(new Error("No path provided."));
@@ -177,6 +177,7 @@ function openPath(targetPath) {
     }
 
     const escapedPath = sanitizeForPs(targetPath);
+    const promptForApp = options && options.promptForApp === true;
     const script = `
 $ErrorActionPreference = 'Stop'
 $target = '${escapedPath}'
@@ -184,7 +185,11 @@ if (-not (Test-Path -LiteralPath $target)) {
   throw "Path not found: $target"
 }
 $resolved = (Resolve-Path -LiteralPath $target).Path
-Invoke-Item -LiteralPath $resolved | Out-Null
+if (${promptForApp ? "$true" : "$false"} -and $IsWindows) {
+  Start-Process -FilePath 'rundll32.exe' -ArgumentList @('shell32.dll,OpenAs_RunDLL', $resolved) | Out-Null
+} else {
+  Invoke-Item -LiteralPath $resolved | Out-Null
+}
 Write-Output $resolved
 `;
     executePowerShell(script)

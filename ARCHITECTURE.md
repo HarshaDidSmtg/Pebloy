@@ -1,8 +1,8 @@
-# BDeploy — Architecture
+# Pebloy — Architecture
 
 ## 1. Overview
 
-BDeploy is a local web app for SQL object lifecycle workflows:
+Pebloy is a local web app for SQL object lifecycle workflows:
 
 - **Code Diff:** Compare object scripts between source and destination databases using fresh scripts pulled at runtime.
 - **Backup:** Generate object scripts from a source database using `scripts/powershell/DBObjectsBulkScriptGenerator.ps1`.
@@ -182,7 +182,7 @@ For process monitoring with PM2:
 
 ```text
 npm install -g pm2
-pm2 start src/server.js --name bdeploy
+pm2 start src/server.js --name pebloy
 pm2 status
 ```
 

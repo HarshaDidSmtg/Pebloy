@@ -13,7 +13,7 @@ async function runBackup(profile, selectedObjects, options, task, onProgress = (
 
   onProgress({ taskType: "Backup", key: "backup", operation: "Generating scripts...", percent: 35 });
 
-  const { generated } = await generateScriptsForProfile({
+  const { generated, exactDefinitionsApplied, exactDefinitionWarning } = await generateScriptsForProfile({
     taskId: task.taskId,
     profile,
     selectedObjects: cleanObjects,
@@ -36,6 +36,8 @@ async function runBackup(profile, selectedObjects, options, task, onProgress = (
       generatedAt: new Date().toISOString(),
       generatedRoot: generated.runRoot,
     },
+    exactDefinitionsApplied,
+    exactDefinitionWarning,
     scriptStdout: generated.scriptStdout,
   };
 }

@@ -3,7 +3,7 @@
   if (typeof module === "object" && module.exports) {
     module.exports = api;
   }
-  root.BDeployEditorHelpers = api;
+  root.PebloyEditorHelpers = api;
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   function normalizeFindMatchIndex(matchIdx, matchCount) {
     if (!matchCount) return -1;

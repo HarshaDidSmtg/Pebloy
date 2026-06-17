@@ -1,4 +1,4 @@
-# Contributing to BDeploy
+# Contributing to Pebloy
 
 Thank you for your interest in contributing! This guide explains how to get started.
 
@@ -7,8 +7,8 @@ Thank you for your interest in contributing! This guide explains how to get star
 Clone the repository and work from the repository root:
 
 ```bash
-git clone https://github.com/SriHarshaSpidey/BDeploy.git
-cd BDeploy
+git clone https://github.com/SriHarshaSpidey/Pebloy.git
+cd Pebloy
 npm install
 npm run dev          # Start Express server with auto-reload
 # or
@@ -85,7 +85,7 @@ Run `npm run check` before submitting — it validates JS syntax across all serv
 
 ## Reporting Issues
 
-Please open a GitHub Issue at [SriHarshaSpidey/BDeploy Issues](https://github.com/SriHarshaSpidey/BDeploy/issues) with:
+Please open a GitHub Issue at [SriHarshaSpidey/Pebloy Issues](https://github.com/SriHarshaSpidey/Pebloy/issues) with:
 
 - OS version and Node.js version
 - Steps to reproduce

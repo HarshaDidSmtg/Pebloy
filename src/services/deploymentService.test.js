@@ -479,4 +479,18 @@ describe("runDeployment", () => {
     expect(planTypes[1]).toBe("TABLE");
     expect(planTypes[2]).toBe("PROCEDURE");
   });
+
+  it("orders objects of the same type by created date after type dependency order", () => {
+    const plan = buildDeploymentPlan([
+      { objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcNewer", createdDate: "2026-06-11T08:30:00.000Z" },
+      { objectType: "VIEW", schemaName: "dbo", objectName: "ViewA", createdDate: "2026-06-15T08:30:00.000Z" },
+      { objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcOlder", createdDate: "2026-06-10T08:30:00.000Z" },
+    ]);
+
+    expect(plan.map((item) => `${item.objectType}:${item.objectName}`)).toEqual([
+      "VIEW:ViewA",
+      "PROCEDURE:ProcOlder",
+      "PROCEDURE:ProcNewer",
+    ]);
+  });
 });

@@ -1,4 +1,4 @@
-// Utility functions for BDeploy services
+// Utility functions for Pebloy services
 
 function normalizeAuthType(authType) {
   // Only accept "Sql" or "Windows" (case-insensitive), fallback to "Windows"
