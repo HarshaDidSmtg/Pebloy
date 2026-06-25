@@ -1,7 +1,7 @@
 {
   "name": "pebloy",
-  "version": "1.3.1",
-  "description": "SQL Server schema diff, backup, and deployment tool for Windows",
+  "version": "1.3.2",
+  "description": "SQL Server schema diff, backup, and deployment tool for Windows — compare, script, and deploy database objects.",
   "main": "src/electron/main.js",
   "author": "Pebloy Contributors",
   "license": "MIT",

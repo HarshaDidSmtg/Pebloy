@@ -2,6 +2,12 @@
 
 All notable changes to Pebloy are documented here.
 
+## [1.3.2] — 2026-06-26
+
+### Changed
+
+- Version bump to verify the in-app update flow (`updater:check`) detects and surfaces a newer release.
+
 ## [Unreleased] — 2026-06-23
 
 ### Added
