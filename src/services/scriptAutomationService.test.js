@@ -91,6 +91,18 @@ describe("normalizeExecutableSql — CREATE OR ALTER conversion", () => {
     expect(out).toContain("SET QUOTED_IDENTIFIER OFF\nGO\n/*** header ***/\nCREATE OR ALTER PROCEDURE [dbo].[foo] AS SELECT 1");
   });
 
+  it("rehydrates metadata-backed SET batches for headerless programmable deploy artifacts", () => {
+    const out = normalizeExecutableSql("CREATE VIEW [dbo].[v] AS SELECT 1 AS x", "VIEW", {}, {
+      strategy: "createOrAlter",
+      moduleMetadata: {
+        usesAnsiNulls: false,
+        usesQuotedIdentifier: true,
+      },
+    });
+
+    expect(out).toContain("SET ANSI_NULLS OFF\nGO\nSET QUOTED_IDENTIFIER ON\nGO\nCREATE OR ALTER VIEW [dbo].[v] AS SELECT 1 AS x");
+  });
+
   it("leaves TABLE DDL unchanged (no OR ALTER for tables)", () => {
     const sql = "CREATE TABLE [dbo].[t] (id INT NOT NULL)";
     const out = normalizeExecutableSql(sql, "TABLE");

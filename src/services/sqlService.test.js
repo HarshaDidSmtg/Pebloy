@@ -104,7 +104,7 @@ describe("executeSqlScriptsIndividually", () => {
             objectType: "PROCEDURE",
             schemaName: "dbo",
             objectName: "ProcA",
-            definition: "CREATE PROCEDURE dbo.ProcA AS SELECT 1",
+            definition: "-- authored preamble\nCREATE PROCEDURE dbo.ProcA AS SELECT 1",
             usesAnsiNulls: 1,
             usesQuotedIdentifier: 0,
           },
@@ -130,7 +130,7 @@ describe("executeSqlScriptsIndividually", () => {
     expect(decodedQuery).toContain("m.uses_ansi_nulls AS usesAnsiNulls");
     expect(decodedQuery).toContain("m.uses_quoted_identifier AS usesQuotedIdentifier");
     expect(result.get("PROCEDURE|dbo|ProcA").definition).toBe(
-      "SET ANSI_NULLS ON\nGO\nSET QUOTED_IDENTIFIER OFF\nGO\nCREATE PROCEDURE dbo.ProcA AS SELECT 1"
+      "CREATE PROCEDURE dbo.ProcA AS SELECT 1"
     );
   });
 });

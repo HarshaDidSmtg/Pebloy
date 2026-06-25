@@ -17,7 +17,7 @@
 Clone the repository and run from the repository root:
 
 ```powershell
-git clone https://github.com/SriHarshaSpidey/Pebloy.git
+git clone https://github.com/HarshaDidSmtg/Pebloy.git
 cd Pebloy
 npm install
 npm start

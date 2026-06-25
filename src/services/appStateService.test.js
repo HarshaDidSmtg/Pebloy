@@ -17,6 +17,7 @@ describe("appStateService — shortcuts", () => {
   it("returns default shortcuts when no file exists", () => {
     const state = getAppState();
     expect(state.preferences.shortcuts).toEqual(DEFAULT_SHORTCUTS);
+    expect(state.preferences.hiddenTabs).toEqual([]);
   });
 
   it("saves a custom shortcut and reads it back", () => {
@@ -76,5 +77,28 @@ describe("appStateService — shortcuts", () => {
     saveAppState({ preferences: { favoriteThemes: [] } });
     state = getAppState();
     expect(state.preferences.favoriteThemes).toEqual(DEFAULT_THEME_FAVORITES);
+  });
+
+  it("persists hidden tabs across saves while keeping settings visible", () => {
+    saveAppState({ preferences: { hiddenTabs: ["deploy", "dashboard", "customize", "deploy", "not-a-tab"] } });
+    saveAppState({ preferences: { theme: "cyberpunk" } });
+
+    const state = getAppState();
+    expect(state.preferences.hiddenTabs).toEqual(["deploy"]);
+    expect(state.preferences.theme).toBe("cyberpunk");
+  });
+
+  it("falls back to credentials when a persisted active tab was retired", () => {
+    saveAppState({ ui: { activeTab: "dashboard" } });
+
+    const state = getAppState();
+    expect(state.ui.activeTab).toBe("credentials");
+  });
+
+  it("keeps valid active tabs when sanitizing persisted state", () => {
+    saveAppState({ ui: { activeTab: "diff" } });
+
+    const state = getAppState();
+    expect(state.ui.activeTab).toBe("diff");
   });
 });

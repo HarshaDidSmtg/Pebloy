@@ -35,6 +35,34 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.resolve(__dirname, "..", "public")));
 
+app.get("/api/dashboard", (req, res) => {
+  try {
+    const profiles = listProfiles();
+    const logs = listLogFiles();
+    const recent = logs.slice(0, 5);
+    const byType = {};
+    for (const log of logs) {
+      byType[log.taskType] = (byType[log.taskType] || 0) + 1;
+    }
+    res.json({
+      profileCount: profiles.length,
+      totalTasks: logs.length,
+      taskBreakdown: byType,
+      recentTasks: recent.map((l) => ({
+        taskId: l.taskId,
+        taskType: l.taskType,
+        status: l.status,
+        startedAt: l.startedAt,
+        objectCount: l.objectCount || 0,
+        sourceProfileLabel: l.sourceProfileLabel,
+        destinationProfileLabel: l.destinationProfileLabel,
+      })),
+    });
+  } catch (error) {
+    httpError(res, error);
+  }
+});
+
 // Fetch unique object types for discover dropdown
 app.get("/api/objects/types", async (req, res) => {
   try {

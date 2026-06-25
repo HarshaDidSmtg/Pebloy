@@ -504,6 +504,7 @@ function normalizeDefinition(value) {
 }
 
 const MODULE_DEFINITION_OBJECT_TYPES = new Set(["PROCEDURE", "VIEW", "FUNCTION", "TRIGGER"]);
+const MODULE_DDL_START_PATTERN = /(^|\n)\s*((?:CREATE(?:\s+OR\s+ALTER)?|ALTER)\s+(?:PROCEDURE|PROC|VIEW|FUNCTION|TRIGGER)\b)/im;
 
 function normalizeBitFlag(value) {
   if (value === null || value === undefined || value === "") {
@@ -528,27 +529,35 @@ function normalizeBitFlag(value) {
   return null;
 }
 
+function stripLeadingModulePreamble(text) {
+  const normalized = String(text || "").trim();
+  if (!normalized) {
+    return "";
+  }
+
+  const match = MODULE_DDL_START_PATTERN.exec(normalized);
+  if (!match) {
+    return normalized;
+  }
+
+  const startIndex = match.index + match[0].length - match[2].length;
+  return normalized.slice(startIndex).trim();
+}
+
 function composeModuleDefinition(definition, usesAnsiNulls, usesQuotedIdentifier) {
   const body = normalizeDefinition(definition);
   if (!body) {
     return "";
   }
 
-  const parts = [];
-  const ansiFlag = normalizeBitFlag(usesAnsiNulls);
-  const quotedFlag = normalizeBitFlag(usesQuotedIdentifier);
-  const hasAnsiHeader = /^\s*SET\s+ANSI_NULLS\s+(?:ON|OFF)\s*;?$/im.test(body);
-  const hasQuotedHeader = /^\s*SET\s+QUOTED_IDENTIFIER\s+(?:ON|OFF)\s*;?$/im.test(body);
-
-  if (ansiFlag !== null && !hasAnsiHeader) {
-    parts.push(`SET ANSI_NULLS ${ansiFlag ? "ON" : "OFF"}`, "GO");
-  }
-  if (quotedFlag !== null && !hasQuotedHeader) {
-    parts.push(`SET QUOTED_IDENTIFIER ${quotedFlag ? "ON" : "OFF"}`, "GO");
-  }
-
-  parts.push(body);
-  return parts.join("\n").trim();
+  return stripLeadingModulePreamble(
+    body
+    .replace(
+      /^\s*SET\s+ANSI_NULLS\s+(?:ON|OFF)\s*;?\s*\r?\nGO\s*\r?\nSET\s+QUOTED_IDENTIFIER\s+(?:ON|OFF)\s*;?\s*\r?\nGO\s*\r?\n?/i,
+      ""
+    )
+    .trim()
+  );
 }
 
 async function fetchObjectDefinitionMap(profile, selectedObjects = []) {
@@ -1261,5 +1270,6 @@ module.exports = {
   executeSqlScript,
   executeSqlScriptsIndividually,
   getTableCreateScript,
+  normalizeBitFlag,
   resolveObjectTypes,
 };

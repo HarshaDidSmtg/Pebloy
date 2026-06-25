@@ -44,6 +44,11 @@ desktop.ini
 # Claude Code internal
 .claude/
 
-# Test results
+# Test results and fixtures
 coverage/
 junit.xml
+test-output/
+
+# Session / scratch files
+SESSION_CONTEXT.md
+image.png

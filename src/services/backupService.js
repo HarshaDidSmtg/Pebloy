@@ -1,6 +1,6 @@
-const path = require("path");
 const { ensureDir } = require("./storage");
 const { generateScriptsForProfile, normalizeSelectedObjects } = require("./scriptGenerationService");
+const { EXPORTS_DIR } = require("./paths");
 
 async function runBackup(profile, selectedObjects, options, task, onProgress = () => {}) {
   const cleanObjects = normalizeSelectedObjects(selectedObjects);
@@ -8,12 +8,12 @@ async function runBackup(profile, selectedObjects, options, task, onProgress = (
     throw new Error("Select one or more objects to back up.");
   }
 
-  const backupRoot = options.destinationPath || path.resolve(__dirname, "..", "..", "artifacts", "exports");
+  const backupRoot = options.destinationPath || EXPORTS_DIR;
   ensureDir(backupRoot);
 
   onProgress({ taskType: "Backup", key: "backup", operation: "Generating scripts...", percent: 35 });
 
-  const { generated, exactDefinitionsApplied, exactDefinitionWarning } = await generateScriptsForProfile({
+  const { generated, exactDefinitionsApplied, exactDefinitionWarning, generationWarnings = [] } = await generateScriptsForProfile({
     taskId: task.taskId,
     profile,
     selectedObjects: cleanObjects,
@@ -38,6 +38,7 @@ async function runBackup(profile, selectedObjects, options, task, onProgress = (
     },
     exactDefinitionsApplied,
     exactDefinitionWarning,
+    generationWarnings,
     scriptStdout: generated.scriptStdout,
   };
 }

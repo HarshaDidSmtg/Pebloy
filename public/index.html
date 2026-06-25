@@ -10,14 +10,11 @@
   <body>
     <header class="app-header">
       <div class="brand-wrap">
-        <img src="logo.svg" alt="Pebloy logo" class="app-logo" />
-        <div>
+        <img src="logo.svg" alt="" class="app-logo" aria-hidden="true" />
+        <div class="brand-copy">
           <h1>Pebloy</h1>
-          <p>Streamlined SQL Server schema management</p>
+          <p>SQL Server schema management</p>
         </div>
-      </div>
-      <div class="header-tools">
-        <div class="theme-picker" id="themePicker"></div>
       </div>
     </header>
 
@@ -36,9 +33,9 @@
         <h2>Connections</h2>
         <form id="profileForm" class="grid-form">
           <input type="hidden" id="profileId" />
-          <label>Connection Alias <input id="profileLabel" required /></label>
-          <label>SQL Server <input id="serverName" required /></label>
-          <label>Database <input id="databaseName" required /></label>
+          <label>Connection Alias <input id="profileLabel" required maxlength="100" /></label>
+          <label>SQL Server <input id="serverName" required maxlength="253" placeholder="localhost or server\instance" /></label>
+          <label>Database <input id="databaseName" required maxlength="128" /></label>
           <label>
             Authentication
             <select id="authenticationType">
@@ -46,9 +43,9 @@
               <option value="Sql">SQL</option>
             </select>
           </label>
-          <label id="usernameField" class="credentials-sql-only">Username <input id="username" /></label>
-          <label id="passwordField" class="credentials-sql-only">Password <input id="password" type="password" autocomplete="new-password" /></label>
-          <label>Environment <input id="environmentTag" placeholder="DEV/QA/UAT/PROD" /></label>
+          <label id="usernameField" class="credentials-sql-only">Username <input id="username" maxlength="128" /></label>
+          <label id="passwordField" class="credentials-sql-only">Password <input id="password" type="password" autocomplete="new-password" placeholder="Enter password" /></label>
+          <label>Environment <input id="environmentTag" maxlength="20" placeholder="DEV/QA/UAT/PROD" /></label>
           <div class="row-actions">
             <button type="submit">Save Profile</button>
             <button type="button" id="clearProfile">Clear</button>
@@ -265,9 +262,8 @@
               <input type="range" id="fontSizeRange" min="11" max="20" step="1" value="14" />
             </div>
             <div class="customize-field">
-              <label>Theme</label>
-              <div class="theme-picker-inline" id="themePickerInline"></div>
-              <div class="theme-preview-panel" id="themePreviewPanel"></div>
+              <label for="themeSelect">Theme</label>
+              <select id="themeSelect"></select>
             </div>
           </div>
 
@@ -303,6 +299,38 @@
                 <option value="Normal" selected>Normal (INFO/WARN/ERROR)</option>
                 <option value="ErrorsOnly">Errors Only</option>
               </select>
+            </div>
+          </div>
+
+          <!-- Tab Visibility -->
+          <div class="customize-card">
+            <h3>Tab Visibility</h3>
+            <p class="muted">Choose which tabs appear in the navigation bar. Settings cannot be hidden.</p>
+            <div class="tab-vis-list">
+              <label class="flag-label"><input type="checkbox" id="tabVis-credentials" data-tab-vis="credentials" checked /> Connections</label>
+              <label class="flag-label"><input type="checkbox" id="tabVis-objects" data-tab-vis="objects" checked /> Objects</label>
+              <label class="flag-label"><input type="checkbox" id="tabVis-diff" data-tab-vis="diff" checked /> Code Diff</label>
+              <label class="flag-label"><input type="checkbox" id="tabVis-backup" data-tab-vis="backup" checked /> Backup</label>
+              <label class="flag-label"><input type="checkbox" id="tabVis-deploy" data-tab-vis="deploy" checked /> Deployment</label>
+              <label class="flag-label"><input type="checkbox" id="tabVis-logs" data-tab-vis="logs" checked /> Logs</label>
+            </div>
+          </div>
+
+          <!-- About & Updates -->
+          <div class="customize-card" id="updaterCard">
+            <h3>About &amp; Updates</h3>
+            <p class="muted">Current version: <strong id="currentVersionLabel">—</strong></p>
+            <div id="updateStatus" class="update-status"></div>
+            <div class="update-progress-wrap" id="updateProgressWrap" hidden>
+              <div class="update-progress-bar-track">
+                <div class="update-progress-bar" id="updateProgressBar"></div>
+              </div>
+              <span class="update-progress-pct" id="updateProgressPct">0%</span>
+            </div>
+            <div class="update-actions">
+              <button type="button" id="checkForUpdatesBtn" class="btn-primary">Check for Updates</button>
+              <button type="button" id="downloadInstallBtn" class="btn-primary" hidden>Download &amp; Install</button>
+              <a id="releasePageLink" href="#" target="_blank" class="btn-ghost" hidden>View Release</a>
             </div>
           </div>
         </div>
@@ -379,8 +407,21 @@
 
     <div id="toast"></div>
 
+    <!-- Parallel tasks floating panel -->
+    <div id="parallelTasksPanel" class="parallel-tasks-panel hidden">
+      <div class="parallel-tasks-header">
+        <span id="parallelTasksTitle">Active Tasks</span>
+        <button type="button" id="closeParallelPanel" class="btn-ghost btn-sm">✕</button>
+      </div>
+      <div id="parallelTasksList" class="parallel-tasks-body"></div>
+    </div>
+
     <!-- Bottom taskbar: shows in-progress tasks + last completed task summary -->
-    <div id="taskbar" class="taskbar">
+    <div id="taskbar" class="taskbar taskbar-initially-hidden">
+      <button type="button" id="showTasksBtn" class="taskbar-tasks-btn hidden">
+        <span class="status-dot running"></span>
+        Tasks <span id="tasksBadge" class="tasks-count">0</span>
+      </button>
       <div id="taskbarRunning" class="taskbar-running"></div>
       <div id="taskbarSummary" class="taskbar-summary"></div>
     </div>

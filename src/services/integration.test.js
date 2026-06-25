@@ -140,7 +140,16 @@ function getDefinition(map, objectType, schemaName, objectName) {
   return map.get(`${objectType}|${schemaName}|${objectName}`)?.definition || "";
 }
 
-describe("Integration: seeded database workflows", () => {
+function hasProfile(tag) {
+  try {
+    const profiles = JSON.parse(fs.readFileSync(profilesPath, "utf8"));
+    return profiles.some((p) => String(p.environmentTag || "").toUpperCase() === tag);
+  } catch { return false; }
+}
+
+const describeIntegration = (hasProfile("DEV") && hasProfile("INT")) ? describe : describe.skip;
+
+describeIntegration("Integration: seeded database workflows", () => {
   let devProfile;
   let sliceProfile;
 
@@ -228,6 +237,14 @@ describe("Integration: seeded database workflows", () => {
     expect(result.objectCount).toBe(selectedObjects.length);
     expect(fs.existsSync(result.generatedRoot)).toBe(true);
     expect(fs.existsSync(result.buildPathFile)).toBe(true);
+    expect(result.generationWarnings || []).toEqual([]);
+
+    const procedurePath = path.join(result.generatedRoot, "bdeploy_test", "Stored Procedures", "usp_modified.sql");
+    expect(fs.existsSync(procedurePath)).toBe(true);
+    const procedureText = fs.readFileSync(procedurePath, "utf8").trim();
+    expect(procedureText).toMatch(/^(?:CREATE|ALTER)\s+(?:PROCEDURE|PROC)\b/i);
+    expect(procedureText).not.toMatch(/^\s*SET\s+(?:ANSI_NULLS|QUOTED_IDENTIFIER)\b/i);
+    expect(procedureText).not.toMatch(/^\s*CREATE\s+OR\s+ALTER\b/i);
 
     const combinedStoredProcedurePath = fs
       .readdirSync(result.generatedRoot)

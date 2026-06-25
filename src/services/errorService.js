@@ -63,6 +63,35 @@ function buildClientError(error, fallbackStatus = 400) {
     resolutionSteps = [
       "Choose different source and target profiles, or enable the explicit override if this is intentional.",
     ];
+  } else if (/bulk script generation failed|dbobjectsbulkscriptgenerator/i.test(lower)) {
+    resolutionSteps = [
+      "Confirm the source database is reachable and the selected profile credentials are valid.",
+      "Check that the SqlServer PowerShell module is installed under vendor/ps-modules or in the user module path.",
+      "Open the task log for the full PowerShell error output to identify which object caused the failure.",
+    ];
+  } else if (/table delta generation failed|comparetablesgeneratedelta/i.test(lower)) {
+    resolutionSteps = [
+      "Confirm both source and target databases are reachable with the selected profiles.",
+      "Verify the table exists in the source database and has not been renamed or dropped.",
+      "Check the task log for the specific table or column that triggered the delta failure.",
+    ];
+  } else if (/canonical source artifact validation failed/i.test(lower)) {
+    resolutionSteps = [
+      "Re-run Backup or Code Diff to regenerate clean source artifacts before deploying.",
+      "If the error mentions a deploy-only wrapper (CREATE OR ALTER, IF OBJECT_ID), the generated file is not a canonical source — regenerate it.",
+      "Ensure the source object exists and is scriptable in the source database.",
+    ];
+  } else if (/no valid objects supplied|requires at least one object/i.test(lower)) {
+    resolutionSteps = [
+      "Select at least one object in the Object Selection tab before running this operation.",
+      "If the object list was loaded from a file, verify the file format: one schema.name per line, or TYPE,schema,name.",
+    ];
+  } else if (/cannot connect|network-related|instance-specific/i.test(lower)) {
+    resolutionSteps = [
+      "Verify the SQL Server hostname and port in the connection profile.",
+      "Ensure the SQL Server service is running and accepting TCP connections.",
+      "Check firewall rules, VPN access, and named-instance settings (e.g., SERVER\\INSTANCE).",
+    ];
   }
 
   return {

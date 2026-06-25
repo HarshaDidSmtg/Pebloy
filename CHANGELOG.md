@@ -2,6 +2,38 @@
 
 All notable changes to Pebloy are documented here.
 
+## [Unreleased] — 2026-06-23
+
+### Added
+
+- **Canonical source-artifact quality gate** — `src/services/scriptGenerationService.js` now validates BuildPaths-listed per-object source artifacts before Backup or Code Diff uses them. Programmable-object source files must stay headerless, start with the expected `CREATE` / `ALTER` text, reject deploy-only wrappers such as `IF OBJECT_ID`, `DROP`, and `CREATE OR ALTER`, and tables must remain deterministic `CREATE TABLE` sources.
+- **Generation warning surfacing (UI)** — generation warnings from Backup, Code Diff, and Deploy now render as a visible warning panel directly below the result area in each tab. Warnings are color-coded using `--warning` and list the affected object name and profile role (source/destination for diff).
+- **Dashboard tab** — new first tab showing connection count, total task counts by type, quick-action buttons (Run Diff / Backup / Deploy / Select Objects), and a recent-tasks summary table. Dashboard refreshes on every tab visit.
+- **Golden-file regression tests** — `scriptGenerationService.test.js` now covers all canonical source object types (PROCEDURE, VIEW, FUNCTION, TRIGGER, TABLE, SYNONYM, SEQUENCE, USER_DEFINED_TYPE) for valid and invalid artifact scenarios, plus `EXACT_DEFINITION_OBJECT_MISSING` and `EXACT_DEFINITION_METADATA_INCOMPLETE` warning cases, and Windows line-ending output for function artifacts.
+- **Discover grid pagination** — the object picker now paginates at 50 objects per page for large result sets, with Prev/Next buttons and a jump-to-page input. Sorting resets to page 1. Lists under 50 objects render without pagination as before.
+- **Log file size cap** — `loggingService` trims individual `.log` files that exceed `MAX_LOG_FILE_BYTES` (default 2 MB, overridable via env var), keeping the header line and last 200 lines.
+- **Centralized artifact path config** — `src/services/paths.js` exports `EXPORTS_DIR` and `CODEDIFF_DIR`; `backupService`, `deploymentService`, and `scriptGenerationService` now derive output roots from this module rather than inlining `__dirname` chains. All paths remain env-var overridable.
+- **Improved actionable error messages** — `errorService` now maps additional error patterns to resolution steps: bulk script generation failures, table delta failures, canonical source validation failures, no-objects-supplied, and network connection errors.
+- **PowerShell error context extraction** — `scriptAutomationService` parses PS stderr for `At ...ps1:line N`, `CategoryInfo`, `FullyQualifiedErrorId`, and script-level `ERROR:` lines, appending them as a `[Detail]` suffix to thrown error messages for better log attribution.
+
+### Changed
+
+- **Tab order updated** — Dashboard is now the first tab (Dashboard → Connections → Objects → Code Diff → Backup → Deployment → Logs → Settings).
+- **Headerless canonical programmable-object artifacts preserved** — per-object Backup / Code Diff source files for procedures, views, functions, and triggers remain SSDT / DACPAC-safe and do not carry leading `SET ANSI_NULLS` / `GO` / `SET QUOTED_IDENTIFIER` / `GO` batches in BuildPaths-listed artifacts.
+- **Deploy-time session settings are now rehydrated from exact metadata** — executable deploy artifacts rebuild `SET ANSI_NULLS` and `SET QUOTED_IDENTIFIER` batches for procedures, views, functions, and triggers, while canonical source files remain headerless.
+- **Exact-definition sync now preserves deploy metadata in memory** so source artifacts stay canonical while deployment still has access to module-level session-setting metadata.
+- **Procedure deploy contract remains per-object** — individually tracked programmable-object deploy artifacts are still the executable path; combined stored-procedure files generated during backup remain auxiliary helpers rather than canonical source inputs.
+
+### Notes
+
+- **Backend path unchanged** — PowerShell remains the current scripting and execution backend; no .NET migration shipped.
+- **Validation scope** — in-repo unit, integration, and syntax validation passed; external `sqlproj` / DacFx build validation remains pending and is not present in this repo.
+- **Deployment plan preview** — confirmed fully implemented as of v1.3.0 (`POST /api/deploy/plan`, full UI with ordered execution plan).
+- **Retry failed objects** — confirmed fully implemented as a UI workflow: failed objects are re-added to the selection list for a follow-up deploy run.
+- **Utility consolidation** — `normalizeAuthType` and `normalizeSqlName` are defined once in `src/services/utils.js` with no duplication found across the service layer.
+- **Folder-as-source workflows** — not yet implemented; all Backup, Diff, and Deploy modes require live database profiles. Planned as a future enhancement (see IMPROVEMENTS.md).
+- **SQL parser/build validation (DacFx)** — not yet implemented; only pattern-based canonical-source validation exists. External compiler-grade validation via sqlproj/DacFx remains a future enhancement.
+
 ## [1.3.1] — 2026-05-28
 
 ### Added

@@ -14,7 +14,26 @@ jest.mock("./scriptAutomationService", () => ({
   buildProfileOutputBasePath: jest.fn((outputBasePath, profileLabel) => `${outputBasePath}/profiles/${profileLabel || "default"}`),
   buildRunRoot: jest.fn((outputBasePath, databaseName) => `${outputBasePath}/run/${databaseName}`),
   generateTableDelta: jest.fn(),
-  normalizeExecutableSql: jest.fn((sql) => sql),
+  normalizeExecutableSql: jest.fn((sql, objectType, _context, options = {}) => {
+    const metadata = options.moduleMetadata || {};
+    const type = String(objectType || "").toUpperCase();
+    if (!["PROCEDURE", "VIEW", "FUNCTION", "TRIGGER"].includes(type)) {
+      return sql;
+    }
+
+    const headerLines = [];
+    if (metadata.usesAnsiNulls != null) {
+      headerLines.push(`SET ANSI_NULLS ${metadata.usesAnsiNulls ? "ON" : "OFF"}`);
+    }
+    if (metadata.usesQuotedIdentifier != null) {
+      headerLines.push(`SET QUOTED_IDENTIFIER ${metadata.usesQuotedIdentifier ? "ON" : "OFF"}`);
+    }
+    if (!headerLines.length) {
+      return sql;
+    }
+
+    return `${headerLines.join("\nGO\n")}\nGO\n${sql}`;
+  }),
 }));
 jest.mock("./scriptGenerationService", () => ({
   generateScriptsForProfile: jest.fn(),
@@ -58,6 +77,7 @@ function makeGeneratedInfo(runRoot = "/out", scripts = []) {
     scripts,
     combinedStoredProceduresPath: null,
     selectedObjects: [],
+    generationWarnings: [],
   };
 }
 
@@ -150,6 +170,46 @@ describe("runDeployment", () => {
     expect(broadcastProgress).toHaveBeenCalledWith(
       "deployProgress",
       expect.objectContaining({ objectType: "VIEW", objectName: "ViewA", status: "RolledBack", done: 1, total: 1 })
+    );
+  });
+
+  it("rehydrates non-default programmable object metadata into deploy execution artifacts", async () => {
+    const fs = require("fs");
+    fs.readFileSync.mockImplementation(() => "CREATE VIEW dbo.ViewA AS SELECT 1");
+    generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", [
+      {
+        objectType: "VIEW",
+        schemaName: "dbo",
+        objectName: "ViewA",
+        scriptPath: "/out/dbo.ViewA.sql",
+        moduleMetadata: { usesAnsiNulls: false, usesQuotedIdentifier: true, definitionSource: "exact" },
+      },
+    ]));
+
+    await runDeployment({
+      sourceProfile: srcProfile,
+      destinationProfile: dstProfile,
+      selectedObjects: [{ objectType: "VIEW", schemaName: "dbo", objectName: "ViewA" }],
+      mode: "ExecuteDirectly",
+      continueOnError: false,
+      options: {},
+      task,
+      logEvent,
+    });
+
+    expect(normalizeExecutableSql).toHaveBeenCalledWith(
+      "CREATE VIEW dbo.ViewA AS SELECT 1",
+      "VIEW",
+      expect.objectContaining({ schemaName: "dbo", objectName: "ViewA" }),
+      expect.objectContaining({
+        strategy: "createOrAlter",
+        moduleMetadata: { usesAnsiNulls: false, usesQuotedIdentifier: true, definitionSource: "exact" },
+      })
+    );
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining("VIEW_dbo_ViewA.sql"),
+      expect.stringContaining("SET ANSI_NULLS OFF\r\nGO\r\nSET QUOTED_IDENTIFIER ON\r\nGO\r\nCREATE VIEW dbo.ViewA AS SELECT 1"),
+      "utf8"
     );
   });
 

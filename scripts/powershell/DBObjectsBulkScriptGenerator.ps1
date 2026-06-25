@@ -152,6 +152,16 @@ function Clean-SqlScript($text) {
     return ($out -join "`r`n")
 }
 
+function Remove-LeadingModuleBatchHeaders {
+    param([Parameter(Mandatory)][string]$Text)
+
+    return ([regex]::Replace(
+        $Text,
+        '(?ims)^\s*SET\s+ANSI_NULLS\s+(?:ON|OFF)\s*;?\s*\r?\nGO\s*\r?\nSET\s+QUOTED_IDENTIFIER\s+(?:ON|OFF)\s*;?\s*\r?\nGO\s*\r?\n?',
+        ''
+    )).Trim()
+}
+
 function Format-ModuleDefinitionText {
     param(
         [Parameter(Mandatory)][string]$DefinitionText,
@@ -160,26 +170,12 @@ function Format-ModuleDefinitionText {
     )
 
     $text = Format-DdlKeywords $DefinitionText
-    $text = $text.Trim()
+    $text = Remove-LeadingModuleBatchHeaders $text
     if ([string]::IsNullOrWhiteSpace($text)) {
         return ""
     }
 
-    $parts = @()
-    $hasAnsiHeader = $text -match '(?im)^\s*SET\s+ANSI_NULLS\s+(?:ON|OFF)\s*;?\s*$'
-    $hasQuotedHeader = $text -match '(?im)^\s*SET\s+QUOTED_IDENTIFIER\s+(?:ON|OFF)\s*;?\s*$'
-
-    if (-not $hasAnsiHeader -and $null -ne $UsesAnsiNulls -and "$UsesAnsiNulls" -ne "") {
-        $parts += "SET ANSI_NULLS $(if ([bool]$UsesAnsiNulls) { 'ON' } else { 'OFF' })"
-        $parts += "GO"
-    }
-    if (-not $hasQuotedHeader -and $null -ne $UsesQuotedIdentifier -and "$UsesQuotedIdentifier" -ne "") {
-        $parts += "SET QUOTED_IDENTIFIER $(if ([bool]$UsesQuotedIdentifier) { 'ON' } else { 'OFF' })"
-        $parts += "GO"
-    }
-
-    $parts += $text
-    return ($parts -join "`r`n").Trim()
+    return $text
 }
 
 function Set-ScriptingOptionIfAvailable {

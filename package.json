@@ -7,12 +7,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/SriHarshaSpidey/Pebloy.git"
+    "url": "git+https://github.com/HarshaDidSmtg/Pebloy.git"
   },
   "bugs": {
-    "url": "https://github.com/SriHarshaSpidey/Pebloy/issues"
+    "url": "https://github.com/HarshaDidSmtg/Pebloy/issues"
   },
-  "homepage": "https://github.com/SriHarshaSpidey/Pebloy#readme",
+  "homepage": "https://github.com/HarshaDidSmtg/Pebloy#readme",
   "keywords": [
     "sql-server",
     "database",
@@ -29,6 +29,7 @@
     "dev": "nodemon --watch src --ext js,json src/server.js",
     "electron": "electron .",
     "electron:dev": "electron . --dev",
+    "prebuild": "node scripts/prebuild-win.js",
     "build": "electron-builder --win",
     "build:dir": "electron-builder --win --dir",
     "check": "node --check src/server.js && node --check src/services/backupService.js && node --check src/services/deploymentService.js && node --check src/services/diffService.js && node --check src/services/loggingService.js && node --check src/services/profileService.js && node --check src/services/scriptAutomationService.js && node --check src/services/secretStore.js && node --check src/services/sqlService.js && node --check src/services/storage.js && node --check src/services/systemService.js && node --check src/electron/main.js && node --check public/app.js",
@@ -74,11 +75,18 @@
         { "target": "nsis", "arch": ["x64"] },
         { "target": "portable", "arch": ["x64"] }
       ],
-      "icon": "build/icon.ico"
+      "icon": "build/icon.ico",
+      "sign": null,
+      "signingHashAlgorithms": null,
+      "certificateSubjectName": null
     },
     "nsis": {
       "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
       "allowToChangeInstallationDirectory": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Pebloy"
