@@ -1,6 +1,6 @@
 {
   "name": "pebloy",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "SQL Server schema diff, backup, and deployment tool for Windows",
   "main": "src/electron/main.js",
   "author": "Pebloy Contributors",
