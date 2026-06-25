@@ -10,6 +10,11 @@ const {
   normalizeExecutableSql,
 } = require("./scriptAutomationService");
 const { generateScriptsForProfile } = require("./scriptGenerationService");
+const { EXPORTS_DIR } = require("./paths");
+
+function toWindowsLineEndings(text) {
+  return String(text || "").replace(/\r?\n/g, "\r\n");
+}
 
 function normalizeLookupName(value) {
   return String(value || "").trim().toLowerCase();
@@ -186,7 +191,7 @@ async function runDeployment({
     });
   }
 
-  const scriptOutputRoot = options?.scriptOutputPath || path.resolve(__dirname, "..", "..", "artifacts", "exports");
+  const scriptOutputRoot = options?.scriptOutputPath || EXPORTS_DIR;
   const exportedSourceObjects = ordered.filter((item) => item.objectType !== "TABLE");
   broadcastProgress("taskProgress", {
     taskId: task.taskId,
@@ -221,6 +226,11 @@ async function runDeployment({
   const generatedScriptMap = new Map(generatedScripts.map((entry) => [keyOf(entry), entry]));
   const combinedStoredProceduresPath = generatedInfo.combinedStoredProceduresPath;
   const hasTables = ordered.some((item) => item.objectType === "TABLE");
+  const generationWarnings = generatedInfo.generationWarnings || [];
+
+  generationWarnings.forEach((warning) => {
+    logEvent("WARN", warning.message, warning);
+  });
 
   logEvent("INFO", "Deployment source scripts prepared", {
     generatedRoot: generated.runRoot,
@@ -323,12 +333,13 @@ async function runDeployment({
       current.errorMessage = null;
 
       const rawSql = fs.readFileSync(genItem.scriptPath, "utf8");
-      const executableSql = normalizeExecutableSql(rawSql, genItem.objectType, {
+      const executableSql = toWindowsLineEndings(normalizeExecutableSql(rawSql, genItem.objectType, {
         schemaName: genItem.schemaName,
         objectName: genItem.objectName,
       }, {
         strategy: getRollbackStrategy(genItem.objectType),
-      });
+        moduleMetadata: genItem.moduleMetadata || null,
+      }));
       current.scriptPath = writeDeploymentSql(
         deploymentScriptDir,
         `${task.taskId}_${item.objectType}_${item.schemaName}_${item.objectName}`,
@@ -389,6 +400,7 @@ async function runDeployment({
       generatedRoot: generated.runRoot,
       buildPathFile: generated.latestBuildPathFile,
       rollbackApplied: true,
+      generationWarnings,
     };
   }
 
@@ -468,6 +480,7 @@ async function runDeployment({
             results: [...resultsByKey.values()],
             generatedRoot: generated.runRoot,
             buildPathFile: generated.latestBuildPathFile,
+            generationWarnings,
           };
         }
       }
@@ -486,12 +499,13 @@ async function runDeployment({
       if (!genItem || !current) continue;
 
       const rawSql = fs.readFileSync(genItem.scriptPath, "utf8");
-      const executableSql = normalizeExecutableSql(rawSql, genItem.objectType, {
+      const executableSql = toWindowsLineEndings(normalizeExecutableSql(rawSql, genItem.objectType, {
         schemaName: genItem.schemaName,
         objectName: genItem.objectName,
       }, {
         strategy: getDirectStrategy(genItem.objectType),
-      });
+        moduleMetadata: genItem.moduleMetadata || null,
+      }));
       const deploymentScriptPath = writeDeploymentSql(
         deploymentScriptDir,
         `${task.taskId}_${groupItem.objectType}_${groupItem.schemaName}_${groupItem.objectName}`,
@@ -582,6 +596,7 @@ async function runDeployment({
       results: [...resultsByKey.values()],
       generatedRoot: generated.runRoot,
       buildPathFile: generated.latestBuildPathFile,
+      generationWarnings,
     };
   }
 
@@ -590,6 +605,7 @@ async function runDeployment({
     results: [...resultsByKey.values()],
     generatedRoot: generated.runRoot,
     buildPathFile: generated.latestBuildPathFile,
+    generationWarnings,
   };
 }
 

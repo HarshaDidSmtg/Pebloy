@@ -8,10 +8,13 @@ let appState = null;
 let pendingAppStatePatch = null;
 let appStateSaveTimer = null;
 let isApplyingAppState = false;
+const DEFAULT_TAB = "credentials";
 const _profileHealth = new Map(); // profileId → { status: 'ok'|'error'|'unknown', testedAt: ISO|null }
 let _lastDeployResults = []; // for retry failed
 let _selectionSort  = { col: null, dir: "asc" };
 let _discoveredSort = { col: null, dir: "asc" };
+let _discoverPage = 1;
+const DISCOVER_PAGE_SIZE = 50;
 let _logSort = { col: "startedAt", dir: "desc" };
 const editorHelpers = globalThis.PebloyEditorHelpers || {
   normalizeFindMatchIndex(matchIdx, matchCount) {
@@ -211,6 +214,35 @@ async function chooseTextFile(options = {}) {
   });
 }
 
+function renderGenerationWarnings(warnings, containerId) {
+  const existing = document.getElementById(containerId + "_warnings");
+  if (existing) existing.remove();
+  if (!warnings || !warnings.length) return;
+
+  const panel = document.createElement("div");
+  panel.id = containerId + "_warnings";
+  panel.style.cssText = "border-left:3px solid var(--warning);background:color-mix(in srgb,var(--warning) 8%,transparent);border-radius:4px;padding:0.5rem 0.75rem;margin-top:0.5rem;font-size:0.82rem";
+
+  const header = document.createElement("div");
+  header.style.cssText = "font-weight:600;color:var(--warning);margin-bottom:0.25rem";
+  header.textContent = `${warnings.length} Generation Warning${warnings.length === 1 ? "" : "s"}`;
+  panel.appendChild(header);
+
+  const list = document.createElement("ul");
+  list.style.cssText = "margin:0;padding-left:1.2rem;color:var(--text-2)";
+  for (const w of warnings) {
+    const li = document.createElement("li");
+    const role = w.profileRole ? ` [${w.profileRole}]` : "";
+    const obj = (w.schemaName && w.objectName) ? ` — ${w.schemaName}.${w.objectName}` : "";
+    li.textContent = `${w.message}${obj}${role}`;
+    list.appendChild(li);
+  }
+  panel.appendChild(list);
+
+  const anchor = document.getElementById(containerId);
+  if (anchor) anchor.after(panel);
+}
+
 function showToast(message, isError = false) {
   const toast = $("toast");
 
@@ -302,10 +334,7 @@ function readLegacyPreference(key, fallback = "") {
 }
 
 function readAppPreference(key, fallback = "") {
-  return readLegacyPreference(
-    `pebloy.${key}`,
-    readLegacyPreference(`bdeploy.${key}`, readLegacyPreference(`dbbridge.${key}`, fallback))
-  );
+  return readLegacyPreference(`pebloy.${key}`, fallback);
 }
 
 async function loadPersistedAppState() {
@@ -343,7 +372,12 @@ function scheduleAppStateSave(partial, { delay = 250, silent = true } = {}) {
 }
 
 function getActiveTabName() {
-  return document.querySelector(".tab.active")?.dataset.tab || "credentials";
+  return document.querySelector(".tab.active")?.dataset.tab || DEFAULT_TAB;
+}
+
+function getDefaultVisibleTabButton() {
+  return document.querySelector(`.tab[data-tab='${DEFAULT_TAB}']:not(.hidden)`) ||
+    document.querySelector(".tab[data-tab]:not(.hidden)");
 }
 
 function collectCurrentAppState() {
@@ -362,6 +396,7 @@ function collectCurrentAppState() {
       fontFamily: $("fontSelector")?.value || "Space Grotesk",
       fontSize: Number($("fontSizeRange")?.value || 14),
       logLevel: $("logLevelSelect")?.value || "Normal",
+      hiddenTabs: Array.from(document.querySelectorAll(".tab[data-tab].hidden")).map((b) => b.dataset.tab),
       shortcuts,
     },
     ui: {
@@ -431,6 +466,7 @@ function applyPersistedUiState() {
     if ($("continueOnError")) $("continueOnError").checked = Boolean(ui.continueOnError);
     if ($("allowSameSource")) $("allowSameSource").checked = Boolean(ui.allowSameSource);
 
+    applyTabVisibility(prefs.hiddenTabs || []);
     if (ui.activeTab) setActiveTab(ui.activeTab);
   } finally {
     isApplyingAppState = false;
@@ -816,9 +852,73 @@ function tabInit() {
 
 function setActiveTab(tabName) {
   const tabButton = document.querySelector(`.tab[data-tab='${tabName}']`);
-  if (tabButton) {
+  if (tabButton && !tabButton.classList.contains("hidden")) {
     tabButton.click();
+    return;
   }
+
+  getDefaultVisibleTabButton()?.click();
+}
+
+function applyTabVisibility(hiddenTabs) {
+  const hiddenSet = new Set(Array.isArray(hiddenTabs) ? hiddenTabs : []);
+  document.querySelectorAll(".tab[data-tab]").forEach((btn) => {
+    if (btn.dataset.tab === "customize") return;
+    btn.classList.toggle("hidden", hiddenSet.has(btn.dataset.tab));
+  });
+  document.querySelectorAll("[data-tab-vis]").forEach((cb) => {
+    cb.checked = !hiddenSet.has(cb.dataset.tabVis);
+  });
+  const activeTab = getActiveTabName();
+  if (hiddenSet.has(activeTab)) {
+    getDefaultVisibleTabButton()?.click();
+  }
+}
+
+// ─── Parallel Tasks Panel ──────────────────────────────────────────────────
+
+function renderParallelTasksPanel() {
+  const panel = $("parallelTasksPanel");
+  const list = $("parallelTasksList");
+  const badge = $("tasksBadge");
+  const showBtn = $("showTasksBtn");
+  if (!panel || !list) return;
+
+  const tasks = [..._runningTasksMap.values()];
+  const count = tasks.length;
+
+  if (badge) badge.textContent = String(count);
+  if (showBtn) showBtn.classList.toggle("hidden", count === 0);
+
+  const title = $("parallelTasksTitle");
+  if (title) title.textContent = `Active Tasks (${count})`;
+
+  list.innerHTML = tasks.map((t) => {
+    const pct = t.percent ?? 0;
+    const typeKey = (t.taskType || "").toLowerCase();
+    const label = t.progressLabel || t.operation || "Running…";
+    return `<div class="parallel-task-row" data-task-id="${escapeHtml(t.taskId)}">
+      <div class="parallel-task-row-header">
+        <span class="parallel-task-name">${escapeHtml(t.taskType || "Task")}</span>
+        <span class="parallel-task-type type-${typeKey}">${escapeHtml(t.taskType || "")}</span>
+      </div>
+      <div class="parallel-task-bar-track"><div class="parallel-task-bar-fill" style="width:${pct}%"></div></div>
+      <div class="parallel-task-label">${escapeHtml(label)}</div>
+    </div>`;
+  }).join("");
+
+  if (count > 0 && !panel.classList.contains("hidden")) panel.classList.remove("hidden");
+}
+
+function setupParallelTasksPanel() {
+  const closeBtn = $("closeParallelPanel");
+  if (closeBtn) closeBtn.onclick = () => $("parallelTasksPanel")?.classList.add("hidden");
+
+  const showBtn = $("showTasksBtn");
+  if (showBtn) showBtn.onclick = () => {
+    const panel = $("parallelTasksPanel");
+    if (panel) panel.classList.toggle("hidden");
+  };
 }
 
 // Simple pagination utility
@@ -1077,24 +1177,48 @@ function addToSharedSelection(items) {
   persistCurrentAppState({ delay: 0 });
 }
 
-function renderSharedObjectPicker() {
+function renderSharedObjectPicker(page) {
   const sortedDiscovered = sortObjects(sharedDiscoveredObjects, _discoveredSort);
   const sortArrow = (col) => _discoveredSort.col === col ? (_discoveredSort.dir === "asc" ? " ↑" : " ↓") : "";
 
-  const rows = sortedDiscovered
-    .map(
-      (o, i) => {
-        // map back to original index for selection tracking
-        const origIdx = sharedDiscoveredObjects.indexOf(o);
-        return `<tr>
+  const total = sortedDiscovered.length;
+  const usePagination = total > DISCOVER_PAGE_SIZE;
+  const pages = usePagination ? Math.ceil(total / DISCOVER_PAGE_SIZE) : 1;
+  _discoverPage = Math.min(Math.max(1, page ?? _discoverPage), pages);
+  const pageItems = usePagination
+    ? sortedDiscovered.slice((_discoverPage - 1) * DISCOVER_PAGE_SIZE, _discoverPage * DISCOVER_PAGE_SIZE)
+    : sortedDiscovered;
+
+  const rows = pageItems
+    .map((o) => {
+      const origIdx = sharedDiscoveredObjects.indexOf(o);
+      return `<tr>
 <td><input type='checkbox' data-discovered='${origIdx}' checked /></td>
 <td>${escapeHtml(o.objectType)}</td>
 <td class="obj-name-cell"><span class="obj-schema">${escapeHtml(o.schemaName)}</span><span class="obj-dot">.</span><span class="obj-name">${escapeHtml(o.objectName)}</span></td>
-      <td>${formatDateTime(o.createdDate)}</td><td>${formatDateTime(o.modifiedDate)}</td>
+<td>${formatDateTime(o.createdDate)}</td><td>${formatDateTime(o.modifiedDate)}</td>
 </tr>`;
-      }
-    )
+    })
     .join("");
+
+  let paginationHtml = "";
+  if (usePagination) {
+    const prevDisabled = _discoverPage === 1 ? " disabled" : "";
+    const nextDisabled = _discoverPage === pages ? " disabled" : "";
+    const start = (_discoverPage - 1) * DISCOVER_PAGE_SIZE + 1;
+    const end = Math.min(_discoverPage * DISCOVER_PAGE_SIZE, total);
+    paginationHtml = `
+<div class="pagination" style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap;margin-top:0.4rem">
+  <button class="page-btn" id="discoverPrev"${prevDisabled}>&#8249; Prev</button>
+  <span class="muted" style="font-size:0.82rem">${start}–${end} of ${total}</span>
+  <button class="page-btn" id="discoverNext"${nextDisabled}>Next &#8250;</button>
+  <label style="font-size:0.82rem;margin-left:0.5rem">Page
+    <input id="discoverJumpPage" type="number" min="1" max="${pages}" value="${_discoverPage}"
+      style="width:3.5rem;margin-left:0.25rem;padding:0.1rem 0.3rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text)" />
+    of ${pages}
+  </label>
+</div>`;
+  }
 
   $("sharedObjectPicker").innerHTML = `
 <table class='table'>
@@ -1106,7 +1230,8 @@ function renderSharedObjectPicker() {
   <th data-sort-disc="modified" style="cursor:pointer;user-select:none">Modified${sortArrow("modified")}</th>
 </tr></thead>
 <tbody>${rows}</tbody>
-</table>`;
+</table>
+${paginationHtml}`;
 
   document.querySelectorAll("[data-sort-disc]").forEach((th) => {
     th.onclick = () => {
@@ -1116,24 +1241,24 @@ function renderSharedObjectPicker() {
       } else {
         _discoveredSort = { col, dir: "asc" };
       }
-      renderSharedObjectPicker();
+      _discoverPage = 1;
+      renderSharedObjectPicker(1);
     };
   });
 
-  const hdrCb = document.getElementById("selectAllDiscoveredCb");
-  const rowCbs = () => [...document.querySelectorAll("input[data-discovered]")];
-
-  hdrCb.addEventListener("change", () => {
-    rowCbs().forEach((cb) => { cb.checked = hdrCb.checked; });
-  });
-
-  $("sharedObjectPicker").addEventListener("change", (e) => {
-    if (!e.target.matches("input[data-discovered]")) return;
-    const all = rowCbs();
-    const checked = all.filter((cb) => cb.checked);
-    hdrCb.indeterminate = checked.length > 0 && checked.length < all.length;
-    hdrCb.checked = checked.length === all.length;
-  });
+  if (usePagination) {
+    const prevBtn = document.getElementById("discoverPrev");
+    const nextBtn = document.getElementById("discoverNext");
+    const jumpInput = document.getElementById("discoverJumpPage");
+    if (prevBtn) prevBtn.onclick = () => renderSharedObjectPicker(_discoverPage - 1);
+    if (nextBtn) nextBtn.onclick = () => renderSharedObjectPicker(_discoverPage + 1);
+    if (jumpInput) {
+      jumpInput.onchange = () => {
+        const p = Math.min(Math.max(1, Number.parseInt(jumpInput.value, 10) || 1), pages);
+        renderSharedObjectPicker(p);
+      };
+    }
+  }
 }
 
 async function refreshProfiles() {
@@ -1253,8 +1378,9 @@ async function discoverSharedObjects() {
   beginTaskProgress("objects", "Loading database objects...");
   showToast("Loading database objects...", false);
   sharedDiscoveredObjects = dedupeObjects(await api(`/api/objects?${params.toString()}`));
+  _discoverPage = 1;
   updateTaskProgress("objects", `Rendering ${sharedDiscoveredObjects.length} discovered objects...`, 85);
-  renderSharedObjectPicker();
+  renderSharedObjectPicker(1);
   endTaskProgress("objects", true, "Objects");
   showToast(`Discovered ${sharedDiscoveredObjects.length} objects`);
 }
@@ -1574,6 +1700,18 @@ function setupObjectsTab() {
     }
   };
 
+  // Allow pressing Enter in any discover filter field to trigger search.
+  ["sharedNameFilter", "sharedTypeFilter", "sharedSchemaFilter"].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener("keydown", async (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        try { await discoverSharedObjects(); } catch (err) { showToast(err.message, true); }
+      }
+    });
+  });
+
   $("addDiscoveredObjects").onclick = () => {
     const chosen = Array.from(document.querySelectorAll("input[data-discovered]:checked"))
       .map((el) => sharedDiscoveredObjects[Number(el.dataset.discovered)])
@@ -1587,6 +1725,21 @@ function setupObjectsTab() {
     addToSharedSelection(chosen);
     showToast(`Added ${chosen.length} objects from search results`);
   };
+
+  // Single delegated listener for the discover grid (registered once, not per-render).
+  // Handles both header "select all" and individual row checkbox state sync.
+  $("sharedObjectPicker").addEventListener("change", (e) => {
+    const hdrCb = document.getElementById("selectAllDiscoveredCb");
+    if (!hdrCb) return;
+    if (e.target.id === "selectAllDiscoveredCb") {
+      document.querySelectorAll("input[data-discovered]").forEach((cb) => { cb.checked = e.target.checked; });
+    } else if (e.target.matches("input[data-discovered]")) {
+      const all = [...document.querySelectorAll("input[data-discovered]")];
+      const checked = all.filter((cb) => cb.checked);
+      hdrCb.indeterminate = checked.length > 0 && checked.length < all.length;
+      hdrCb.checked = checked.length === all.length;
+    }
+  });
 
   $("clearSharedObjects").onclick = () => {
     const hadSelection = sharedSelectedObjects.length > 0;
@@ -1670,6 +1823,7 @@ function setupDiff() {
       currentDiffRows = filteredReport.details.filter((x) => x.status !== "Unchanged");
       currentDiffIndex = 0;
       renderDiff(filteredReport);
+      renderGenerationWarnings(result.report?.generationWarnings, "diffSummary");
       endTaskProgress("diff", true, "Diff");
       showToast(`Diff complete. Task: ${result.taskId}`);
     } catch (error) {
@@ -1813,7 +1967,9 @@ function escapeHtml(text) {
   return String(text)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function setupBackup() {
@@ -1854,10 +2010,10 @@ function setupBackup() {
         `Output folder     : ${result.generatedRoot || result.backupFolder}`,
         `Build path file   : ${result.buildPathFile || "(none)"}`,
         `Exact SQL sync    : ${result.exactDefinitionsApplied || 0} programmable object${(result.exactDefinitionsApplied || 0) === 1 ? "" : "s"}`,
-        `Exact SQL warning : ${result.exactDefinitionWarning || "(none)"}`,
         `Generated at      : ${formatDateTime(result.restoreReadiness?.generatedAt || new Date())}`,
         `Task ID           : ${result.taskId}`,
       ].join("\n");
+      renderGenerationWarnings(result.generationWarnings, "backupResult");
       showToast(`Backup scripts generated in ${result.generatedRoot || result.backupFolder}`);
       await refreshLogs();
     } catch (error) {
@@ -2082,10 +2238,10 @@ function setupDeployment() {
 function renderDeployResult(result) {
   const s = result.summary || {};
   const isRollback = result.rollbackApplied === true;
-  const statusColor = { Success: "var(--success)", Failed: "var(--danger)", RolledBack: "var(--accent)", Skipped: "var(--muted)", PendingDelta: "var(--warning)" };
+  const statusClass = { Success: "deploy-status-success", Failed: "deploy-status-failed", RolledBack: "deploy-status-accent", Skipped: "deploy-status-skipped", PendingDelta: "deploy-status-warning" };
   const rows = (result.itemResults || [])
     .map((item) => {
-      const color = statusColor[item.status] || "var(--text-2)";
+      const cls = statusClass[item.status] || "";
       const name = `${item.schemaName}.${item.objectName}`;
       const err = item.errorMessage ? escapeHtml(item.errorMessage) : "";
       const statusLabel = item.status === "RolledBack" ? "Validated (not applied)" : item.status;
@@ -2093,8 +2249,8 @@ function renderDeployResult(result) {
 <td>${escapeHtml(item.objectType)}</td>
 <td>${escapeHtml(name)} <button class="btn-copy-inline" data-copy="${escapeHtml(name)}" title="Copy">&#x2398;</button></td>
 <td>${escapeHtml(item.action || "")}</td>
-<td style="color:${color};font-weight:600">${statusLabel}</td>
-<td style="color:var(--danger);font-size:0.85em">${err}</td>
+<td class="${cls} fw-600">${statusLabel}</td>
+<td class="deploy-error-cell">${err}</td>
 </tr>`;
     })
     .join("");
@@ -2105,16 +2261,16 @@ function renderDeployResult(result) {
 
   const rolledBackCount = s.rolledBack ?? 0;
   const rolledBackCard = isRollback
-    ? `<div class="card"><strong style="color:var(--accent)">Validated</strong><div>${rolledBackCount}</div></div>`
+    ? `<div class="card"><strong class="text-accent">Validated</strong><div>${rolledBackCount}</div></div>`
     : "";
 
   $("deployResult").innerHTML = `
 ${rollbackNote}
 <div class="summary-cards" style="margin-bottom:0.6rem">
   <div class="card"><strong>Total</strong><div>${s.total ?? 0}</div></div>
-  ${isRollback ? rolledBackCard : `<div class="card"><strong style="color:var(--success)">Success</strong><div>${s.success ?? 0}</div></div>`}
-  <div class="card"><strong style="color:var(--danger)">Failed</strong><div>${s.failed ?? 0}</div></div>
-  <div class="card"><strong style="color:var(--muted)">Skipped</strong><div>${s.skipped ?? 0}</div></div>
+  ${isRollback ? rolledBackCard : `<div class="card"><strong class="text-success">Success</strong><div>${s.success ?? 0}</div></div>`}
+  <div class="card"><strong class="text-danger">Failed</strong><div>${s.failed ?? 0}</div></div>
+  <div class="card"><strong class="text-muted">Skipped</strong><div>${s.skipped ?? 0}</div></div>
 </div>
 <div style="overflow:auto;max-height:18rem">
 <table class="table">
@@ -2126,6 +2282,7 @@ ${rollbackNote}
   $("deployResult").querySelectorAll(".btn-copy-inline").forEach((btn) => {
     btn.onclick = () => copyToClipboard(btn.dataset.copy);
   });
+  renderGenerationWarnings(result.generationWarnings, "deployResult");
 }
 
 // ─── Log auto-refresh & SSE ────────────────────────────────────────────────
@@ -2150,8 +2307,11 @@ function connectSSE() {
 
   es.addEventListener("taskStart", (e) => {
     const data = JSON.parse(e.data);
-    _runningTasksMap.set(data.taskId, data);
+    _runningTasksMap.set(data.taskId, { ...data, percent: 0, progressLabel: "Starting…" });
     renderTaskbar();
+    renderParallelTasksPanel();
+    const panel = $("parallelTasksPanel");
+    if (panel) panel.classList.remove("hidden");
     startLogAutoRefresh();
   });
 
@@ -2159,6 +2319,10 @@ function connectSSE() {
     const data = JSON.parse(e.data);
     _runningTasksMap.delete(data.taskId);
     renderTaskbar();
+    renderParallelTasksPanel();
+    if (_runningTasksMap.size === 0) {
+      setTimeout(() => $("parallelTasksPanel")?.classList.add("hidden"), 2500);
+    }
     renderTaskbarSummary(data);
     refreshLogs();
     sendDesktopNotification(data);
@@ -2199,8 +2363,13 @@ function connectSSE() {
   es.addEventListener("taskProgress", (e) => {
     const data = JSON.parse(e.data);
     const key = data.key || taskTypeToProgressKey[data.taskType];
-    if (!key) return;
-    updateTaskProgress(key, data.operation || `${data.taskType} running...`, data.percent);
+    if (key) updateTaskProgress(key, data.operation || `${data.taskType} running...`, data.percent);
+    const task = data.taskId ? _runningTasksMap.get(data.taskId) : null;
+    if (task) {
+      task.percent = data.percent ?? task.percent;
+      task.progressLabel = data.operation || task.progressLabel;
+      renderParallelTasksPanel();
+    }
   });
 
   es.onerror = () => {
@@ -2337,16 +2506,16 @@ async function refreshLogs(page = 1, pageSize = 20) {
   const { items, pages } = paginate(sortedLogs, page, pageSize);
 
   function statusBadge(s) {
-    const map = { Success: "var(--success-ink)", Failed: "var(--danger-ink)", Running: "var(--info-ink)" };
-    const color = map[s] || "#888";
-    return `<span style="color:${color};font-weight:600;font-size:0.8rem">${escapeHtml(s || "")}</span>`;
+    const map = { Success: "badge-success", Failed: "badge-failed", Running: "badge-running" };
+    const cls = map[s] || "badge-muted";
+    return `<span class="badge ${cls}">${escapeHtml(s || "")}</span>`;
   }
 
   function eventBadge(log) {
     const level = String(log.highestLevel || "").toUpperCase();
     const label = level || "—";
-    const colors = { ERROR: "var(--danger-ink)", WARN: "var(--warning-ink)", INFO: "var(--text-2)" };
-    return `<span style="color:${colors[level] || "var(--muted)"};font-weight:600;font-size:0.78rem">${escapeHtml(label)}</span>`;
+    const cls = { ERROR: "log-badge-error", WARN: "log-badge-warn", INFO: "log-badge-info" }[level] || "log-badge-muted";
+    return `<span class="log-badge ${cls}">${escapeHtml(label)}</span>`;
   }
 
   const rows = items.map((l) => {
@@ -2489,193 +2658,130 @@ function formatLogDetail(detail) {
   return lines.join("\n");
 }
 
+function setupUpdater() {
+  const api = window.electronAPI;
+  const checkBtn = $("checkForUpdatesBtn");
+  const installBtn = $("downloadInstallBtn");
+  const releaseLink = $("releasePageLink");
+  const statusEl = $("updateStatus");
+  const versionLabel = $("currentVersionLabel");
+  const progressWrap = $("updateProgressWrap");
+  const progressBar = $("updateProgressBar");
+  const progressPct = $("updateProgressPct");
+
+  if (!checkBtn) return;
+
+  if (!api) {
+    checkBtn.textContent = "Updates unavailable (web mode)";
+    checkBtn.disabled = true;
+    return;
+  }
+
+  api.getVersion().then((v) => { if (versionLabel) versionLabel.textContent = v; }).catch(() => {});
+
+  let removeProgressListener = null;
+  let pendingDownloadUrl = null;
+
+  function setStatus(msg, type = "") {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.className = "update-status" + (type ? ` update-status--${type}` : "");
+  }
+
+  checkBtn.addEventListener("click", async () => {
+    checkBtn.disabled = true;
+    installBtn.hidden = true;
+    releaseLink.hidden = true;
+    progressWrap.hidden = true;
+    setStatus("Checking for updates…");
+
+    try {
+      const info = await api.checkForUpdates();
+      if (!info.hasUpdate) {
+        setStatus(`You're up to date (v${info.current}).`, "ok");
+      } else {
+        setStatus(`v${info.latest} is available${info.releaseName ? ` — ${info.releaseName}` : ""}.`, "available");
+        pendingDownloadUrl = info.downloadUrl;
+        if (info.downloadUrl) {
+          installBtn.hidden = false;
+        }
+        if (info.releaseUrl) {
+          releaseLink.href = info.releaseUrl;
+          releaseLink.hidden = false;
+        }
+      }
+    } catch (err) {
+      setStatus(`Check failed: ${err.message}`, "error");
+    } finally {
+      checkBtn.disabled = false;
+    }
+  });
+
+  installBtn.addEventListener("click", async () => {
+    if (!pendingDownloadUrl) return;
+    installBtn.disabled = true;
+    checkBtn.disabled = true;
+    progressWrap.hidden = false;
+    progressBar.style.width = "0%";
+    progressPct.textContent = "0%";
+    setStatus("Downloading update…");
+
+    if (removeProgressListener) removeProgressListener();
+    removeProgressListener = api.onUpdateProgress((pct) => {
+      progressBar.style.width = `${pct}%`;
+      progressPct.textContent = `${pct}%`;
+    });
+
+    try {
+      await api.downloadAndInstall(pendingDownloadUrl);
+      setStatus("Download complete. Launching installer — the app will close.", "ok");
+      progressBar.style.width = "100%";
+      progressPct.textContent = "100%";
+    } catch (err) {
+      setStatus(`Download failed: ${err.message}`, "error");
+      installBtn.disabled = false;
+      checkBtn.disabled = false;
+    } finally {
+      if (removeProgressListener) { removeProgressListener(); removeProgressListener = null; }
+    }
+  });
+}
+
 function setupTheme() {
   const themes = Array.isArray(globalThis.PebloyThemes) && globalThis.PebloyThemes.length
     ? globalThis.PebloyThemes
     : [];
-  const themeMap = new Map(themes.map((theme) => [theme.id, theme]));
-  const fallbackThemeId = themeMap.has("dark") ? "dark" : themes[0]?.id;
-  const validThemes = themes.map((theme) => theme.id);
-  const savedTheme = appState?.preferences?.theme || readAppPreference("theme", "dark");
+  const themeMap = new Map(themes.map((t) => [t.id, t]));
+  const fallbackThemeId = themeMap.has("azure") ? "azure" : themes[0]?.id;
+  const validThemes = themes.map((t) => t.id);
+  const savedTheme = appState?.preferences?.theme || readAppPreference("theme", "azure");
   const saved = validThemes.includes(savedTheme) ? savedTheme : fallbackThemeId;
 
-  const headerPicker = $("themePicker");
-  const settingsPicker = $("themePickerInline");
-  const previewPanel = $("themePreviewPanel");
+  const themeSelect = $("themeSelect");
 
-  const getFavoriteThemeIds = () => {
-    const savedFavorites = Array.isArray(appState?.preferences?.favoriteThemes)
-      ? appState.preferences.favoriteThemes.map((value) => String(value || "").trim()).filter((value) => themeMap.has(value))
-      : [];
-    return savedFavorites.length ? [...new Set(savedFavorites)] : validThemes;
-  };
-
-  const renderHeaderPicker = () => {
-    if (!headerPicker) return;
-    const favoriteIds = getFavoriteThemeIds();
-    headerPicker.innerHTML = favoriteIds.map((themeId) => {
-      const theme = themeMap.get(themeId);
-      if (!theme) return "";
-      return `
-      <div class="theme-swatch-wrap">
-        <button
-          type="button"
-          class="theme-swatch theme-swatch--header"
-          data-theme="${escapeHtml(theme.id)}"
-          data-theme-title="${escapeHtml(theme.label)}"
-          title="${escapeHtml(theme.label)}"
-          aria-label="Switch to ${escapeHtml(theme.label)} theme"
-          style="${previewStyle(theme)}"
-        >
-          <span class="swatch-emoji">${escapeHtml(theme.glyph || theme.emoji || theme.label.slice(0, 1))}</span>
-          <span class="swatch-name">${escapeHtml(theme.label)}</span>
-        </button>
-      </div>`;
-    }).join("");
-  };
-
-  const previewStyle = (theme) => {
-    const colors = Array.isArray(theme.preview) && theme.preview.length >= 3
-      ? theme.preview
-      : [theme.tokens?.surface, theme.tokens?.["surface-2"], theme.tokens?.accent].filter(Boolean);
-    return `--theme-preview-1:${colors[0] || "#111111"};--theme-preview-2:${colors[1] || colors[0] || "#222222"};--theme-preview-3:${colors[2] || theme.tokens?.accent || "#ff2340"};`;
-  };
-
-  renderHeaderPicker();
-
-  if (settingsPicker) {
-    settingsPicker.innerHTML = themes.map((theme) => `
-      <div
-        class="theme-option-card"
-        data-theme-inline="${escapeHtml(theme.id)}"
-        role="button"
-        tabindex="0"
-        aria-label="Choose ${escapeHtml(theme.label)} theme"
-        style="${previewStyle(theme)}"
-      >
-        <button
-          type="button"
-          class="theme-favorite-toggle"
-          data-theme-favorite="${escapeHtml(theme.id)}"
-          title="Toggle ${escapeHtml(theme.label)} favorite"
-          aria-label="Toggle ${escapeHtml(theme.label)} favorite"
-          aria-pressed="false"
-        >
-          ☆
-        </button>
-        <span class="theme-option-preview" aria-hidden="true">
-          <span class="theme-option-preview-orb"></span>
-          <span class="theme-option-preview-grid"></span>
-          <span class="theme-option-preview-line theme-option-preview-line--one"></span>
-          <span class="theme-option-preview-line theme-option-preview-line--two"></span>
-        </span>
-        <span class="theme-option-copy">
-          <strong>${escapeHtml(theme.glyph || "")}&nbsp;${escapeHtml(theme.label)}</strong>
-          <span>${escapeHtml(theme.description || "")}</span>
-        </span>
-      </div>
-    `).join("");
+  if (themeSelect) {
+    themeSelect.innerHTML = themes.map((t) =>
+      `<option value="${escapeHtml(t.id)}">${escapeHtml(t.glyph || "")} ${escapeHtml(t.label)}</option>`
+    ).join("");
+    themeSelect.value = saved;
+    themeSelect.addEventListener("change", () => applyTheme(themeSelect.value));
   }
 
-  const syncFavoriteState = () => {
-    const favoriteIds = new Set(getFavoriteThemeIds());
-    document.querySelectorAll("[data-theme-favorite]").forEach((button) => {
-      const isFavorite = favoriteIds.has(button.dataset.themeFavorite);
-      button.classList.toggle("active", isFavorite);
-      button.setAttribute("aria-pressed", String(isFavorite));
-      button.textContent = isFavorite ? "★" : "☆";
-      button.title = `${isFavorite ? "Remove" : "Add"} ${button.dataset.themeFavorite} ${isFavorite ? "from" : "to"} favorites`;
-    });
-  };
+  function applyTheme(themeId, persist = true) {
+    const theme = themeMap.get(themeId) || themeMap.get(fallbackThemeId);
+    if (!theme) return;
 
-  function renderThemePreview(theme) {
-    if (!previewPanel || !theme) return;
-    previewPanel.innerHTML = `
-      <div class="theme-preview-panel__header">
-        <div>
-          <div class="theme-preview-kicker">Current Theme</div>
-          <h4>${escapeHtml(theme.glyph || "")}&nbsp;${escapeHtml(theme.label)}</h4>
-        </div>
-      </div>
-      <p class="theme-preview-panel__copy">${escapeHtml(theme.description || "")}</p>
-      <div class="theme-preview-metrics">
-        <div class="theme-preview-metric"><span>Accent</span><strong>${escapeHtml(theme.tokens?.accent || "-")}</strong></div>
-        <div class="theme-preview-metric"><span>Surface</span><strong>${escapeHtml(theme.tokens?.surface || "-")}</strong></div>
-        <div class="theme-preview-metric"><span>Theme Sync</span><strong>${escapeHtml(theme.sync || "Local")}</strong></div>
-      </div>
-      <p class="theme-preview-note">Theme tokens now drive borders, hover states, progress chrome, and icon framing in addition to the base palette.</p>
-    `;
-  }
-
-  function applyTheme(theme, persist = true) {
-    const nextTheme = themeMap.get(theme) || themeMap.get(fallbackThemeId);
-    if (!nextTheme) return;
-
-    document.body.setAttribute("data-theme", nextTheme.id);
-    document.documentElement.style.colorScheme = nextTheme.colorScheme || "dark";
-    for (const [token, value] of Object.entries(nextTheme.tokens || {})) {
+    document.body.setAttribute("data-theme", theme.id);
+    document.documentElement.style.colorScheme = theme.colorScheme || "dark";
+    for (const [token, value] of Object.entries(theme.tokens || {})) {
       document.body.style.setProperty(`--${token}`, value);
     }
+    if (themeSelect) themeSelect.value = theme.id;
 
-    document.querySelectorAll("[data-theme]").forEach((btn) => {
-      const active = btn.dataset.theme === nextTheme.id;
-      btn.classList.toggle("active", active);
-      btn.setAttribute("aria-pressed", String(active));
-    });
-    document.querySelectorAll("[data-theme-inline]").forEach((btn) => {
-      const active = btn.dataset.themeInline === nextTheme.id;
-      btn.classList.toggle("active", active);
-      btn.setAttribute("aria-pressed", String(active));
-    });
-    renderThemePreview(nextTheme);
-    syncFavoriteState();
-
-    if (persist) scheduleAppStateSave({ preferences: { theme: nextTheme.id } }, { delay: 0 });
-  }
-
-  function setFavoriteThemes(nextFavoriteIds) {
-    const normalized = [...new Set(nextFavoriteIds.filter((value) => themeMap.has(value)))];
-    const safeFavorites = normalized.length ? normalized : [document.body.dataset.theme || fallbackThemeId];
-    scheduleAppStateSave({ preferences: { favoriteThemes: safeFavorites } }, { delay: 0 });
-    appState = mergeAppState(appState || {}, { preferences: { favoriteThemes: safeFavorites } });
-    renderHeaderPicker();
-    syncFavoriteState();
-    bindThemeEvents();
-  }
-
-  function bindThemeEvents() {
-    document.querySelectorAll("[data-theme]").forEach((btn) => {
-      btn.onclick = () => applyTheme(btn.dataset.theme);
-    });
-
-    document.querySelectorAll("[data-theme-inline]").forEach((card) => {
-      const activate = () => applyTheme(card.dataset.themeInline);
-      card.onclick = (event) => {
-        if (event.target.closest("[data-theme-favorite]")) return;
-        activate();
-      };
-      card.onkeydown = (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          activate();
-        }
-      };
-    });
-
-    document.querySelectorAll("[data-theme-favorite]").forEach((button) => {
-      button.onclick = (event) => {
-        event.stopPropagation();
-        const themeId = button.dataset.themeFavorite;
-        const favorites = getFavoriteThemeIds();
-        const exists = favorites.includes(themeId);
-        const nextFavorites = exists ? favorites.filter((value) => value !== themeId) : [...favorites, themeId];
-        setFavoriteThemes(nextFavorites);
-      };
-    });
+    if (persist) scheduleAppStateSave({ preferences: { theme: theme.id } }, { delay: 0 });
   }
 
   applyTheme(saved, false);
-  bindThemeEvents();
 }
 
 const OBJECT_TYPE_LABELS = {
@@ -2874,6 +2980,8 @@ function setupCustomize() {
         body: JSON.stringify({ folderNames: DEFAULT_FOLDER_NAMES, deploymentOrder: DEFAULT_DEPLOYMENT_ORDER }),
       });
       await loadSettings();
+      applyTabVisibility([]);
+      persistCurrentAppState();
       showToast("Settings reset to defaults");
     } catch (error) {
       showToast("Failed to reset: " + error.message, true);
@@ -2881,6 +2989,17 @@ function setupCustomize() {
       restore();
     }
   };
+
+  // ── Tab visibility ───────────────────────────────────────────────────────
+  document.querySelectorAll("[data-tab-vis]").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      const hiddenTabs = Array.from(document.querySelectorAll("[data-tab-vis]"))
+        .filter((c) => !c.checked)
+        .map((c) => c.dataset.tabVis);
+      applyTabVisibility(hiddenTabs);
+      persistCurrentAppState();
+    });
+  });
 
   // ── Behavior settings ────────────────────────────────────────────────────
   const notifToggle = $("notificationsToggle");
@@ -3186,6 +3305,7 @@ function setupProfileImportExport() {
 
   if (exportBtn) {
     exportBtn.onclick = async () => {
+      const restore = setButtonLoading(exportBtn, "Exporting...");
       try {
         const profiles = await api("/api/profiles/export");
         const blob = new Blob([JSON.stringify(profiles, null, 2)], { type: "application/json" });
@@ -3198,6 +3318,8 @@ function setupProfileImportExport() {
         showToast(`Exported ${profiles.length} connection(s)`);
       } catch (error) {
         showToast(error.message, true);
+      } finally {
+        restore();
       }
     };
   }
@@ -3208,6 +3330,7 @@ function setupProfileImportExport() {
       const file = importFile.files?.[0];
       if (!file) return;
       importFile.value = "";
+      const restore = setButtonLoading(importBtn, "Importing...");
       try {
         const text = await file.text();
         const profiles = JSON.parse(text);
@@ -3223,6 +3346,8 @@ function setupProfileImportExport() {
         showToast(`Imported ${result.created} connection(s)${errMsg}`);
       } catch (error) {
         showToast(`Import failed: ${error.message}`, true);
+      } finally {
+        restore();
       }
     };
   }
@@ -3263,6 +3388,8 @@ async function start() {
   setupBackup();
   setupDeployment();
   setupCustomize();
+  setupUpdater();
+  setupParallelTasksPanel();
   setupKeyboardShortcuts();
   renderShortcutBadges();
   bindAppStatePersistence();

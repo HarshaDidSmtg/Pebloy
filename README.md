@@ -4,7 +4,7 @@
 
 Pebloy is a **Windows desktop tool** (Electron + Node.js) that simplifies comparing, backing up, and deploying SQL Server database objects across environments (DEV -> QA -> UAT -> PROD).
 
-Repository: [SriHarshaSpidey/Pebloy](https://github.com/SriHarshaSpidey/Pebloy)
+Repository: [HarshaDidSmtg/Pebloy](https://github.com/HarshaDidSmtg/Pebloy)
 
 ---
 
@@ -23,7 +23,7 @@ Repository: [SriHarshaSpidey/Pebloy](https://github.com/SriHarshaSpidey/Pebloy)
 | **Factory Reset** | Clears saved profiles, preferences, logs, exports, reports, and temp artifacts so the project can be shared cleanly. |
 | **Dependency Ordering** | UDTs → Sequences → Tables → Views → Functions → Procedures → Synonyms → Triggers. |
 | **Audit Logging** | Every task produces a `.log` (human-readable) and `.json` (structured) file in `artifacts/logs/`, and the Logs tab opens the preferred text log directly. |
-| **Themes** | Light, Dark, Cyberpunk, Dracula, Monokai, Nord, Spider-Man, Batman. Favorites can be pinned to the top-right picker from Settings, and the active selection persists per machine in file-backed app state. |
+| **Themes** | Light, Azure, Dark, Spider-Man, Batman. The active selection persists per machine in file-backed app state. |
 
 ---
 
@@ -44,7 +44,7 @@ Repository: [SriHarshaSpidey/Pebloy](https://github.com/SriHarshaSpidey/Pebloy)
 Clone the repository, then from the repository root run:
 
 ```powershell
-git clone https://github.com/SriHarshaSpidey/Pebloy.git
+git clone https://github.com/HarshaDidSmtg/Pebloy.git
 cd Pebloy
 npm install
 npm start
@@ -110,15 +110,10 @@ pebloy/
 
 | Document | Contents |
 | -------- | -------- |
-| [FEATURES.md](FEATURES.md) | Detailed feature guide and how-to for each tab |
-| [REQUIREMENTS.md](REQUIREMENTS.md) | Product requirements, data model, acceptance criteria |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Technical architecture, service layer, API contracts |
 | [INSTALLATION.md](INSTALLATION.md) | Full installation guide including Electron and installer |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Common issues and fixes |
 | [SECURITY.md](SECURITY.md) | Password storage, SQL injection prevention, log sanitization |
-| [THEMES.md](THEMES.md) | Available themes and customization |
-| [ISSUES.md](ISSUES.md) | Known bugs and identified issues |
-| [IMPROVEMENTS.md](IMPROVEMENTS.md) | Improvement roadmap and future features |
 | [CHANGELOG.md](CHANGELOG.md) | Version history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup and contribution guide |
 

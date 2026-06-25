@@ -22,8 +22,8 @@ Pebloy is a local web app for SQL object lifecycle workflows:
 
 | Service | Responsibility |
 | ------- | -------------- |
-| `src/services/scriptAutomationService.js` | Shared PowerShell orchestration — wraps `scripts/powershell/DBObjectsBulkScriptGenerator.ps1`, builds Connection Alias/date/database output roots, parses `BuildPaths`, and normalizes executable SQL. |
-| `src/services/scriptGenerationService.js` | Shared script-generation entry points used by Backup, Code Diff, and Deploy for normalized selections and task-specific output roots. |
+| `src/services/scriptAutomationService.js` | Shared PowerShell orchestration — wraps `scripts/powershell/DBObjectsBulkScriptGenerator.ps1`, builds Connection Alias/date/database output roots, parses `BuildPaths`, and normalizes deploy-time executable SQL. |
+| `src/services/scriptGenerationService.js` | Shared script-generation entry points used by Backup, Code Diff, and Deploy for normalized selections, exact-definition synchronization, canonical source-artifact validation, and task-specific output roots. |
 | `src/services/diffService.js` | Object diff, line-by-line rendering data, and stage-based compare progress updates. |
 | `src/services/backupService.js` | Backup orchestration and backup-stage progress updates. |
 | `src/services/deploymentService.js` | Deploy orchestration, deduplicated execution planning, table delta routing, and per-object result aggregation. |
@@ -74,7 +74,8 @@ Flow:
 2. `backupService` calls `scriptAutomationService.generateObjectScripts(...)`.
 3. Service invokes `scripts/powershell/DBObjectsBulkScriptGenerator.ps1` with server/database/auth from the selected profile, temp object list file, and output base path.
 4. Script outputs Connection Alias/date/db/schema/type/file structure and BuildPaths manifest.
-5. API returns generated root path, build path file, and run metadata.
+5. `scriptGenerationService` refreshes exact definitions where available and keeps BuildPaths-listed programmable-object source files headerless and canonical for SSDT/DACPAC-style consumers.
+6. API returns generated root path, build path file, and run metadata.
 
 ### 5.3 Deploy
 
@@ -89,11 +90,12 @@ Deployment strategy by object type:
 Flow:
 
 1. UI posts source/destination profiles, selected objects, mode, and output path to `/api/deploy/run`.
-2. `deploymentService` runs `scripts/powershell/DBObjectsBulkScriptGenerator.ps1 -app_task_mode deploy` for selected non-table objects; its SMO-generated module scripts use `CREATE OR ALTER`.
-3. Tables bypass generic table export and use `scripts/powershell/CompareTablesGenerateDelta.ps1`.
-4. Executable scripts are saved under the run's `Deployment Scripts` folder.
-5. Selected objects are deduplicated before execution, then execute individually in configured order through a reused target connection, retaining exact failure attribution; tables execute through their delta batch.
-6. Per-object results are aggregated and logged.
+2. `deploymentService` regenerates fresh non-table source artifacts through `scriptGenerationService`, which keeps the per-object BuildPaths-listed source files headerless and canonical.
+3. Deploy-time executable SQL is built separately: programmable modules rehydrate `SET ANSI_NULLS` / `SET QUOTED_IDENTIFIER` from exact metadata and execute as individually tracked `CREATE OR ALTER` scripts, while non-modules use the existing drop/create strategy.
+4. Tables bypass generic table export and use `scripts/powershell/CompareTablesGenerateDelta.ps1`.
+5. Executable scripts are saved under the run's `Deployment Scripts` folder.
+6. Selected objects are deduplicated before execution, then execute individually in configured order through a reused target connection, retaining exact failure attribution; tables execute through their delta batch.
+7. Per-object results are aggregated and logged.
 
 ## 6. Object Discovery
 

@@ -1,0 +1,15 @@
+// Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
+
+exports[`buildCombinedStoredProcedureText — golden output produces deterministic output for a two-procedure set 1`] = `
+"CREATE OR ALTER PROCEDURE dbo.ProcAlpha
+AS
+SELECT 1
+
+GO
+
+CREATE OR ALTER PROCEDURE dbo.ProcBeta
+AS
+SELECT 2
+
+GO"
+`;

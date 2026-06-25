@@ -10,6 +10,7 @@ const LOG_ARCHIVE_DIR = process.env.LOG_ARCHIVE_DIR || path.join(LOG_DIR, "archi
 const SCRIPT_DIR = process.env.SCRIPTS_DIR || path.join(ARTIFACT_DIR, "scripts");
 const REPORT_DIR = process.env.REPORTS_DIR || path.join(ARTIFACT_DIR, "reports");
 const MAX_ACTIVE_TASK_LOGS = Math.max(1, Number.parseInt(process.env.MAX_ACTIVE_TASK_LOGS || "200", 10) || 200);
+const MAX_LOG_FILE_BYTES = Math.max(1024, Number.parseInt(process.env.MAX_LOG_FILE_BYTES || String(2 * 1024 * 1024), 10) || 2 * 1024 * 1024);
 
 ensureDir(LOG_DIR);
 ensureDir(LOG_ARCHIVE_DIR);
@@ -255,6 +256,21 @@ function shouldKeepDetails(logLevel, level, options = {}) {
   return normalizedLevel === "ERROR" || normalizedLevel === "WARN" || normalizedLevel === "WARNING";
 }
 
+function trimLogFileIfOversized(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size <= MAX_LOG_FILE_BYTES) return;
+    const content = fs.readFileSync(filePath, "utf8");
+    const lines = content.split("\n");
+    // Keep the first line (TASK START header) and the last 200 lines
+    const head = lines[0] || "";
+    const tail = lines.slice(-200).join("\n");
+    fs.writeFileSync(filePath, `${head}\n[...log trimmed — exceeded ${MAX_LOG_FILE_BYTES} bytes...]\n${tail}`, "utf8");
+  } catch (_err) {
+    // Do not fail task logging due to trim errors
+  }
+}
+
 function appendTaskEvent(task, level, message, details = null) {
   const logLevel = normalizeLogLevel(task?.logLevel);
   if (!shouldPersistEvent(logLevel, level)) {
@@ -265,6 +281,7 @@ function appendTaskEvent(task, level, message, details = null) {
   const timestamp = new Date().toISOString();
   const line = `${timestamp} [${level}] ${message}${safeDetails ? ` | ${JSON.stringify(safeDetails)}` : ""}\n`;
   fs.appendFileSync(task.textPath, line, "utf8");
+  trimLogFileIfOversized(task.textPath);
 
   const buf = _taskEventBuffers.get(task.taskId);
   if (buf) {

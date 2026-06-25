@@ -24,6 +24,18 @@ const DEFAULT_THEME_FAVORITES = [
   "batman",
 ];
 
+const KNOWN_TAB_IDS = [
+  "credentials",
+  "objects",
+  "diff",
+  "backup",
+  "deploy",
+  "logs",
+  "customize",
+];
+
+const PROTECTED_TAB_ID = "customize";
+
 const DEFAULT_APP_STATE = {
   preferences: {
     notificationsEnabled: false,
@@ -34,6 +46,7 @@ const DEFAULT_APP_STATE = {
     fontFamily: "Space Grotesk",
     fontSize: 14,
     logLevel: "Normal",
+    hiddenTabs: [],
     shortcuts: { ...DEFAULT_SHORTCUTS },
   },
   ui: {
@@ -81,6 +94,14 @@ function sanitizeState(raw = {}) {
   const favoriteThemes = Array.isArray(merged.preferences.favoriteThemes)
     ? [...new Set(merged.preferences.favoriteThemes.map((value) => String(value || "").trim()).filter(Boolean))]
     : [...DEFAULT_THEME_FAVORITES];
+  const activeTab = String(merged.ui.activeTab || DEFAULT_APP_STATE.ui.activeTab).trim();
+  const hiddenTabs = Array.isArray(merged.preferences.hiddenTabs)
+    ? [...new Set(
+        merged.preferences.hiddenTabs
+          .map((value) => String(value || "").trim())
+          .filter((value) => value && value !== PROTECTED_TAB_ID && KNOWN_TAB_IDS.includes(value))
+      )]
+    : [];
 
   return {
     preferences: {
@@ -94,6 +115,7 @@ function sanitizeState(raw = {}) {
       logLevel: ["Verbose", "Normal", "ErrorsOnly"].includes(merged.preferences.logLevel)
         ? merged.preferences.logLevel
         : DEFAULT_APP_STATE.preferences.logLevel,
+      hiddenTabs,
       shortcuts: Object.fromEntries(
         Object.keys(DEFAULT_SHORTCUTS).map((k) => [
           k,
@@ -104,7 +126,7 @@ function sanitizeState(raw = {}) {
       ),
     },
     ui: {
-      activeTab: String(merged.ui.activeTab || DEFAULT_APP_STATE.ui.activeTab),
+      activeTab: KNOWN_TAB_IDS.includes(activeTab) ? activeTab : DEFAULT_APP_STATE.ui.activeTab,
       objectsProfileId: String(merged.ui.objectsProfileId || ""),
       objectsMode: String(merged.ui.objectsMode || DEFAULT_APP_STATE.ui.objectsMode),
       sharedObjectText: String(merged.ui.sharedObjectText || ""),

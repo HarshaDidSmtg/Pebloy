@@ -1,4 +1,4 @@
-# BDeploy — Troubleshooting
+# Pebloy — Troubleshooting
 
 ## Connection Issues
 
@@ -10,7 +10,8 @@
 - Click **Diagnostics** in the Connections table — this runs a TCP + SQL login path check and shows exactly where the connection is failing.
 
 **Windows Authentication fails even though credentials are correct**
-- Ensure the machine running BDeploy is domain-joined and that the Windows account has SQL Server access.
+
+- Ensure the machine running Pebloy is domain-joined and that the Windows account has SQL Server access.
 - Try using the hostname instead of the IP.
 - Check that the SQL Server Browser service is running (for named instances).
 
@@ -51,7 +52,7 @@
 
 **Diff shows CREATE and PROCEDURE (or similar DDL keywords) on separate lines**
 - This is a known SMO formatting quirk — the SQL Server Management Objects library sometimes emits `CREATE\nPROCEDURE`, `ALTER\nVIEW`, or `CREATE\nOR ALTER\nPROCEDURE` with keyword pairs split across lines.
-- BDeploy normalizes these at all three comparison layers (deploy path, diff path, and live DB definition path) via `normalizeDdlKeywords()`. If you still see split keywords in the diff viewer, re-run the diff — a stale browser cache may be showing an older result.
+- Pebloy normalizes these at all three comparison layers (deploy path, diff path, and live DB definition path) via `normalizeDdlKeywords()`. If you still see split keywords in the diff viewer, re-run the diff — a stale browser cache may be showing an older result.
 - If the symptom persists, check that you are running the latest version of `DBObjectsBulkScriptGenerator.ps1` which includes `Format-DdlKeywords` for normalization at script generation time.
 
 **Diff shows changes that don't exist**
@@ -115,11 +116,13 @@
 - Check that port 5089 is not blocked by a firewall or antivirus.
 
 **Electron app does not open**
-- Run `Launch-BDeploy.ps1` or `Launch-BDeploy.cmd`; that path checks dependencies and starts Electron directly.
+
+- Run `Launch-Pebloy.ps1` or `Launch-Pebloy.cmd`; that path checks dependencies and starts Electron directly.
 - Verify `node_modules/.bin/electron.cmd` exists by running `npm install` if Electron was not installed yet.
 
 **Desktop shortcut still shows the old icon**
-- The launcher refreshes `BDeploy.lnk` to use `build/icon.ico`.
+
+- The launcher refreshes `Pebloy.lnk` to use `build/icon.ico`.
 - If Windows still shows the old icon temporarily, close Explorer windows or let the icon cache refresh.
 
 **File picker and folder picker look inconsistent**

@@ -147,6 +147,25 @@ function ensureSqlServerModule() {
   return _sqlServerModulePromise;
 }
 
+function extractPsErrorContext(stderr, stdout) {
+  const combined = [stderr, stdout].filter(Boolean).join("\n");
+
+  // Pull the first non-empty "At ... line N" or "CategoryInfo" or "FullyQualifiedErrorId" fragment
+  const atMatch = combined.match(/At\s+.+?\.ps1\s*:\s*line\s+\d+/i);
+  const categoryMatch = combined.match(/CategoryInfo\s*:\s*([^\r\n]+)/i);
+  const errorIdMatch = combined.match(/FullyQualifiedErrorId\s*:\s*([^\r\n]+)/i);
+  // Extract the first ERROR: line written by our own scripts
+  const scriptErrorMatch = combined.match(/^(?:ERROR|WARN)\s*:\s*(.+)$/im);
+
+  const parts = [];
+  if (scriptErrorMatch) parts.push(scriptErrorMatch[1].trim());
+  if (atMatch) parts.push(atMatch[0].trim());
+  if (categoryMatch) parts.push(`Category: ${categoryMatch[1].trim()}`);
+  if (errorIdMatch) parts.push(`ErrorId: ${errorIdMatch[1].trim()}`);
+
+  return parts.length ? parts.join(" | ") : null;
+}
+
 function runPowerShellFile(scriptPath, args, timeoutMs = 900000) {
   return new Promise((resolve, reject) => {
     const fullArgs = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...args];
@@ -159,7 +178,10 @@ function runPowerShellFile(scriptPath, args, timeoutMs = 900000) {
 
     execFile("pwsh", fullArgs, { encoding: "utf8", maxBuffer: 1024 * 1024 * 50, timeout: timeoutMs, env }, (error, stdout, stderr) => {
       if (error) {
-        reject(new Error(String(stderr || stdout || error.message || "PowerShell script failed").trim()));
+        const context = extractPsErrorContext(String(stderr || ""), String(stdout || ""));
+        const base = String(stderr || stdout || error.message || "PowerShell script failed").trim();
+        const message = context ? `${base}\n[Detail] ${context}` : base;
+        reject(new Error(message));
         return;
       }
       resolve({ stdout: String(stdout || ""), stderr: String(stderr || "") });
@@ -390,12 +412,11 @@ function normalizeDdlKeywords(text) {
   return text;
 }
 
-function normalizeModuleBatchHeaders(text, objectType) {
-  const type = String(objectType || "").toUpperCase();
-  if (!["PROCEDURE", "VIEW", "FUNCTION", "TRIGGER"].includes(type)) {
-    return String(text || "").trim();
-  }
+function supportsModuleBatchHeaders(objectType) {
+  return ["PROCEDURE", "VIEW", "FUNCTION", "TRIGGER"].includes(String(objectType || "").toUpperCase());
+}
 
+function collectModuleBatchHeader(text) {
   const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
   const headerLines = [];
   let index = 0;
@@ -419,20 +440,40 @@ function normalizeModuleBatchHeaders(text, objectType) {
     break;
   }
 
-  if (!headerLines.length) {
+  const body = lines.slice(index).join("\n").trim();
+  return { headerLines, body };
+}
+
+function buildMetadataHeaderLines(moduleMetadata = {}) {
+  const headerLines = [];
+  if (moduleMetadata.usesAnsiNulls != null) {
+    headerLines.push(`SET ANSI_NULLS ${moduleMetadata.usesAnsiNulls ? "ON" : "OFF"}`);
+  }
+  if (moduleMetadata.usesQuotedIdentifier != null) {
+    headerLines.push(`SET QUOTED_IDENTIFIER ${moduleMetadata.usesQuotedIdentifier ? "ON" : "OFF"}`);
+  }
+  return headerLines;
+}
+
+function normalizeModuleBatchHeaders(text, objectType, moduleMetadata = null) {
+  const type = String(objectType || "").toUpperCase();
+  if (!supportsModuleBatchHeaders(type)) {
     return String(text || "").trim();
   }
 
-  const body = lines.slice(index).join("\n").trim();
+  const { headerLines: existingHeaderLines, body } = collectModuleBatchHeader(text);
+  const headerLines = buildMetadataHeaderLines(moduleMetadata || {});
+  const effectiveHeaderLines = headerLines.length ? headerLines : existingHeaderLines;
+
+  if (!effectiveHeaderLines.length) {
+    return body || String(text || "").trim();
+  }
+
   if (!body) {
-    return headerLines.join("\n");
+    return effectiveHeaderLines.join("\nGO\n");
   }
 
-  if (/^GO\s*(?:\n|$)/i.test(body)) {
-    return `${headerLines.join("\n")}\n${body}`.trim();
-  }
-
-  return `${headerLines.join("\n")}\nGO\n${body}`.trim();
+  return `${effectiveHeaderLines.join("\nGO\n")}\nGO\n${body}`.trim();
 }
 
 function normalizeExecutableSql(sqlText, objectType, context = {}, options = {}) {
@@ -452,7 +493,7 @@ function normalizeExecutableSql(sqlText, objectType, context = {}, options = {})
       .replace(/\bCREATE\s+TRIGGER\b/i, "CREATE OR ALTER TRIGGER");
   }
 
-  text = normalizeModuleBatchHeaders(text, type);
+  text = normalizeModuleBatchHeaders(text, type, options.moduleMetadata || null);
 
   const { schemaName, objectName } = context;
   if (schemaName && objectName) {

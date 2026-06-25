@@ -284,7 +284,13 @@ async function compareObjects(sourceProfile, destinationProfile, selectedObjects
   );
 
   onProgress({ taskType: "Diff", key: "diff", operation: "Preparing diff results...", percent: 95 });
-  return compared;
+  return {
+    ...compared,
+    generationWarnings: [
+      ...(sourceGenerated.generationWarnings || []).map((warning) => ({ ...warning, profileRole: "source" })),
+      ...(destinationGenerated.generationWarnings || []).map((warning) => ({ ...warning, profileRole: "destination" })),
+    ],
+  };
 }
 
 function exportReport(format, report) {
