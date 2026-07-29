@@ -94,8 +94,9 @@
 ## Logs and Artifacts
 
 **Log files are too large**
-- This is a known issue. See [IMPROVEMENTS.md](IMPROVEMENTS.md) for the planned logging optimization.
-- For now, manually clear old logs from `artifacts/logs/`.
+- Pebloy now trims oversized `.log` files automatically when they exceed `MAX_LOG_FILE_BYTES` (default 2 MB).
+- Completed task logs are archived automatically when active log count exceeds `MAX_ACTIVE_TASK_LOGS` (default 200).
+- If you still need to reclaim disk space, clear logs from the Logs tab or remove old files from `artifacts/logs/` and `artifacts/logs/archive/`.
 
 **Can't find a generated script**
 - The Logs tab **Open File** action now opens the preferred `.log` artifact directly.

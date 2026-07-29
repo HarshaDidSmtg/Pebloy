@@ -5,12 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Pebloy</title>
     <link rel="stylesheet" href="style.css" />
-    <link rel="icon" href="logo.svg" type="image/svg+xml" />
+    <link rel="icon" href="logo.svg?v=20260729-logo-refresh" type="image/svg+xml" />
   </head>
   <body>
     <header class="app-header">
       <div class="brand-wrap">
-        <img src="logo.svg" alt="" class="app-logo" aria-hidden="true" />
+        <img src="logo.svg?v=20260729-logo-refresh" alt="" class="app-logo" aria-hidden="true" />
         <div class="brand-copy">
           <h1>Pebloy</h1>
           <p>SQL Server schema management</p>
@@ -138,7 +138,11 @@
               </div>
             </div>
             <input type="file" id="sharedObjectFile" accept=".txt,.csv" hidden />
-            <textarea id="sharedObjectText" placeholder="Paste schema.name or object name (one per line)&#10;Example: dbo.MyProc&#10;         vw_Orders&#10;         reporting.usp_get_summary&#10;&#10;Shortcut: Ctrl+D to Resolve &amp; Add Objects"></textarea>
+            <div id="sharedObjectEditorShell" class="enhanced-text-editor-shell manual-entry-editor-shell">
+              <div id="sharedObjectEditor" class="enhanced-text-editor manual-entry-editor hidden" data-enhanced-textarea="sharedObjectText" aria-label="Manual object entry editor"></div>
+              <textarea id="sharedObjectText" data-enhanced-editor="true" placeholder="Paste schema.name or object name (one per line)&#10;Example: dbo.MyProc&#10;         vw_Orders&#10;         reporting.usp_get_summary&#10;&#10;Shortcut: Ctrl+D to Resolve &amp; Add Objects"></textarea>
+            </div>
+            <p id="sharedObjectEditorHelp" class="manual-entry-help muted"></p>
           </div>
           <button id="resolveAndAddObjects" type="button">Resolve &amp; Add Objects</button>
         </div>
@@ -427,6 +431,7 @@
     </div>
 
     <script src="editorHelpers.js"></script>
+    <script src="manualEntryEditor.js"></script>
     <script src="themeRegistry.js"></script>
     <script src="app.js"></script>
   </body>

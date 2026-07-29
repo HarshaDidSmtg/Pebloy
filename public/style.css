@@ -397,6 +397,53 @@ textarea {
   font-size: 0.82rem;
 }
 
+.manual-entry-help {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.enhanced-text-editor-shell {
+  display: flex;
+  flex: 1 1 100%;
+  flex-direction: column;
+  gap: 0;
+  min-height: 10rem;
+  position: relative;
+}
+
+.enhanced-text-editor {
+  display: none;
+  min-height: 18rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.enhanced-text-editor-shell.has-enhanced-editor .enhanced-text-editor {
+  display: block;
+  flex: 1 1 auto;
+}
+
+.enhanced-text-editor-shell.has-enhanced-editor textarea[data-enhanced-editor="true"] {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.enhanced-text-editor .monaco-editor,
+.enhanced-text-editor .monaco-editor .overflow-guard {
+  border-radius: var(--radius);
+}
+
 .upload-field {
   display: grid;
   gap: 0.3rem;
@@ -1075,10 +1122,15 @@ pre {
   min-height: 0;
 }
 
-.maximizable-wrap.maximized #sharedObjectText {
+.maximizable-wrap.maximized textarea[data-enhanced-editor="true"] {
   flex: 1 1 auto;
   min-height: 0;
   height: 100%;
+}
+
+.maximizable-wrap.maximized .enhanced-text-editor-shell {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 #specifyWrap.maximized #objectsSpecifySection {
@@ -1102,7 +1154,7 @@ pre {
   display: none;
 }
 
-#specifyWrap.maximized #sharedObjectText {
+#specifyWrap.maximized textarea[data-enhanced-editor="true"] {
   width: 100%;
   flex: 1 1 auto;
   height: 100%;
@@ -1113,6 +1165,20 @@ pre {
   font-size: 0.95rem;
   line-height: 1.7;
   border-radius: var(--radius);
+}
+
+#specifyWrap.maximized .enhanced-text-editor-shell {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 28rem;
+  max-height: none;
+  margin: 0;
+}
+
+#specifyWrap.maximized .enhanced-text-editor-shell.has-enhanced-editor .enhanced-text-editor {
+  flex: 1 1 auto;
+  height: 100%;
+  min-height: 0;
 }
 
 #specifyWrap.maximized #resolveAndAddObjects {

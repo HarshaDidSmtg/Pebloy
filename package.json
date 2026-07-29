@@ -32,12 +32,13 @@
     "prebuild": "node scripts/prebuild-win.js",
     "build": "electron-builder --win",
     "build:dir": "electron-builder --win --dir",
-    "check": "node --check src/server.js && node --check src/services/backupService.js && node --check src/services/deploymentService.js && node --check src/services/diffService.js && node --check src/services/loggingService.js && node --check src/services/profileService.js && node --check src/services/scriptAutomationService.js && node --check src/services/secretStore.js && node --check src/services/sqlService.js && node --check src/services/storage.js && node --check src/services/systemService.js && node --check src/electron/main.js && node --check public/app.js",
+    "check": "node --check src/server.js && node --check src/services/backupService.js && node --check src/services/deploymentService.js && node --check src/services/diffService.js && node --check src/services/loggingService.js && node --check src/services/profileService.js && node --check src/services/scriptAutomationService.js && node --check src/services/secretStore.js && node --check src/services/sqlService.js && node --check src/services/storage.js && node --check src/services/systemService.js && node --check src/electron/main.js && node --check public/app.js && node --check public/manualEntryEditor.js",
     "test": "jest"
   },
   "dependencies": {
     "diff": "^5.2.0",
     "express": "^4.19.2",
+    "monaco-editor": "^0.52.2",
     "uuid": "^11.0.3"
   },
   "devDependencies": {
@@ -72,8 +73,18 @@
     ],
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] },
-        { "target": "portable", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "build/icon.ico",
       "sign": null,

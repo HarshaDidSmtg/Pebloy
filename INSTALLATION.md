@@ -23,7 +23,9 @@ npm install
 npm start
 ```
 
-Open `http://localhost:5089` in your browser.
+Open the URL printed in the terminal in your browser (default `http://localhost:5089`).
+
+If port 5089 is already in use, Pebloy automatically selects the next available port and writes the active URL to `data/server-info.json`.
 
 To launch the desktop app directly, use **Launch-Pebloy.cmd** or **scripts/powershell/Launch-Pebloy.ps1**. The launcher verifies Electron dependencies, starts the Electron shell, and refreshes the `Pebloy.lnk` desktop shortcut.
 

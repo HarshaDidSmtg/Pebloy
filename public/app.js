@@ -8,6 +8,7 @@ let appState = null;
 let pendingAppStatePatch = null;
 let appStateSaveTimer = null;
 let isApplyingAppState = false;
+const enhancedTextEditors = new Map();
 const DEFAULT_TAB = "credentials";
 const _profileHealth = new Map(); // profileId → { status: 'ok'|'error'|'unknown', testedAt: ISO|null }
 let _lastDeployResults = []; // for retry failed
@@ -41,6 +42,29 @@ const editorHelpers = globalThis.PebloyEditorHelpers || {
       focusTargetId: "sharedObjectText",
       toastMessage: hadSelection ? "Cleared object selection" : "Ready for manual object entry",
     };
+  },
+  getManualEntryPlaceholderText(shortcuts = {}) {
+    const resolveObjects = shortcuts.resolveObjects || "Ctrl+D";
+    const findInEditor = shortcuts.findInEditor || "Ctrl+F";
+    const replaceInEditor = shortcuts.replaceInEditor || "Ctrl+H";
+    const uppercaseText = shortcuts.uppercaseText || "Ctrl+Shift+U";
+    const lowercaseText = shortcuts.lowercaseText || "Ctrl+Shift+L";
+    return [
+      "Paste schema.name or object name (one per line)",
+      "Example: dbo.MyProc",
+      "         vw_Orders",
+      "         reporting.usp_get_summary",
+      "",
+      `Shortcuts: ${resolveObjects} = Resolve & Add  ·  ${findInEditor} = Find  ·  ${replaceInEditor} = Replace  ·  ${uppercaseText} = UPPER  ·  ${lowercaseText} = lower`,
+    ].join("\n");
+  },
+  getManualEntryHelperText(shortcuts = {}) {
+    const resolveObjects = shortcuts.resolveObjects || "Ctrl+D";
+    const findInEditor = shortcuts.findInEditor || "Ctrl+F";
+    const replaceInEditor = shortcuts.replaceInEditor || "Ctrl+H";
+    const uppercaseText = shortcuts.uppercaseText || "Ctrl+Shift+U";
+    const lowercaseText = shortcuts.lowercaseText || "Ctrl+Shift+L";
+    return `One object per line. Use schema.name when names are ambiguous. Shortcuts: ${resolveObjects} Resolve & Add, ${findInEditor} Find, ${replaceInEditor} Replace, ${uppercaseText} UPPER, ${lowercaseText} lower.`;
   },
 };
 
@@ -140,22 +164,110 @@ function renderShortcutBadges() {
 
   // Update the Specify textarea placeholder with the current shortcut
   const ta = document.getElementById("sharedObjectText");
-  if (ta && sc.resolveObjects) {
-    ta.placeholder =
-      "Paste schema.name (one per line)\n" +
-      "Example: dbo.MyProc\n" +
-      "         dbo.vw_Orders\n" +
-      "         reporting.usp_get_summary\n\n" +
-      `Shortcuts: ${sc.resolveObjects} = Resolve & Add  ·  ` +
-      `${sc.findInEditor || "Ctrl+F"} = Find  ·  ` +
-      `${sc.replaceInEditor || "Ctrl+H"} = Replace  ·  ` +
-      `${sc.uppercaseText || "Ctrl+Shift+U"} = UPPER  ·  ` +
-      `${sc.lowercaseText || "Ctrl+Shift+L"} = lower`;
+  if (ta) {
+    const placeholder = editorHelpers.getManualEntryPlaceholderText
+      ? editorHelpers.getManualEntryPlaceholderText(sc)
+      : ta.placeholder;
+    ta.placeholder = placeholder;
+    getEnhancedTextEditor("sharedObjectText")?.updatePlaceholder?.(placeholder);
+  }
+
+  const editorHelp = document.getElementById("sharedObjectEditorHelp");
+  if (editorHelp && editorHelpers.getManualEntryHelperText) {
+    editorHelp.textContent = editorHelpers.getManualEntryHelperText(sc);
   }
 }
 
 function $(id) {
   return document.getElementById(id);
+}
+
+function getEnhancedTextEditor(textareaOrId) {
+  const textareaId = typeof textareaOrId === "string" ? textareaOrId : textareaOrId?.id;
+  return textareaId ? enhancedTextEditors.get(textareaId) || null : null;
+}
+
+function getTextEditorValue(textareaId) {
+  return getEnhancedTextEditor(textareaId)?.getValue?.() ?? $(textareaId)?.value ?? "";
+}
+
+function setTextEditorValue(textareaId, value, { emit = false } = {}) {
+  const nextValue = String(value ?? "");
+  const editor = getEnhancedTextEditor(textareaId);
+  if (editor?.setValue) {
+    editor.setValue(nextValue, { emit });
+    return;
+  }
+
+  const textarea = $(textareaId);
+  if (!textarea) return;
+  textarea.value = nextValue;
+  if (emit) {
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    textarea.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+}
+
+function focusTextEditor(textareaId) {
+  const editor = getEnhancedTextEditor(textareaId);
+  if (editor?.focus) {
+    editor.layout?.();
+    editor.focus();
+    return;
+  }
+  $(textareaId)?.focus();
+}
+
+function getSharedObjectTextValue() {
+  return getTextEditorValue("sharedObjectText");
+}
+
+function setSharedObjectTextValue(value, { emit = false } = {}) {
+  setTextEditorValue("sharedObjectText", value, { emit });
+}
+
+function focusSharedObjectEntry() {
+  focusTextEditor("sharedObjectText");
+}
+
+async function setupEnhancedTextEditors() {
+  const createEditor =
+    globalThis.PebloyManualEntryEditor?.createEnhancedTextareaEditor ||
+    globalThis.PebloyManualEntryEditor?.createManualEntryEditor;
+  if (!createEditor) {
+    return;
+  }
+
+  const hosts = Array.from(document.querySelectorAll(".enhanced-text-editor[data-enhanced-textarea]"));
+  const failures = [];
+
+  for (const host of hosts) {
+    const textareaId = host.dataset.enhancedTextarea;
+    const textarea = textareaId ? $(textareaId) : null;
+    if (!textareaId || !textarea) continue;
+
+    const existingEditor = getEnhancedTextEditor(textareaId);
+    if (existingEditor?.dispose) {
+      existingEditor.dispose();
+      enhancedTextEditors.delete(textareaId);
+    }
+
+    try {
+      const editor = await createEditor({
+        host,
+        textarea,
+        initialValue: textarea.value,
+        placeholder: textarea.placeholder,
+      });
+      enhancedTextEditors.set(textareaId, editor);
+    } catch (error) {
+      failures.push(`${textareaId}: ${error.message}`);
+    }
+  }
+
+  if (failures.length) {
+    throw new Error(failures.join("; "));
+  }
 }
 
 function getElectronApi() {
@@ -403,7 +515,7 @@ function collectCurrentAppState() {
       activeTab: getActiveTabName(),
       objectsProfileId: $("objectsProfile")?.value || "",
       objectsMode: $("objectsMode")?.value || "Specify",
-      sharedObjectText: $("sharedObjectText")?.value || "",
+      sharedObjectText: getSharedObjectTextValue(),
       sharedSelectedObjects: cloneJson(sharedSelectedObjects),
       diffSourceProfileId: $("diffSourceProfile")?.value || "",
       diffDestProfileId: $("diffDestProfile")?.value || "",
@@ -441,7 +553,7 @@ function applyPersistedUiState() {
     if ($("objectsMode")) $("objectsMode").value = ui.objectsMode || "Specify";
     applyObjectModeUI();
 
-    if ($("sharedObjectText")) $("sharedObjectText").value = ui.sharedObjectText || "";
+    setSharedObjectTextValue(ui.sharedObjectText || "");
     sharedSelectedObjects = dedupeObjects(Array.isArray(ui.sharedSelectedObjects) ? ui.sharedSelectedObjects : []);
     renderSharedSelectionTable();
 
@@ -798,7 +910,6 @@ function setupPanelToggles({ maximizeToggleId, wrapperId, bodyId, focusTargetId 
   const maximizeToggle = $(maximizeToggleId);
   const wrap = $(wrapperId);
   const body = $(bodyId);
-  const focusTarget = focusTargetId ? $(focusTargetId) : null;
   if (!maximizeToggle || !wrap || !body) return;
 
   const syncState = () => {
@@ -824,8 +935,15 @@ function setupPanelToggles({ maximizeToggleId, wrapperId, bodyId, focusTargetId 
     wrap.classList.toggle("maximized", shouldMaximize);
     syncState();
 
-    if (shouldMaximize && focusTarget && typeof focusTarget.focus === "function") {
-      focusTarget.focus({ preventScroll: true });
+    if (shouldMaximize) {
+      if (focusTargetId === "sharedObjectText" || focusTargetId === "sharedObjectEditor") {
+        focusSharedObjectEntry();
+      } else {
+        const focusTarget = focusTargetId ? $(focusTargetId) : null;
+        if (focusTarget && typeof focusTarget.focus === "function") {
+          focusTarget.focus({ preventScroll: true });
+        }
+      }
     }
   });
 
@@ -1407,7 +1525,7 @@ async function resolveAndAdd() {
     showToast("Choose a source connection first", true);
     return;
   }
-  const parsed = parseObjectLines($("sharedObjectText").value);
+  const parsed = parseObjectLines(getSharedObjectTextValue());
   if (!parsed.length) {
     endTaskProgress("objects", false, "Objects");
     showToast("No valid object names found", true);
@@ -1467,7 +1585,7 @@ async function resolveAndAdd() {
   }
 
   addToSharedSelection(valid);
-  $("sharedObjectText").value = "";
+  setSharedObjectTextValue("");
   persistCurrentAppState({ delay: 0 });
   endTaskProgress("objects", true, "Objects");
   showToast(
@@ -1644,7 +1762,46 @@ function setupEditorShortcuts() {
   });
 }
 
-function setupObjectsTab() {
+function setupEnhancedEditorShortcuts() {
+  document.addEventListener("keydown", (e) => {
+    const sc = getShortcuts();
+    const objectsTabActive = document.querySelector(".tab.active")?.dataset.tab === "objects";
+    const editor = getEnhancedTextEditor("sharedObjectText");
+    if (!objectsTabActive || !editor?.isTextFocused?.()) return;
+
+    if (matchesShortcut(e, sc.resolveObjects || "Ctrl+D")) {
+      e.preventDefault();
+      e.stopPropagation();
+      $("resolveAndAddObjects").click();
+      return;
+    }
+    if (matchesShortcut(e, sc.findInEditor || "Ctrl+F")) {
+      e.preventDefault();
+      e.stopPropagation();
+      editor.openFind?.();
+      return;
+    }
+    if (matchesShortcut(e, sc.replaceInEditor || "Ctrl+H")) {
+      e.preventDefault();
+      e.stopPropagation();
+      editor.openReplace?.();
+      return;
+    }
+    if (matchesShortcut(e, sc.uppercaseText || "Ctrl+Shift+U")) {
+      e.preventDefault();
+      e.stopPropagation();
+      editor.transformSelection?.((text) => text.toUpperCase());
+      return;
+    }
+    if (matchesShortcut(e, sc.lowercaseText || "Ctrl+Shift+L")) {
+      e.preventDefault();
+      e.stopPropagation();
+      editor.transformSelection?.((text) => text.toLowerCase());
+    }
+  }, true);
+}
+
+async function setupObjectsTab() {
   $("objectsProfile").onchange = () => {
     if ($("objectsMode").value === "Discover") {
       populateDiscoverDropdowns();
@@ -1670,7 +1827,7 @@ function setupObjectsTab() {
       });
       if (!file) return;
 
-      $("sharedObjectText").value = file.content;
+      setSharedObjectTextValue(file.content);
       if (sharedObjectFileName) sharedObjectFileName.textContent = file.fileName || "File selected";
       persistCurrentAppState({ delay: 0 });
       showToast(`Loaded object list: ${file.fileName || "selected file"}`);
@@ -1680,6 +1837,12 @@ function setupObjectsTab() {
   };
 
   setupEditorShortcuts();
+  setupEnhancedEditorShortcuts();
+  try {
+    await setupEnhancedTextEditors();
+  } catch (error) {
+    showToast(`Enhanced text editor unavailable: ${error.message}`, true);
+  }
 
   $("resolveAndAddObjects").onclick = async () => {
     const restore = setButtonLoading($("resolveAndAddObjects"), "Resolving...");
@@ -1756,8 +1919,12 @@ function setupObjectsTab() {
     applyObjectModeUI();
     renderSharedSelectionTable();
     persistCurrentAppState({ delay: 0 });
-    const input = $(resetState.focusTargetId);
-    if (input) input.focus();
+    if (resetState.focusTargetId === "sharedObjectText" || resetState.focusTargetId === "sharedObjectEditor") {
+      focusSharedObjectEntry();
+    } else {
+      const input = $(resetState.focusTargetId);
+      if (input) input.focus();
+    }
     showToast(resetState.toastMessage);
   };
 
@@ -2471,7 +2638,7 @@ function sendDesktopNotification(data) {
   } else if (data.error) {
     body = String(data.error).slice(0, 100);
   }
-  try { new Notification(title, { body, icon: "/logo.svg" }); } catch (_e) {}
+  try { new Notification(title, { body, icon: "/logo.svg?v=20260729-logo-refresh" }); } catch (_e) {}
 }
 
 // ─── Logs table ────────────────────────────────────────────────────────────
@@ -3383,7 +3550,7 @@ async function start() {
   });
   setupProfileForm();
   setupProfileImportExport();
-  setupObjectsTab();
+  await setupObjectsTab();
   setupDiff();
   setupBackup();
   setupDeployment();

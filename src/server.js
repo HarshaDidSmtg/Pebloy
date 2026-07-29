@@ -34,6 +34,7 @@ const { buildClientError } = require("./services/errorService");
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.resolve(__dirname, "..", "public")));
+app.use("/vendor/monaco", express.static(path.resolve(__dirname, "..", "node_modules", "monaco-editor", "min")));
 
 app.get("/api/dashboard", (req, res) => {
   try {

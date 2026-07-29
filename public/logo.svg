@@ -1,18 +1,55 @@
-<svg width="256" height="200" viewBox="0 0 256 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pebloy logo">
-  <!-- Left database cylinder -->
-  <ellipse cx="76" cy="46" rx="32" ry="10" fill="#38bdf8"/>
-  <rect x="44" y="46" width="64" height="44" fill="#0284c7"/>
-  <ellipse cx="76" cy="90" rx="32" ry="10" fill="#38bdf8"/>
-  <ellipse cx="76" cy="46" rx="24" ry="7" fill="#7dd3fc" opacity="0.35"/>
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pebloy logo">
+  <defs>
+    <linearGradient id="badgeFill" x1="40" y1="28" x2="214" y2="228" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="0.55" stop-color="#111827"/>
+      <stop offset="1" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="badgeStroke" x1="54" y1="36" x2="204" y2="220" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7dd3fc" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#fb7185" stop-opacity="0.45"/>
+    </linearGradient>
+    <linearGradient id="pStroke" x1="82" y1="56" x2="188" y2="178" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="arrowStroke" x1="116" y1="164" x2="184" y2="200" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fb7185"/>
+      <stop offset="1" stop-color="#ff2340"/>
+    </linearGradient>
+    <filter id="softShadow" x="0" y="0" width="256" height="256" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#020617" flood-opacity="0.35"/>
+    </filter>
+  </defs>
 
-  <!-- Right database cylinder -->
-  <ellipse cx="180" cy="46" rx="32" ry="10" fill="#34d399"/>
-  <rect x="148" y="46" width="64" height="44" fill="#059669"/>
-  <ellipse cx="180" cy="90" rx="32" ry="10" fill="#34d399"/>
-  <ellipse cx="180" cy="46" rx="24" ry="7" fill="#6ee7b7" opacity="0.35"/>
+  <path
+    d="M128 18L188 34C204 38 218 51 223 67L238 128L223 189C218 205 204 218 188 222L128 238L68 222C52 218 38 205 33 189L18 128L33 67C38 51 52 38 68 34L128 18Z"
+    fill="url(#badgeFill)"
+    stroke="url(#badgeStroke)"
+    stroke-width="10"
+    filter="url(#softShadow)"
+  />
 
-  <!-- Arrows between DBs -->
-  <path d="M114 68 L142 68" stroke="#f8fafc" stroke-width="5" stroke-linecap="round"/>
-  <path d="M132 60 L144 68 L132 76" fill="none" stroke="#f8fafc" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M124 60 L112 68 L124 76" fill="none" stroke="#94a3b8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path
+    d="M90 58V198M90 58H140C170 58 192 80 192 109C192 138 170 160 140 160H90"
+    fill="none"
+    stroke="url(#pStroke)"
+    stroke-width="28"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <path d="M124 92H165" stroke="#e0f2fe" stroke-width="8" stroke-linecap="round" opacity="0.92"/>
+  <path d="M124 110H156" stroke="#bae6fd" stroke-width="8" stroke-linecap="round" opacity="0.88"/>
+  <path d="M124 128H165" stroke="#7dd3fc" stroke-width="8" stroke-linecap="round" opacity="0.84"/>
+
+  <path d="M118 188H168" stroke="url(#arrowStroke)" stroke-width="16" stroke-linecap="round"/>
+  <path
+    d="M154 171L184 188L154 205"
+    fill="none"
+    stroke="url(#arrowStroke)"
+    stroke-width="16"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
 </svg>

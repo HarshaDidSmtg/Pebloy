@@ -3,6 +3,8 @@ const {
   getNextFindMatchIndex,
   getFindCountText,
   getClearSelectionUiState,
+  getManualEntryPlaceholderText,
+  getManualEntryHelperText,
 } = require("../../public/editorHelpers");
 
 describe("editorHelpers", () => {
@@ -37,5 +39,25 @@ describe("editorHelpers", () => {
     expect(normalizeFindMatchIndex(1, 3)).toBe(1);
     expect(normalizeFindMatchIndex(7, 3)).toBe(2);
     expect(normalizeFindMatchIndex(0, 0)).toBe(-1);
+  });
+
+  test("manual entry helper copy reflects shortcut overrides", () => {
+    const shortcuts = {
+      resolveObjects: "Ctrl+R",
+      findInEditor: "Ctrl+Shift+F",
+      replaceInEditor: "Ctrl+Alt+R",
+      uppercaseText: "Alt+U",
+      lowercaseText: "Alt+L",
+    };
+
+    const placeholder = getManualEntryPlaceholderText(shortcuts);
+    const helper = getManualEntryHelperText(shortcuts);
+
+    expect(placeholder).toContain("Paste schema.name or object name (one per line)");
+    expect(placeholder).toContain("Ctrl+R = Resolve & Add");
+    expect(placeholder).toContain("Ctrl+Shift+F = Find");
+    expect(helper).toContain("Ctrl+Alt+R Replace");
+    expect(helper).toContain("Alt+U UPPER");
+    expect(helper).toContain("Alt+L lower");
   });
 });

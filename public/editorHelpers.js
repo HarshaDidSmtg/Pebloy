@@ -39,10 +39,39 @@
     };
   }
 
+  function getManualEntryPlaceholderText(shortcuts = {}) {
+    const resolveObjects = shortcuts.resolveObjects || "Ctrl+D";
+    const findInEditor = shortcuts.findInEditor || "Ctrl+F";
+    const replaceInEditor = shortcuts.replaceInEditor || "Ctrl+H";
+    const uppercaseText = shortcuts.uppercaseText || "Ctrl+Shift+U";
+    const lowercaseText = shortcuts.lowercaseText || "Ctrl+Shift+L";
+
+    return [
+      "Paste schema.name or object name (one per line)",
+      "Example: dbo.MyProc",
+      "         vw_Orders",
+      "         reporting.usp_get_summary",
+      "",
+      `Shortcuts: ${resolveObjects} = Resolve & Add  ·  ${findInEditor} = Find  ·  ${replaceInEditor} = Replace  ·  ${uppercaseText} = UPPER  ·  ${lowercaseText} = lower`,
+    ].join("\n");
+  }
+
+  function getManualEntryHelperText(shortcuts = {}) {
+    const resolveObjects = shortcuts.resolveObjects || "Ctrl+D";
+    const findInEditor = shortcuts.findInEditor || "Ctrl+F";
+    const replaceInEditor = shortcuts.replaceInEditor || "Ctrl+H";
+    const uppercaseText = shortcuts.uppercaseText || "Ctrl+Shift+U";
+    const lowercaseText = shortcuts.lowercaseText || "Ctrl+Shift+L";
+
+    return `One object per line. Use schema.name when names are ambiguous. Shortcuts: ${resolveObjects} Resolve & Add, ${findInEditor} Find, ${replaceInEditor} Replace, ${uppercaseText} UPPER, ${lowercaseText} lower.`;
+  }
+
   return {
     normalizeFindMatchIndex,
     getNextFindMatchIndex,
     getFindCountText,
     getClearSelectionUiState,
+    getManualEntryPlaceholderText,
+    getManualEntryHelperText,
   };
 });
