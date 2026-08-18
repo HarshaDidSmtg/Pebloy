@@ -57,8 +57,14 @@ function parseSqlNetworkTarget(serverName) {
   };
 }
 
+// PowerShell 7 colors its error stream with ANSI escapes even when
+// redirected; they must never reach logs or the UI.
+function stripAnsiCodes(text) {
+  return String(text || "").replace(/\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
 function cleanPowerShellError(raw) {
-  const text = String(raw || "");
+  const text = stripAnsiCodes(raw);
   const xmlErrorParts = Array.from(text.matchAll(/<S S=\"Error\">([\s\S]*?)<\/S>/g)).map((m) => m[1]);
   const xmlText = xmlErrorParts
     .join(" ")
@@ -86,6 +92,7 @@ function runPowerShell(scriptText, maxBuffer = 1024 * 1024 * 20) {
         encoding: "utf8",
         maxBuffer,
         timeout: POWERSHELL_TIMEOUT_MS,
+        env: { ...process.env, NO_COLOR: "1", TERM: "dumb" },
       },
       (error, stdout, stderr) => {
         try {
@@ -123,6 +130,7 @@ function runPowerShellLines(
         encoding: "utf8",
         maxBuffer,
         timeout: timeoutMs,
+        env: { ...process.env, NO_COLOR: "1", TERM: "dumb" },
       },
       (error, stdout, stderr) => {
         try {
@@ -529,19 +537,41 @@ function normalizeBitFlag(value) {
   return null;
 }
 
-function stripLeadingModulePreamble(text) {
-  const normalized = String(text || "").trim();
-  if (!normalized) {
-    return "";
+const MODULE_DDL_LINE_PATTERN = /^(?:CREATE(?:\s+OR\s+ALTER)?|ALTER)\s+(?:PROCEDURE|PROC|VIEW|FUNCTION|TRIGGER)\b/i;
+const SESSION_SET_LINE_PATTERN = /^SET\s+(?:ANSI_NULLS|QUOTED_IDENTIFIER)\s+(?:ON|OFF)\s*;?\s*$/i;
+const GO_SEPARATOR_LINE_PATTERN = /^GO(?:\s+\d+)?\s*$/i;
+
+// Remove ONLY session-setting headers (SET ANSI_NULLS / SET QUOTED_IDENTIFIER
+// and their GO separators) that precede the module DDL. Authored comments
+// above CREATE are part of the module definition and MUST be preserved —
+// slicing at the DDL start used to delete developers' header banners.
+function stripLeadingSessionSetHeaders(text) {
+  const lines = String(text || "").split("\n");
+  const result = [];
+  let reachedDdl = false;
+  let blockCommentDepth = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (!reachedDdl && blockCommentDepth === 0) {
+      if (MODULE_DDL_LINE_PATTERN.test(trimmed)) {
+        reachedDdl = true;
+      } else if (SESSION_SET_LINE_PATTERN.test(trimmed) || GO_SEPARATOR_LINE_PATTERN.test(trimmed)) {
+        continue;
+      }
+    }
+
+    if (!reachedDdl) {
+      blockCommentDepth += (trimmed.match(/\/\*/g) || []).length;
+      blockCommentDepth -= (trimmed.match(/\*\//g) || []).length;
+      if (blockCommentDepth < 0) blockCommentDepth = 0;
+    }
+
+    result.push(line);
   }
 
-  const match = MODULE_DDL_START_PATTERN.exec(normalized);
-  if (!match) {
-    return normalized;
-  }
-
-  const startIndex = match.index + match[0].length - match[2].length;
-  return normalized.slice(startIndex).trim();
+  return result.join("\n").trim();
 }
 
 function composeModuleDefinition(definition, usesAnsiNulls, usesQuotedIdentifier) {
@@ -550,13 +580,11 @@ function composeModuleDefinition(definition, usesAnsiNulls, usesQuotedIdentifier
     return "";
   }
 
-  return stripLeadingModulePreamble(
-    body
-    .replace(
-      /^\s*SET\s+ANSI_NULLS\s+(?:ON|OFF)\s*;?\s*\r?\nGO\s*\r?\nSET\s+QUOTED_IDENTIFIER\s+(?:ON|OFF)\s*;?\s*\r?\nGO\s*\r?\n?/i,
-      ""
-    )
-    .trim()
+  // Downgrade deploy-only CREATE OR ALTER to canonical CREATE at the DDL
+  // line itself so leading comments do not defeat the anchor.
+  return stripLeadingSessionSetHeaders(body).replace(
+    /(^|\n)([ \t]*)CREATE\s+OR\s+ALTER\s+(PROCEDURE|PROC|VIEW|FUNCTION|TRIGGER)\b/i,
+    "$1$2CREATE $3"
   );
 }
 
@@ -1261,6 +1289,263 @@ ORDER BY io.inputRow;
   return await runSmoQuery(profile, query);
 }
 
+function normalizeSqlDateWindow(dateWindow) {
+  if (!dateWindow || typeof dateWindow !== "object") return null;
+  const start = new Date(dateWindow.start);
+  const end = new Date(dateWindow.end);
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) return null;
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+function buildObjectDependenciesQuery(objects = [], options = {}) {
+  const candidates = (Array.isArray(objects) ? objects : [])
+    .map((item) => ({
+      schemaName: String(item.schemaName || "").trim(),
+      objectName: String(item.objectName || "").trim(),
+    }))
+    .filter((item) => item.objectName);
+
+  if (!candidates.length) return "";
+
+  const inputCte = candidates
+    .map(
+      (o, index) =>
+        `SELECT ${index + 1} AS inputRow, ${escapeSqlLiteral(o.schemaName)} AS schemaName, ${escapeSqlLiteral(o.objectName)} AS objectName`
+    )
+    .join("\nUNION ALL\n");
+
+  const dateWindow = normalizeSqlDateWindow(options.dateWindow);
+  const sqlDateWindow = dateWindow
+    ? { start: dateWindow.start.replace(/Z$/i, ""), end: dateWindow.end.replace(/Z$/i, "") }
+    : null;
+  const dependencyDateFilter = sqlDateWindow
+    ? `\n    AND oc.modifiedDate IS NOT NULL\n    AND oc.modifiedDate >= CONVERT(datetime2, ${escapeSqlLiteral(sqlDateWindow.start)}, 126)\n    AND oc.modifiedDate <= CONVERT(datetime2, ${escapeSqlLiteral(sqlDateWindow.end)}, 126)`
+    : "";
+
+  return `
+WITH InputObjects AS (
+${inputCte}
+),
+ObjectCatalog AS (
+  SELECT N'TABLE' AS objectType, s.name AS schemaName, t.name AS objectName, N'OBJECT:' + CONVERT(nvarchar(30), t.object_id) AS catalogKey, t.create_date AS createdDate, t.modify_date AS modifiedDate
+  FROM sys.tables t
+  INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+  UNION ALL
+  SELECT CASE o.type WHEN 'V' THEN N'VIEW'
+                     WHEN 'P' THEN N'PROCEDURE'
+                     WHEN 'FN' THEN N'FUNCTION'
+                     WHEN 'TF' THEN N'FUNCTION'
+                     WHEN 'IF' THEN N'FUNCTION'
+                     WHEN 'TR' THEN N'TRIGGER' END,
+         s.name,
+         o.name,
+         N'OBJECT:' + CONVERT(nvarchar(30), o.object_id),
+         o.create_date,
+         o.modify_date
+  FROM sys.objects o
+  INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
+  WHERE o.type IN ('V','P','FN','TF','IF','TR')
+  UNION ALL
+  SELECT N'SYNONYM', s.name, sn.name, N'OBJECT:' + CONVERT(nvarchar(30), sn.object_id), sn.create_date, sn.modify_date
+  FROM sys.synonyms sn
+  INNER JOIN sys.schemas s ON s.schema_id = sn.schema_id
+  UNION ALL
+  SELECT N'SEQUENCE', s.name, sq.name, N'OBJECT:' + CONVERT(nvarchar(30), sq.object_id), sq.create_date, sq.modify_date
+  FROM sys.sequences sq
+  INNER JOIN sys.schemas s ON s.schema_id = sq.schema_id
+  UNION ALL
+  SELECT N'USER_DEFINED_TYPE', s.name, ty.name, N'TYPE:' + CONVERT(nvarchar(30), ty.user_type_id), NULL, NULL
+  FROM sys.types ty
+  INNER JOIN sys.schemas s ON s.schema_id = ty.schema_id
+  WHERE ty.is_user_defined = 1
+),
+RootObjects AS (
+  SELECT DISTINCT oc.catalogKey, oc.objectType, oc.schemaName, oc.objectName, oc.createdDate, oc.modifiedDate
+  FROM InputObjects io
+  INNER JOIN ObjectCatalog oc
+    ON LOWER(oc.objectName) = LOWER(io.objectName)
+   AND (
+      NULLIF(LTRIM(RTRIM(io.schemaName)), '') IS NULL
+      OR LOWER(oc.schemaName) = LOWER(io.schemaName)
+   )
+),
+DependencyEdges AS (
+  SELECT
+    N'OBJECT:' + CONVERT(nvarchar(30), sed.referencing_id) AS sourceKey,
+    CASE WHEN sed.referenced_class = 6
+         THEN N'TYPE:' + CONVERT(nvarchar(30), sed.referenced_id)
+         ELSE N'OBJECT:' + CONVERT(nvarchar(30), sed.referenced_id)
+    END AS dependencyKey
+  FROM sys.sql_expression_dependencies sed
+  WHERE sed.referenced_id IS NOT NULL
+    AND sed.referenced_class IN (1, 6)
+  UNION
+  SELECT N'OBJECT:' + CONVERT(nvarchar(30), fk.parent_object_id), N'OBJECT:' + CONVERT(nvarchar(30), fk.referenced_object_id)
+  FROM sys.foreign_keys fk
+  UNION
+  SELECT N'OBJECT:' + CONVERT(nvarchar(30), c.object_id), N'TYPE:' + CONVERT(nvarchar(30), c.user_type_id)
+  FROM sys.columns c
+  INNER JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+  WHERE ty.is_user_defined = 1
+  UNION
+  SELECT N'OBJECT:' + CONVERT(nvarchar(30), sn.object_id), N'OBJECT:' + CONVERT(nvarchar(30), OBJECT_ID(sn.base_object_name))
+  FROM sys.synonyms sn
+  WHERE OBJECT_ID(sn.base_object_name) IS NOT NULL
+)
+SELECT objectType, schemaName, objectName, createdDate, modifiedDate, parentObjectType, parentSchemaName, parentObjectName
+FROM (
+  SELECT DISTINCT
+    oc.objectType,
+    oc.schemaName,
+    oc.objectName,
+    oc.createdDate,
+    oc.modifiedDate,
+    root.objectType AS parentObjectType,
+    root.schemaName AS parentSchemaName,
+    root.objectName AS parentObjectName,
+    CASE oc.objectType
+      WHEN 'USER_DEFINED_TYPE' THEN 1
+      WHEN 'SEQUENCE' THEN 2
+      WHEN 'TABLE' THEN 3
+      WHEN 'VIEW' THEN 4
+      WHEN 'FUNCTION' THEN 5
+      WHEN 'PROCEDURE' THEN 6
+      WHEN 'SYNONYM' THEN 7
+      WHEN 'TRIGGER' THEN 8
+      ELSE 9
+    END AS sortOrder
+  FROM RootObjects root
+  INNER JOIN DependencyEdges edge ON edge.sourceKey = root.catalogKey
+  INNER JOIN ObjectCatalog oc ON oc.catalogKey = edge.dependencyKey
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM RootObjects existingRoot
+    WHERE existingRoot.catalogKey = oc.catalogKey
+  )${dependencyDateFilter}
+) DependencyResults
+ORDER BY sortOrder, schemaName, objectName
+`;
+}
+
+async function fetchObjectDependencies(profile, objects = [], options = {}) {
+  const query = buildObjectDependenciesQuery(objects, options);
+  if (!query) return [];
+
+  const authType = normalizeAuthenticationType(profile.authenticationType);
+  if (authType !== "Windows" && authType !== "Sql") {
+    throw new Error("Unsupported authentication type.");
+  }
+
+  return await runSmoQuery(profile, query);
+}
+
+async function fetchObjectDependencyEdges(profile, objects = []) {
+  const candidates = (Array.isArray(objects) ? objects : [])
+    .map((item) => ({
+      schemaName: String(item.schemaName || "").trim(),
+      objectName: String(item.objectName || "").trim(),
+    }))
+    .filter((item) => item.objectName);
+
+  if (!candidates.length) return [];
+
+  const inputCte = candidates
+    .map(
+      (o, index) =>
+        `SELECT ${index + 1} AS inputRow, ${escapeSqlLiteral(o.schemaName)} AS schemaName, ${escapeSqlLiteral(o.objectName)} AS objectName`
+    )
+    .join("\nUNION ALL\n");
+
+  const query = `
+WITH InputObjects AS (
+${inputCte}
+),
+ObjectCatalog AS (
+  SELECT N'TABLE' AS objectType, s.name AS schemaName, t.name AS objectName, N'OBJECT:' + CONVERT(nvarchar(30), t.object_id) AS catalogKey
+  FROM sys.tables t
+  INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+  UNION ALL
+  SELECT CASE o.type WHEN 'V' THEN N'VIEW'
+                     WHEN 'P' THEN N'PROCEDURE'
+                     WHEN 'FN' THEN N'FUNCTION'
+                     WHEN 'TF' THEN N'FUNCTION'
+                     WHEN 'IF' THEN N'FUNCTION'
+                     WHEN 'TR' THEN N'TRIGGER' END,
+         s.name,
+         o.name,
+         N'OBJECT:' + CONVERT(nvarchar(30), o.object_id)
+  FROM sys.objects o
+  INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
+  WHERE o.type IN ('V','P','FN','TF','IF','TR')
+  UNION ALL
+  SELECT N'SYNONYM', s.name, sn.name, N'OBJECT:' + CONVERT(nvarchar(30), sn.object_id)
+  FROM sys.synonyms sn
+  INNER JOIN sys.schemas s ON s.schema_id = sn.schema_id
+  UNION ALL
+  SELECT N'SEQUENCE', s.name, sq.name, N'OBJECT:' + CONVERT(nvarchar(30), sq.object_id)
+  FROM sys.sequences sq
+  INNER JOIN sys.schemas s ON s.schema_id = sq.schema_id
+  UNION ALL
+  SELECT N'USER_DEFINED_TYPE', s.name, ty.name, N'TYPE:' + CONVERT(nvarchar(30), ty.user_type_id)
+  FROM sys.types ty
+  INNER JOIN sys.schemas s ON s.schema_id = ty.schema_id
+  WHERE ty.is_user_defined = 1
+),
+SelectedObjects AS (
+  SELECT DISTINCT oc.catalogKey, oc.objectType, oc.schemaName, oc.objectName
+  FROM InputObjects io
+  INNER JOIN ObjectCatalog oc
+    ON LOWER(oc.objectName) = LOWER(io.objectName)
+   AND (
+      NULLIF(LTRIM(RTRIM(io.schemaName)), '') IS NULL
+      OR LOWER(oc.schemaName) = LOWER(io.schemaName)
+   )
+),
+DependencyEdges AS (
+  SELECT
+    N'OBJECT:' + CONVERT(nvarchar(30), sed.referencing_id) AS sourceKey,
+    CASE WHEN sed.referenced_class = 6
+         THEN N'TYPE:' + CONVERT(nvarchar(30), sed.referenced_id)
+         ELSE N'OBJECT:' + CONVERT(nvarchar(30), sed.referenced_id)
+    END AS dependencyKey
+  FROM sys.sql_expression_dependencies sed
+  WHERE sed.referenced_id IS NOT NULL
+    AND sed.referenced_class IN (1, 6)
+  UNION
+  SELECT N'OBJECT:' + CONVERT(nvarchar(30), fk.parent_object_id), N'OBJECT:' + CONVERT(nvarchar(30), fk.referenced_object_id)
+  FROM sys.foreign_keys fk
+  UNION
+  SELECT N'OBJECT:' + CONVERT(nvarchar(30), c.object_id), N'TYPE:' + CONVERT(nvarchar(30), c.user_type_id)
+  FROM sys.columns c
+  INNER JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+  WHERE ty.is_user_defined = 1
+  UNION
+  SELECT N'OBJECT:' + CONVERT(nvarchar(30), sn.object_id), N'OBJECT:' + CONVERT(nvarchar(30), OBJECT_ID(sn.base_object_name))
+  FROM sys.synonyms sn
+  WHERE OBJECT_ID(sn.base_object_name) IS NOT NULL
+)
+SELECT DISTINCT
+  src.objectType AS objectType,
+  src.schemaName AS schemaName,
+  src.objectName AS objectName,
+  dep.objectType AS dependencyObjectType,
+  dep.schemaName AS dependencySchemaName,
+  dep.objectName AS dependencyObjectName
+FROM SelectedObjects src
+INNER JOIN DependencyEdges edge ON edge.sourceKey = src.catalogKey
+INNER JOIN SelectedObjects dep ON dep.catalogKey = edge.dependencyKey
+WHERE src.catalogKey <> dep.catalogKey
+ORDER BY src.schemaName, src.objectName, dep.schemaName, dep.objectName;
+`;
+
+  const authType = normalizeAuthenticationType(profile.authenticationType);
+  if (authType !== "Windows" && authType !== "Sql") {
+    throw new Error("Unsupported authentication type.");
+  }
+
+  return await runSmoQuery(profile, query);
+}
+
 module.exports = {
   testConnection,
   runConnectionDiagnostics,
@@ -1272,4 +1557,7 @@ module.exports = {
   getTableCreateScript,
   normalizeBitFlag,
   resolveObjectTypes,
+  fetchObjectDependencies,
+  buildObjectDependenciesQuery,
+  fetchObjectDependencyEdges,
 };

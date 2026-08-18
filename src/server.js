@@ -10,12 +10,12 @@ const {
   deleteProfile,
   getProfile,
 } = require("./services/profileService");
-const { testConnection, runConnectionDiagnostics, discoverObjects, resolveObjectTypes } = require("./services/sqlService");
+const { testConnection, runConnectionDiagnostics, discoverObjects, resolveObjectTypes, fetchObjectDependencies, buildObjectDependenciesQuery } = require("./services/sqlService");
 
 const { pickFile, pickFolder, openPath } = require("./services/systemService");
 const { compareObjects, exportReport } = require("./services/diffService");
 const { runBackup } = require("./services/backupService");
-const { runDeployment, buildDeploymentPlan } = require("./services/deploymentService");
+const { runDeployment, buildDeploymentPlan, buildDerivedDeploymentPlan } = require("./services/deploymentService");
 const {
   createTaskLog,
   appendTaskEvent,
@@ -29,12 +29,15 @@ const { getSettings, saveSettings } = require("./services/settingsService");
 const { getAppState, saveAppState } = require("./services/appStateService");
 const { performFactoryReset } = require("./services/factoryResetService");
 const { buildClientError } = require("./services/errorService");
+const { LOOPBACK_HOST, isLoopbackRequest } = require("./services/formatterAccessService");
 
+
+const { formatInteractiveSql, getFormatterCapabilities } = require("./services/formatterService");
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
-app.use(express.static(path.resolve(__dirname, "..", "public")));
+app.use(express.json({ limit: "20mb" }));
 app.use("/vendor/monaco", express.static(path.resolve(__dirname, "..", "node_modules", "monaco-editor", "min")));
+app.use(express.static(path.resolve(__dirname, "..", "public")));
 
 app.get("/api/dashboard", (req, res) => {
   try {
@@ -129,6 +132,15 @@ function httpError(res, error, status = 400) {
   res.status(clientError.status).json(clientError);
 }
 
+function ensureLoopbackFormatterRequest(req, res) {
+  if (isLoopbackRequest(req)) {
+    return true;
+  }
+
+  httpError(res, new Error("Pebloy formatter endpoints are local-only and accept loopback requests only."), 403);
+  return false;
+}
+
 
 // Helper to get profile with secret or throw
 function requireProfile(id) {
@@ -157,7 +169,7 @@ function writeServerInfo(port) {
       {
         app: "Pebloy",
         port,
-        url: `http://localhost:${port}`,
+        url: `http://${LOOPBACK_HOST}:${port}`,
         pid: process.pid,
         startedAt: new Date().toISOString(),
       },
@@ -178,7 +190,7 @@ function listenOnAvailablePort(appInstance, desiredPort) {
       }
 
       attempts += 1;
-      const server = appInstance.listen(portToTry);
+  const server = appInstance.listen(portToTry, LOOPBACK_HOST);
 
       server.once("listening", () => resolve({ server, port: portToTry }));
       server.once("error", (error) => {
@@ -296,6 +308,32 @@ app.post("/api/objects/resolve-types", async (req, res) => {
   }
 });
 
+app.post("/api/objects/dependencies", async (req, res) => {
+  try {
+    const profile = requireProfile(req.body.profileId);
+    const objects = req.body.objects || [];
+    const dependencies = await fetchObjectDependencies(profile, objects, {
+      dateWindow: req.body.dateWindow || null,
+    });
+    res.json({ requestedCount: objects.length, dependencies });
+  } catch (error) {
+    httpError(res, error);
+  }
+});
+
+app.post("/api/objects/dependencies/query", async (req, res) => {
+  try {
+    requireProfile(req.body.profileId);
+    const objects = req.body.objects || [];
+    const query = buildObjectDependenciesQuery(objects, {
+      dateWindow: req.body.dateWindow || null,
+    });
+    res.json({ requestedCount: objects.length, query });
+  } catch (error) {
+    httpError(res, error);
+  }
+});
+
 app.post("/api/diff/compare", async (req, res) => {
   let task;
   try {
@@ -315,6 +353,7 @@ app.post("/api/diff/compare", async (req, res) => {
     appendTaskEvent(task, "INFO", "Diff task started");
     const report = await compareObjects(sourceProfile, destinationProfile, req.body.selectedObjects || [], {
       taskId: task.taskId,
+      engine: req.body.engine,
       onProgress: (data) => broadcastEvent("taskProgress", { taskId: task.taskId, ...data }),
     });
     appendTaskEvent(task, "INFO", "Diff task completed", report.summary);
@@ -349,9 +388,12 @@ app.post("/api/diff/export", (req, res) => {
   }
 });
 
-app.post("/api/deploy/plan", (req, res) => {
+app.post("/api/deploy/plan", async (req, res) => {
   try {
-    const plan = buildDeploymentPlan(req.body.selectedObjects || []);
+    const sourceProfile = req.body.sourceProfileId ? requireProfile(req.body.sourceProfileId) : null;
+    const plan = sourceProfile
+      ? await buildDerivedDeploymentPlan(sourceProfile, req.body.selectedObjects || [])
+      : buildDeploymentPlan(req.body.selectedObjects || [], { engine: req.body.engine });
     res.json({ plan });
   } catch (error) {
     httpError(res, error);
@@ -462,7 +504,7 @@ app.post("/api/deploy/run", async (req, res) => {
       selectedObjects: req.body.selectedObjects || [],
       mode: req.body.mode || "ExecuteDirectly",
       continueOnError: Boolean(req.body.continueOnError),
-      options: req.body.options || {},
+      options: { ...(req.body.options || {}), engine: req.body.engine },
       task,
       logEvent: (level, message, details) => appendTaskEvent(task, level, message, details),
       broadcastProgress: (event, data) => broadcastEvent(event, data),
@@ -490,6 +532,10 @@ app.post("/api/deploy/run", async (req, res) => {
       generatedRoot: result.generatedRoot || null,
       buildPathFile: result.buildPathFile || null,
       rollbackApplied: Boolean(result.rollbackApplied),
+      generationWarnings: result.generationWarnings || [],
+      dacfxValidation: result.dacfxValidation || { enabled: false },
+      engine: result.engine || req.body.engine || null,
+      deployScriptPath: result.deployScriptPath || null,
       summary,
       logFilePath: task.textPath,
     });
@@ -546,6 +592,51 @@ app.post("/api/logs/:taskId/open", async (req, res) => {
   } catch (error) {
     httpError(res, error);
   }
+});
+
+app.post("/api/format", async (req, res) => {
+  if (!ensureLoopbackFormatterRequest(req, res)) {
+    return;
+  }
+
+  try {
+    const sql = String(req.body?.sql ?? "");
+    const startedAt = Date.now();
+    const result = await formatInteractiveSql(sql, {
+      dialect: req.body?.dialect,
+      mode: req.body?.mode,
+      options: req.body?.options,
+    });
+    res.json({
+      formatted: result.formatted,
+      dialect: result.dialect,
+      normalization: result.normalization,
+      options: result.options,
+      durationMs: Date.now() - startedAt,
+    });
+  } catch (error) {
+    httpError(res, error);
+  }
+});
+
+app.get("/api/format/capabilities", (req, res) => {
+  if (!ensureLoopbackFormatterRequest(req, res)) {
+    return;
+  }
+
+  res.json(getFormatterCapabilities());
+});
+
+app.post("/api/formatter/save", (req, res) => {
+  if (!ensureLoopbackFormatterRequest(req, res)) {
+    return;
+  }
+
+  httpError(
+    res,
+    new Error("Formatter Save only overwrites the .sql or .txt file opened or created in the current Pebloy desktop session. Use Save As for any new path."),
+    409
+  );
 });
 
 app.get("/api/settings", (req, res) => {
@@ -636,7 +727,7 @@ listenOnAvailablePort(app, desiredPort)
   .then(({ port }) => {
     writeServerInfo(port);
     const fallbackMessage = port === desiredPort ? "" : ` (requested ${desiredPort}; selected next available port)`;
-    console.log(`Pebloy listening on http://localhost:${port}${fallbackMessage}`);
+    console.log(`Pebloy listening on http://${LOOPBACK_HOST}:${port}${fallbackMessage}`);
     ensureSqlServerModule()
       .then(() => console.log("SqlServer PowerShell module ready."))
       .catch((err) => console.warn(`SqlServer module setup: ${err.message}`));

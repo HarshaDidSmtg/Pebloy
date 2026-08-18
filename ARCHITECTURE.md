@@ -12,7 +12,7 @@ Pebloy is a local web app for SQL object lifecycle workflows:
 
 | Layer | Technology |
 | ----- | ---------- |
-| Frontend | Vanilla HTML/CSS/JS in `public/`, with Monaco powering the enhanced multiline object-entry editor |
+| Frontend | Vanilla HTML/CSS/JS in `public/` |
 | Backend | Node.js + Express in `src/server.js` |
 | Desktop shell | Electron (optional) |
 | DB scripting | PowerShell + SQL Server SMO |
@@ -28,9 +28,10 @@ Pebloy is a local web app for SQL object lifecycle workflows:
 | `src/services/backupService.js` | Backup orchestration and backup-stage progress updates. |
 | `src/services/deploymentService.js` | Deploy orchestration, deduplicated execution planning, table delta routing, and per-object result aggregation. |
 | `src/services/sqlService.js` | SQL execution plus DB metadata discovery and true object type resolution via PowerShell ADO.NET. |
-| `src/services/errorService.js` | Maps backend failures into user-facing errors with resolution steps. |
-| `src/services/paths.js` | Centralized artifact/export path roots shared by backup, diff, deploy, and related services. |
 | `src/services/profileService.js` | Connection profile CRUD. |
+| `src/services/formatterService.js` | Shared generated-SQL formatter entry points plus the interactive formatter route backed by a local worker thread. |
+| `src/services/formatterOptions.js` | Interactive-only formatter option normalization and capability metadata exposed to the UI. |
+| `src/services/tsqlFormatterProvider.js` | Offline T-SQL formatting provider that preserves GO batches, comments, BOM, EOL style, and trailing newline. |
 | `src/services/appStateService.js` | File-backed UI/app-state persistence in `data/app-state.json` for preferences and working inputs. |
 | `src/services/settingsService.js` | File-backed script-generation folder naming and deployment-order persistence in `data/settings.json`. |
 | `src/services/factoryResetService.js` | Clears runtime data, artifacts, and saved preferences for a clean shareable workspace state. |
@@ -45,6 +46,7 @@ Pebloy is a local web app for SQL object lifecycle workflows:
 - Profiles are managed in the Connections tab and persisted in `data/profiles.json`.
 - Encrypted secrets are stored separately in `data/secrets.json` (DPAPI-protected).
 - UI preferences and working tab inputs are persisted in `data/app-state.json`.
+- Interactive formatter options and editor toggles are also persisted in `data/app-state.json`, but they stay separate from `settings.formatting.formatGeneratedSql`.
 - Script-generation customization is persisted in `data/settings.json`.
 - A shared object list drives Diff, Backup, and Deploy tabs.
 - Object list items are normalized to `{ objectType, schemaName, objectName }`.
@@ -99,13 +101,27 @@ Flow:
 6. Selected objects are deduplicated before execution, then execute individually in configured order through a reused target connection, retaining exact failure attribution; tables execute through their delta batch.
 7. Per-object results are aggregated and logged.
 
+### 5.4 Formatter
+
+Purpose: Format local SQL text only. It never reads a database, modifies a database, or affects generated SQL used by Backup, Code Diff, or Deploy.
+
+Flow:
+
+1. UI loads Monaco locally from the packaged `monaco-editor` dependency.
+2. UI fetches `/api/format/capabilities` to render the interactive formatter options panel.
+3. UI posts SQL text plus interactive-only options to `/api/format`.
+4. `formatterService` normalizes the interactive request and routes execution through `formatterWorker.js`.
+5. `tsqlFormatterProvider` formats each GO-delimited batch independently, preserving comments, BOM, EOL style, trailing newline, and string literal content.
+6. If a batch cannot be parsed safely, the original batch text is returned unchanged.
+7. UI can show the result either in a single Monaco editor or a Monaco diff view with the pre-format snapshot.
+
 ## 6. Object Discovery
 
 Two modes for building the object list:
 
-**Discover mode:** Browses live objects from the selected source database with type/schema filters. Results paginate at 50 items per page. A header checkbox selects or clears the visible page and supports an indeterminate state.
+**Discover mode:** Browses live objects from the selected source database with type/schema filters. A header checkbox selects or clears the visible result set and supports an indeterminate state.
 
-**Specify mode:** User pastes `schema.name` or an unqualified object name into a Monaco-backed multiline editor and clicks "Resolve & Add Objects". `sqlService` queries DB metadata to detect the true object type at runtime — never hardcoded. Unqualified names are accepted only when they resolve to a single object.
+**Specify mode:** User pastes `schema.name` or an unqualified object name and clicks "Detect & Add Objects". `sqlService` queries DB metadata to detect the true object type at runtime — never hardcoded. Unqualified names are accepted only when they resolve to a single object.
 
 Both modes produce normalized `{ objectType, schemaName, objectName }` entries.
 
@@ -126,43 +142,32 @@ Both modes produce normalized `{ objectType, schemaName, objectName }` entries.
 
 ## 8. API Endpoint Reference
 
-| Method | Path | Purpose |
+| Method | Path | Handler |
 | ------ | ---- | ------- |
-| GET | `/api/dashboard` | Dashboard-style summary data for profiles and recent tasks |
-| GET | `/api/objects/types` | Unique object types for discover filters |
-| GET | `/api/objects/filters` | Combined type + schema filter data |
-| GET | `/api/objects/schemas` | Unique schemas for discover filters |
-| GET | `/api/events` | Server-sent events stream for task start/progress/end updates |
-| GET / POST | `/api/profiles` | List or create connection profiles |
-| PUT / DELETE | `/api/profiles/:id` | Update or delete a profile |
+| GET | `/api/health` | Health check |
+| GET/POST | `/api/profiles` | List / create connection profiles |
+| GET/PUT/DELETE | `/api/profiles/:id` | Read / update / delete a profile |
 | POST | `/api/profiles/:id/test` | Test connection |
 | POST | `/api/profiles/:id/diagnostics` | TCP + SQL login path diagnostics |
-| GET | `/api/objects` | Discover live DB objects with type/schema/search filters |
+| GET | `/api/objects/discover` | Discover live DB objects (type/schema filters) |
 | POST | `/api/objects/resolve-types` | Resolve true object types for a pasted object list |
-| POST | `/api/diff/compare` | Run code diff using fresh generated scripts |
-| POST | `/api/diff/export` | Export the current diff as Markdown or HTML |
-| POST | `/api/deploy/plan` | Preview ordered deployment actions for the selected objects |
-| GET | `/api/profiles/export` | Export saved connection profiles |
-| POST | `/api/profiles/import` | Import connection profiles |
+| POST | `/api/diff/compare` | Run code diff (generates fresh scripts, returns diff) |
 | POST | `/api/backup/run` | Run backup (script generation only) |
 | POST | `/api/deploy/run` | Run deployment (execute or rollback) |
-| GET / DELETE | `/api/logs` | List or clear task logs |
+| GET | `/api/logs` | List task log files |
 | GET | `/api/tasks/:taskId` | Read a specific task log |
 | POST | `/api/logs/:taskId/open` | Open the preferred local task log file |
-| GET / PUT | `/api/settings` | Read or update script-generation / deployment-order settings |
-| GET / PUT | `/api/app-state` | Read or update persistent UI/app state |
+| DELETE | `/api/logs` | Delete all log files |
+| GET | `/api/format/capabilities` | Read interactive formatter capability metadata |
+| POST | `/api/format` | Format local SQL text with interactive-only options |
+| GET | `/api/app-state` | Read persistent app state |
+| PUT | `/api/app-state` | Write persistent app state |
 | POST | `/api/factory-reset` | Clear all saved data, logs, and artifacts |
 | POST | `/api/system/pick-folder` | Open native folder picker dialog |
 | POST | `/api/system/pick-file` | Open native file picker dialog |
-| GET | `/api/data-export` | Export profiles, settings, and app state as one payload |
-| POST | `/api/data-import` | Restore profiles, settings, and app state from one payload |
-| GET | `/api/status` | Lightweight runtime status (app, version, running tasks, port) |
-
-## 9. Frontend Editor Experience
-
-- Manual Object Entry uses Monaco served from `/vendor/monaco` and wired through `public/manualEntryEditor.js`.
-- The enhanced editor syncs back to the hidden `sharedObjectText` textarea so persistence, file import, Resolve & Add, and existing shortcuts continue to work.
-- Other text inputs remain native controls; only true multiline editor surfaces opt into the Monaco adapter.
+| POST | `/api/formatter/save` | Overwrite the currently opened local `.sql` / `.txt` file |
+| GET | `/api/settings` | Read script-generation / deployment-order settings |
+| PUT | `/api/settings` | Write script-generation / deployment-order settings |
 
 ## 10. System Dialogs
 
@@ -177,6 +182,7 @@ Runtime behavior:
 - Backend endpoints remain available as fallback dialog paths.
 - Folder pickers support optional dialog descriptions and initial paths.
 - File pickers are used for object-list import and similar file-selection flows.
+- The formatter save-as path also uses Electron IPC so `.sql` and `.txt` files stay local.
 
 ## 11. Logging and Artifacts
 
@@ -192,9 +198,9 @@ Script and report outputs:
 - `artifacts/scripts/` — timestamped SQL script artifacts saved before execution
 - `artifacts/reports/` — diff exports (md/html/json)
 
-## 12. Monitoring, Status, and Events
+## 12. Monitoring and Health
 
-The backend exposes lightweight runtime status at `/api/status` and task progress over `/api/events`.
+The backend exposes a health check at `/api/health`.
 
 For process monitoring with PM2:
 
@@ -237,7 +243,7 @@ flowchart TD
 ## 14. Operational Notes
 
 - For SQL authentication profiles, username/password must be valid and stored in the profile secret store.
-- Deploy mode `ExecuteDirectly` (`Apply Changes` in the UI) is the default and commits changes to the destination DB.
-- Deploy mode `Rollback` (`Validate Only (Rollback)` in the UI) executes scripts inside a transaction that is always rolled back.
+- Deploy mode `GenerateScriptOnly` does not execute any SQL against the destination DB.
+- Deploy mode default is `Execute Directly`.
 - If source and destination are the same DB, deployment is blocked unless explicitly overridden.
 - Prefer SQL Server hostname over raw IP for Windows authentication — DNS resolution is more reliable.

@@ -120,11 +120,103 @@ function Get-QualifiedSqlName {
     return "$(Quote-SqlIdentifier $SchemaName).$(Quote-SqlIdentifier $ObjectName)"
 }
 
+function Format-AliasUserDefinedTypeBaseType {
+    param(
+        [Parameter(Mandatory)][string]$BaseTypeName,
+        [Parameter(Mandatory)][int]$MaxLength,
+        [Parameter(Mandatory)][int]$NumericPrecision,
+        [Parameter(Mandatory)][int]$NumericScale
+    )
+
+    $typeName = [string]$BaseTypeName
+    switch -Regex ($typeName.ToLowerInvariant()) {
+        '^(nchar|nvarchar)$' {
+            if ($MaxLength -lt 0) { return "$typeName(MAX)" }
+            return "$typeName($([int]($MaxLength / 2)))"
+        }
+        '^(char|varchar|binary|varbinary)$' {
+            if ($MaxLength -lt 0) { return "$typeName(MAX)" }
+            return "$typeName($MaxLength)"
+        }
+        '^(decimal|numeric)$' {
+            return "$typeName($NumericPrecision,$NumericScale)"
+        }
+        '^(datetime2|datetimeoffset|time)$' {
+            return "$typeName($NumericScale)"
+        }
+        default {
+            return $typeName
+        }
+    }
+}
+
+function Get-AliasUserDefinedTypeScript {
+    param(
+        [Parameter(Mandatory)]$Database,
+        [Parameter(Mandatory)][string]$SchemaName,
+        [Parameter(Mandatory)][string]$ObjectName
+    )
+
+    $escapedSchema = $SchemaName.Replace("'", "''")
+    $escapedName = $ObjectName.Replace("'", "''")
+    $query = @"
+SELECT TOP 1
+    ty.name AS TypeName,
+    s.name AS SchemaName,
+    bt.name AS BaseTypeName,
+    ty.max_length AS MaxLength,
+    ty.precision AS NumericPrecision,
+    ty.scale AS NumericScale,
+    ty.is_nullable AS IsNullable
+FROM sys.types ty WITH (NOLOCK)
+INNER JOIN sys.schemas s ON s.schema_id = ty.schema_id
+INNER JOIN sys.types bt ON bt.user_type_id = ty.system_type_id AND bt.user_type_id = bt.system_type_id
+WHERE ty.is_user_defined = 1
+  AND ty.is_table_type = 0
+  AND ty.is_assembly_type = 0
+  AND s.name = N'$escapedSchema'
+  AND ty.name = N'$escapedName';
+"@
+
+    $row = $Database.ExecuteWithResults($query).Tables[0].Rows | Select-Object -First 1
+    if (!$row) {
+        return ""
+    }
+
+    $baseType = Format-AliasUserDefinedTypeBaseType -BaseTypeName ([string]$row.BaseTypeName) -MaxLength ([int]$row.MaxLength) -NumericPrecision ([int]$row.NumericPrecision) -NumericScale ([int]$row.NumericScale)
+    $nullability = if ([bool]$row.IsNullable) { 'NULL' } else { 'NOT NULL' }
+    return "CREATE TYPE $(Get-QualifiedSqlName -SchemaName ([string]$row.SchemaName) -ObjectName ([string]$row.TypeName)) FROM $baseType $nullability;"
+}
+
+function Get-OptionalSmoObject {
+    param(
+        [Parameter(Mandatory)]$Database,
+        [Parameter(Mandatory)][string]$CollectionName,
+        [Parameter(Mandatory)][string]$ObjectName,
+        [Parameter(Mandatory)][string]$SchemaName
+    )
+
+    $collectionProperty = $Database.PSObject.Properties[$CollectionName]
+    if ($null -eq $collectionProperty -or $null -eq $collectionProperty.Value) {
+        return $null
+    }
+
+    try {
+        return $collectionProperty.Value[$ObjectName, $SchemaName]
+    }
+    catch {
+        return $null
+    }
+}
+
 function Write-ContentAtomically($path, $content) {
     $dir = Split-Path $path
     Ensure-Directory $dir
     $tmp = Join-Path $dir ([System.IO.Path]::GetRandomFileName())
-    Set-Content -Path $tmp -Value $content -Encoding utf8
+    $utf8WithBom = [System.Text.UTF8Encoding]::new($true)
+    $contentText = [string]$content
+    if (!$contentText.EndsWith("`n")) { $contentText += [Environment]::NewLine }
+    [System.IO.File]::WriteAllText($tmp, $contentText, $utf8WithBom)
     Move-Item -Path $tmp -Destination $path -Force
 }
 function Format-DdlKeywords($text) {
@@ -233,6 +325,7 @@ function New-DacpacTableScripter {
 
     Set-ScriptingOptionIfAvailable -Options $tableScripter.Options -Name "NoFileGroup" -Value $true
     Set-ScriptingOptionIfAvailable -Options $tableScripter.Options -Name "NoFileStream" -Value $true
+    Set-ScriptingOptionIfAvailable -Options $tableScripter.Options -Name "NoCollation" -Value $true
     Set-ScriptingOptionIfAvailable -Options $tableScripter.Options -Name "NoTablePartitioningSchemes" -Value $true
     Set-ScriptingOptionIfAvailable -Options $tableScripter.Options -Name "NoIndexPartitioningSchemes" -Value $true
 
@@ -344,6 +437,53 @@ function Remove-DacpacUnsupportedIndexOptions {
     return $clean.Trim()
 }
 
+function Remove-ColumnCollationsForDacpac {
+    param([Parameter(Mandatory)][string]$Sql)
+
+    # SSMS omits COLLATE on columns that use the database default collation;
+    # SSDT/DACPAC source is also cleaner without per-column collation noise.
+    # This intentionally targets normal column/type definitions and leaves any
+    # string literals alone because SQL identifiers cannot appear inside quotes
+    # in the matched segment.
+    return [regex]::Replace(
+        $Sql,
+        '(?im)(?:\[(?:n?(?:var)?char|n?text)\]|\b(?:n?(?:var)?char|n?text)\b)\s*(?:\(\s*(?:max|\d+)\s*\))?\s+COLLATE\s+(?:\[[^\]]+\]|[A-Za-z0-9_]+)',
+        {
+            param($match)
+            return ([regex]::Replace($match.Value, '\s+COLLATE\s+(?:\[[^\]]+\]|[A-Za-z0-9_]+)', '', 'IgnoreCase')).TrimEnd()
+        }
+    )
+}
+
+function Is-TableSessionSetLine {
+    param([AllowEmptyString()][string]$UpperTrimmedLine)
+
+    if ([string]::IsNullOrWhiteSpace($UpperTrimmedLine)) {
+        return $false
+    }
+
+    return $UpperTrimmedLine -match '^SET\s+(?:ANSI_NULLS|QUOTED_IDENTIFIER|ANSI_PADDING|ANSI_WARNINGS|ARITHABORT|CONCAT_NULL_YIELDS_NULL)\s+(?:ON|OFF)\s*;?$' -or
+           $UpperTrimmedLine -match '^SET\s+NUMERIC_ROUNDABORT\s+(?:ON|OFF)\s*;?$'
+}
+
+function Flush-TableStatementLines {
+    param(
+        [Parameter(Mandatory)]$StatementLines,
+        [Parameter(Mandatory)]$Statements
+    )
+
+    $rawStatement = ($StatementLines -join "`r`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($rawStatement)) {
+        return
+    }
+
+    $statement = Remove-DacpacUnsupportedIndexOptions $rawStatement
+    $statement = Remove-ColumnCollationsForDacpac $statement
+    if (![string]::IsNullOrWhiteSpace($statement) -and $statement.Trim().ToUpperInvariant() -ne "GO") {
+        $Statements.Add($statement) | Out-Null
+    }
+}
+
 function Assert-DacpacTableScriptIsClean {
     param(
         [Parameter(Mandatory)][string]$Sql,
@@ -351,6 +491,7 @@ function Assert-DacpacTableScriptIsClean {
     )
 
     $blockedPatterns = @(
+        "\bCOLLATE\b",
         "\bONLINE\s*=",
         "\bRESUMABLE\s*=",
         "\bMAX_DURATION\s*=",
@@ -376,13 +517,19 @@ function Assert-DacpacTableScriptIsClean {
 function Format-DacpacTableScript {
     param(
         [Parameter(Mandatory)]$ScriptLines,
+        [Parameter(Mandatory)][string]$ObjectType,
         [string]$ObjectName = "table"
     )
 
-    $statements = @()
+    if ($ObjectType -ne "Tables") {
+        return Convert-Script $ScriptLines
+    }
+
+    $statements = [System.Collections.Generic.List[string]]::new()
 
     foreach ($scriptLine in $ScriptLines) {
         $statementLines = @()
+        $hasCapturedDdlStatement = $false
 
         foreach ($line in ([string]$scriptLine -split "`r?`n")) {
             $trim = $line.Trim()
@@ -390,24 +537,15 @@ function Format-DacpacTableScript {
 
             if ([string]::IsNullOrWhiteSpace($trim) -and $statementLines.Count -eq 0) { continue }
             if ($upper -eq "GO") { continue }
-            if ($upper -eq "SET ANSI_NULLS ON") { continue }
-            if ($upper -eq "SET QUOTED_IDENTIFIER ON") { continue }
-            if ($upper -eq "SET ANSI_PADDING ON") { continue }
-            if ($upper -eq "SET ANSI_PADDING OFF") { continue }
+            if (Is-TableSessionSetLine $upper) {
+                continue
+            }
             if ($upper.StartsWith("USE ")) { continue }
 
             $statementLines += $line.TrimEnd()
         }
 
-        $rawStatement = ($statementLines -join "`r`n").Trim()
-        if ([string]::IsNullOrWhiteSpace($rawStatement)) {
-            continue
-        }
-
-        $statement = Remove-DacpacUnsupportedIndexOptions $rawStatement
-        if (![string]::IsNullOrWhiteSpace($statement)) {
-            $statements += $statement
-        }
+        Flush-TableStatementLines -StatementLines $statementLines -Statements $statements
     }
 
     if ($statements.Count -eq 0) {
@@ -501,8 +639,8 @@ foreach ($dbName in $Databases) {
     $allTableContent = @()
     $tableDropStatements = @()
     $buildEntries = @()
-    $shouldWriteCombinedArtifacts = $app_task_mode -eq "backup"
-    $shouldWriteCombinedTableScript = $shouldWriteCombinedArtifacts
+    $shouldWriteCombinedArtifacts = $app_task_mode -in @("backup", "deploy")
+    $shouldWriteCombinedTableScript = $app_task_mode -eq "backup"
     $allTableUpdateTemplates = @()
 
     $db = Get-DatabaseFromServer -SmoServer $smoServer -DatabaseName $dbName
@@ -544,6 +682,21 @@ FROM sys.table_types tt WITH (NOLOCK)
 JOIN sys.schemas s ON tt.schema_id = s.schema_id
 JOIN sys.objects o ON tt.type_table_object_id = o.object_id
 WHERE tt.name IN ($nameList)
+
+UNION ALL
+
+SELECT
+s.name AS SchemaName,
+ty.name AS ObjectName,
+'USER_ALIAS_TYPE' AS TypeDesc,
+NULL AS CreateDate
+FROM sys.types ty WITH (NOLOCK)
+JOIN sys.schemas s ON ty.schema_id = s.schema_id
+JOIN sys.types bt ON bt.user_type_id = ty.system_type_id AND bt.user_type_id = bt.system_type_id
+WHERE ty.is_user_defined = 1
+    AND ty.is_table_type = 0
+    AND ty.is_assembly_type = 0
+    AND ty.name IN ($nameList)
 "@
 
 
@@ -631,11 +784,13 @@ WHERE tt.name IN ($nameList)
             "SYNONYM"              { "Synonyms" }
             "SEQUENCE_OBJECT"      { "Sequences" }
             "USER_TABLE_TYPE"      { "User Defined Types" }
+            "USER_ALIAS_TYPE"      { "User Defined Types" }
             default                { "Functions" }
         }
 
         # Apply folder name override if provided; $type is used for folder creation
-        $type = if ($_folderOverrides.ContainsKey($actual.TypeDesc)) { $_folderOverrides[$actual.TypeDesc] } else { $typeKey }
+        $folderOverrideKey = if ($actual.TypeDesc -eq "USER_ALIAS_TYPE") { "USER_TABLE_TYPE" } else { $actual.TypeDesc }
+        $type = if ($_folderOverrides.ContainsKey($folderOverrideKey)) { $_folderOverrides[$folderOverrideKey] } else { $typeKey }
 
         # Get SMO object (always use canonical $typeKey for collection lookup)
         $obj = $null
@@ -645,7 +800,17 @@ WHERE tt.name IN ($nameList)
     elseif ($typeKey -eq "Tables") { $obj = $db.Tables[$resolvedObjectName, $resolvedSchema] }
     elseif ($typeKey -eq "Synonyms") { $obj = $db.Synonyms[$resolvedObjectName, $resolvedSchema] }
     elseif ($typeKey -eq "Sequences") { $obj = $db.Sequences[$resolvedObjectName, $resolvedSchema] }
-    elseif ($typeKey -eq "User Defined Types") { $obj = $db.UserDefinedTableTypes[$resolvedObjectName, $resolvedSchema] }
+    elseif ($typeKey -eq "User Defined Types") {
+        if ($actual.TypeDesc -eq "USER_ALIAS_TYPE") {
+            $obj = Get-OptionalSmoObject -Database $db -CollectionName "UserDefinedDataTypes" -ObjectName $resolvedObjectName -SchemaName $resolvedSchema
+        }
+        else {
+            $obj = $db.UserDefinedTableTypes[$resolvedObjectName, $resolvedSchema]
+            if ($null -eq $obj) {
+                $obj = Get-OptionalSmoObject -Database $db -CollectionName "UserDefinedDataTypes" -ObjectName $resolvedObjectName -SchemaName $resolvedSchema
+            }
+        }
+    }
 
         $text = ""
         if ($typeKey -in @("Stored Procedures", "Views", "Functions")) {
@@ -677,22 +842,24 @@ WHERE s.name = N'$escapedSchema'
         if ([string]::IsNullOrWhiteSpace($text) -and $obj) {
             # Fall back to SMO scripting for tables, synonyms, sequences, types, or when a module definition is unavailable.
             if ($typeKey -eq "Tables") {
-                $text = Format-DacpacTableScript -ScriptLines ($tableScripter.Script($obj)) -ObjectName "$resolvedSchema.$resolvedObjectName"
+                $text = Format-DacpacTableScript -ScriptLines ($tableScripter.Script($obj)) -ObjectType $typeKey -ObjectName "$resolvedSchema.$resolvedObjectName"
             }
             else {
                 $text = Clean-SqlScript (Convert-Script ($scripter.Script($obj)))
             }
         }
 
+        if ([string]::IsNullOrWhiteSpace($text) -and $typeKey -eq "User Defined Types") {
+            $text = Get-AliasUserDefinedTypeScript -Database $db -SchemaName $resolvedSchema -ObjectName $resolvedObjectName
+        }
+
+        if (![string]::IsNullOrWhiteSpace($text) -and $typeKey -eq "User Defined Types") {
+            $text = Remove-ColumnCollationsForDacpac $text
+        }
+
         if ([string]::IsNullOrWhiteSpace($text)) {
             Write-Warning "Scripting failed: $resolvedSchema.$resolvedObjectName"
             continue
-        }
-
-        if ($app_task_mode -eq "deploy" -and $typeKey -in @("Stored Procedures", "Views", "Functions")) {
-            $text = $text -replace "(?im)^\s*CREATE\s+(?:OR\s+ALTER\s+)?(?:PROCEDURE|PROC)\b", "CREATE OR ALTER PROCEDURE"
-            $text = $text -replace "(?im)^\s*CREATE\s+(?:OR\s+ALTER\s+)?VIEW\b", "CREATE OR ALTER VIEW"
-            $text = $text -replace "(?im)^\s*CREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\b", "CREATE OR ALTER FUNCTION"
         }
 
         # Combine SP file using the same CREATE/CREATE OR ALTER mode as the individual files.
@@ -781,7 +948,8 @@ WHERE s.name = N'$escapedSchema'
         $lines += "<Build Include=""$($e.Path)"" />"
     }
 
-    Set-Content -Path $buildFilePath -Value $lines
+    Set-Content -Path $buildFilePath -Value $lines -Encoding utf8
+    Write-Host "BuildPaths file: $buildFilePath"
 
     # Combined Stored Procedures file
 if ($shouldWriteCombinedArtifacts -and $allSPContent.Count -gt 0) {

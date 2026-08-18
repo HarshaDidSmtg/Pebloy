@@ -3,6 +3,7 @@ const path = require("path");
 const os = require("os");
 const { randomUUID } = require("crypto");
 const { ensureDir } = require("./storage");
+const { writeSqlFileSync } = require("./sqlFileEncoding");
 
 const ARTIFACT_DIR = process.env.ARTIFACTS_DIR || path.resolve(__dirname, "..", "..", "artifacts");
 const LOG_DIR = process.env.LOGS_DIR || path.join(ARTIFACT_DIR, "logs");
@@ -336,7 +337,7 @@ function writeScriptArtifact(taskId, taskType, objectType, schemaName, objectNam
     .replace(/[^a-zA-Z0-9._-]/g, "_");
 
   const filePath = path.join(SCRIPT_DIR, `${stamp}_${taskId}_${safe}.sql`);
-  fs.writeFileSync(filePath, sqlText, "utf8");
+  writeSqlFileSync(filePath, sqlText);
   return filePath;
 }
 

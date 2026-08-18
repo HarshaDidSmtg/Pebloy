@@ -1,7 +1,15 @@
 const fs = require("fs");
 const path = require("path");
-const { executeSql, executeSqlScript, executeSqlScriptsIndividually } = require("./sqlService");
+const { executeSql, executeSqlScript, executeSqlScriptsIndividually, fetchObjectDefinitionMap, fetchObjectDependencyEdges } = require("./sqlService");
 const { writeScriptArtifact } = require("./loggingService");
+const { writeSqlFileSync } = require("./sqlFileEncoding");
+const {
+  compareGeneratedArtifacts,
+  deployGeneratedArtifacts,
+  isDacFxEngine,
+  normalizeEngine,
+  validateGeneratedArtifacts,
+} = require("./dacfxService");
 const { getSettings } = require("./settingsService");
 const {
   buildProfileOutputBasePath,
@@ -18,6 +26,13 @@ function toWindowsLineEndings(text) {
 
 function normalizeLookupName(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+function normalizeDefinitionForCompare(value) {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .trim();
 }
 
 function buildTypeOrder() {
@@ -48,6 +63,12 @@ function normalizeSelection(items = []) {
       normalized.modifiedDate = modifiedDate;
     }
 
+    if (Array.isArray(x.dependencies)) {
+      normalized.dependencies = x.dependencies;
+    } else if (Array.isArray(x.dependsOn)) {
+      normalized.dependencies = x.dependsOn;
+    }
+
     return normalized;
   });
 }
@@ -56,6 +77,18 @@ function toSortableTimestamp(value) {
   if (!value) return null;
   const timestamp = Date.parse(String(value));
   return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function getDependencyNames(item) {
+  return (Array.isArray(item.dependencies) ? item.dependencies : [])
+    .map((dependency) => {
+      if (typeof dependency === "string") return normalizeLookupName(dependency);
+      if (!dependency || typeof dependency !== "object") return "";
+      const schemaName = dependency.schemaName || dependency.schema || "";
+      const objectName = dependency.objectName || dependency.name || "";
+      return normalizeLookupName(`${schemaName}.${objectName}`);
+    })
+    .filter(Boolean);
 }
 
 function dedupeSelection(items = []) {
@@ -72,7 +105,7 @@ function dedupeSelection(items = []) {
 
 function sortedByDependency(items) {
   const TYPE_ORDER = buildTypeOrder();
-  return [...items].sort((a, b) => {
+  const baseOrdered = [...items].sort((a, b) => {
     const ao = TYPE_ORDER[a.objectType] || 999;
     const bo = TYPE_ORDER[b.objectType] || 999;
     if (ao !== bo) return ao - bo;
@@ -88,6 +121,85 @@ function sortedByDependency(items) {
     if (a.schemaName !== b.schemaName) return a.schemaName.localeCompare(b.schemaName);
     return a.objectName.localeCompare(b.objectName);
   });
+
+  const indexed = baseOrdered.map((item) => ({ item, key: keyOf(item) }));
+  const byKey = new Map(indexed.map((entry) => [entry.key, entry]));
+  const byName = new Map(indexed.map((entry) => [normalizeLookupName(`${entry.item.schemaName}.${entry.item.objectName}`), entry]));
+  const visited = new Set();
+  const visiting = new Set();
+  const ordered = [];
+
+  function visit(entry) {
+    if (visited.has(entry.key)) return;
+    if (visiting.has(entry.key)) return;
+    visiting.add(entry.key);
+
+    for (const dependencyName of getDependencyNames(entry.item)) {
+      const dependency = byName.get(dependencyName) || byKey.get(dependencyName);
+      if (dependency) visit(dependency);
+    }
+
+    visiting.delete(entry.key);
+    visited.add(entry.key);
+    ordered.push(entry.item);
+  }
+
+  indexed.forEach(visit);
+  return ordered;
+}
+
+async function deriveSelectionDependencies(sourceProfile, selectedObjects, logEvent = () => {}) {
+  const unique = dedupeSelection(selectedObjects);
+  if (!sourceProfile || unique.length < 2) {
+    return unique;
+  }
+
+  try {
+    const edges = await fetchObjectDependencyEdges(sourceProfile, unique);
+    if (!Array.isArray(edges) || !edges.length) {
+      return unique;
+    }
+
+    const selectedKeys = new Set(unique.map(keyOf));
+    const dependenciesByKey = new Map();
+
+    for (const edge of edges) {
+      const item = {
+        objectType: edge.objectType,
+        schemaName: edge.schemaName,
+        objectName: edge.objectName,
+      };
+      const dependency = {
+        objectType: edge.dependencyObjectType,
+        schemaName: edge.dependencySchemaName,
+        objectName: edge.dependencyObjectName,
+      };
+      const itemKey = keyOf(item);
+      const dependencyKey = keyOf(dependency);
+      if (!selectedKeys.has(itemKey) || !selectedKeys.has(dependencyKey) || itemKey === dependencyKey) {
+        continue;
+      }
+
+      if (!dependenciesByKey.has(itemKey)) dependenciesByKey.set(itemKey, new Map());
+      dependenciesByKey.get(itemKey).set(dependencyKey, dependency);
+    }
+
+    return unique.map((item) => {
+      const existing = Array.isArray(item.dependencies) ? item.dependencies : [];
+      const derived = [...(dependenciesByKey.get(keyOf(item))?.values() || [])];
+      return derived.length ? { ...item, dependencies: [...existing, ...derived] } : item;
+    });
+  } catch (error) {
+    logEvent("WARN", "Unable to derive deployment order from SQL dependency metadata; using configured fallback order.", {
+      errorMessage: error.message,
+    });
+    return unique;
+  }
+}
+
+async function buildDependencyOrderedSelection(sourceProfile, selectedObjects, logEvent = () => {}) {
+  const enriched = await deriveSelectionDependencies(sourceProfile, selectedObjects, logEvent);
+  return sortedByDependency(enriched);
 }
 
 function keyOf(item) {
@@ -123,12 +235,12 @@ function writeDeploymentSql(outputDir, fileName, sqlText) {
   const safeName = String(fileName || "deployment_script").replace(/[^a-zA-Z0-9._-]/g, "_");
   fs.mkdirSync(outputDir, { recursive: true });
   const filePath = path.join(outputDir, `${safeName}.sql`);
-  fs.writeFileSync(filePath, String(sqlText || ""), "utf8");
+  writeSqlFileSync(filePath, sqlText);
   return filePath;
 }
 
 function supportsCreateOrAlter(objectType) {
-  return ["PROCEDURE", "VIEW", "FUNCTION", "TRIGGER"].includes(String(objectType || "").toUpperCase());
+  return ["PROCEDURE"].includes(String(objectType || "").toUpperCase());
 }
 
 function getDirectStrategy(objectType) {
@@ -138,13 +250,31 @@ function getDirectStrategy(objectType) {
 function getActionForObjectType(objectType) {
   const type = String(objectType || "").toUpperCase();
   if (type === "TABLE") return "AlterDelta";
-  if (type === "PROCEDURE") return "ExecuteIndividually";
+  if (type === "PROCEDURE") return "ExecuteCombinedProcedures";
   if (supportsCreateOrAlter(type)) return "CreateOrAlterIndividually";
   return "DropAndCreate";
 }
 
 function getRollbackStrategy(objectType) {
   return supportsCreateOrAlter(objectType) ? "createOrAlter" : "dropCreate";
+}
+
+function buildLegacyDeploymentMetadata(generationWarnings = []) {
+  return {
+    generationWarnings,
+    dacfxValidation: { enabled: false },
+    engine: "Legacy",
+    deployScriptPath: null,
+  };
+}
+
+function getActionForEngine(objectType, engine) {
+  return isDacFxEngine(engine) ? "DacFxDeploy" : getActionForObjectType(objectType);
+}
+
+function mapDacFxAction(operation) {
+  const normalized = String(operation || "Deploy").trim();
+  return normalized ? `DacFx${normalized}` : "DacFxDeploy";
 }
 
 function markProcedureResults(resultsByKey, selectedProcedures, status, errorMessage, scriptPath) {
@@ -157,6 +287,39 @@ function markProcedureResults(resultsByKey, selectedProcedures, status, errorMes
   }
 }
 
+function broadcastProcedureResults({
+  resultsByKey,
+  selectedProcedures,
+  taskId,
+  status,
+  errorMessage = null,
+  total,
+  doneCount,
+  broadcastProgress,
+}) {
+  let nextDoneCount = doneCount;
+  for (const item of selectedProcedures) {
+    const current = resultsByKey.get(keyOf(item));
+    if (!current) continue;
+
+    current.status = status;
+    current.errorMessage = errorMessage;
+    nextDoneCount += 1;
+    broadcastProgress("deployProgress", {
+      taskId,
+      objectType: current.objectType,
+      schemaName: current.schemaName,
+      objectName: current.objectName,
+      status,
+      error: errorMessage || undefined,
+      done: nextDoneCount,
+      total,
+    });
+  }
+
+  return nextDoneCount;
+}
+
 function buildDeploymentPlan(selectedObjects) {
   const unique = dedupeSelection(selectedObjects);
   const ordered = sortedByDependency(unique);
@@ -164,6 +327,273 @@ function buildDeploymentPlan(selectedObjects) {
     ...item,
     action: getActionForObjectType(item.objectType),
   }));
+}
+
+async function buildDerivedDeploymentPlan(sourceProfile, selectedObjects, logEvent = () => {}) {
+  const ordered = await buildDependencyOrderedSelection(sourceProfile, selectedObjects, logEvent);
+  return ordered.map((item) => ({
+    ...item,
+    action: getActionForObjectType(item.objectType),
+  }));
+}
+
+function buildDefinitionLookup(definitions) {
+  const lookup = new Map();
+  if (!definitions || typeof definitions.values !== "function") {
+    return lookup;
+  }
+
+  for (const definition of definitions.values()) {
+    lookup.set(keyOf(definition), definition);
+  }
+
+  return lookup;
+}
+
+async function findUnchangedDirectExecutionKeys({ sourceProfile, destinationProfile, selectedObjects, logEvent }) {
+  const comparableObjects = (selectedObjects || []).filter(
+    (item) => !["TABLE", "PROCEDURE"].includes(String(item.objectType || "").toUpperCase())
+  );
+  if (!comparableObjects.length) {
+    return new Set();
+  }
+
+  try {
+    const [sourceDefinitions, destinationDefinitions] = await Promise.all([
+      fetchObjectDefinitionMap(sourceProfile, comparableObjects),
+      fetchObjectDefinitionMap(destinationProfile, comparableObjects),
+    ]);
+    const sourceLookup = buildDefinitionLookup(sourceDefinitions);
+    const destinationLookup = buildDefinitionLookup(destinationDefinitions);
+    const unchangedKeys = new Set();
+
+    for (const item of comparableObjects) {
+      const itemKey = keyOf(item);
+      const sourceDefinition = sourceLookup.get(itemKey);
+      const destinationDefinition = destinationLookup.get(itemKey);
+      if (!sourceDefinition || !destinationDefinition) {
+        continue;
+      }
+
+      if (normalizeDefinitionForCompare(sourceDefinition.definition) === normalizeDefinitionForCompare(destinationDefinition.definition)) {
+        unchangedKeys.add(itemKey);
+      }
+    }
+
+    return unchangedKeys;
+  } catch (error) {
+    logEvent("WARN", "Unable to pre-compare direct deploy objects; continuing with generated scripts.", {
+      errorMessage: error.message,
+    });
+    return new Set();
+  }
+}
+
+async function runDacFxDeployment({
+  sourceProfile,
+  destinationProfile,
+  selectedObjects,
+  mode,
+  options,
+  task,
+  logEvent,
+  broadcastProgress = () => {},
+}) {
+  const ordered = await buildDependencyOrderedSelection(sourceProfile, selectedObjects, logEvent);
+  const total = ordered.length;
+  let doneCount = 0;
+  const resultsByKey = new Map();
+  for (const item of ordered) {
+    resultsByKey.set(keyOf(item), {
+      ...item,
+      action: "DacFxDeploy",
+      status: "Skipped",
+      errorMessage: "No generated script found.",
+      scriptPath: null,
+    });
+  }
+
+  const scriptOutputRoot = options?.scriptOutputPath || EXPORTS_DIR;
+  broadcastProgress("taskProgress", {
+    taskId: task.taskId,
+    taskType: "Deploy",
+    key: "deploy",
+    operation: "Generating latest source scripts...",
+    percent: 20,
+  });
+
+  const generatedInfo = await generateScriptsForProfile({
+    taskId: task.taskId,
+    profile: sourceProfile,
+    selectedObjects: ordered,
+    outputBasePath: scriptOutputRoot,
+    appTaskMode: "deploy",
+  });
+
+  const generated = generatedInfo.generated;
+  fs.mkdirSync(generated.runRoot, { recursive: true });
+  const deploymentScriptDir = path.join(generated.runRoot, "Deployment Scripts");
+  const generatedScripts = generatedInfo.scripts || [];
+  const generatedScriptMap = new Map(generatedScripts.map((entry) => [keyOf(entry), entry]));
+  const generationWarnings = generatedInfo.generationWarnings || [];
+
+  generationWarnings.forEach((warning) => {
+    logEvent("WARN", warning.message, warning);
+  });
+
+  let dacfxValidation = { enabled: false };
+  if (getSettings().dacfx?.validationEnabled) {
+    broadcastProgress("taskProgress", {
+      taskId: task.taskId,
+      taskType: "Deploy",
+      key: "deploy",
+      operation: "Validating generated scripts with DacFx...",
+      percent: 45,
+    });
+    const validationResult = await validateGeneratedArtifacts({
+      taskId: `${task.taskId}_deploy_validate`,
+      scripts: generatedScripts,
+    });
+    dacfxValidation = {
+      enabled: true,
+      ...validationResult,
+    };
+  }
+
+  broadcastProgress("taskProgress", {
+    taskId: task.taskId,
+    taskType: "Deploy",
+    key: "deploy",
+    operation: mode === "Rollback" ? "Generating DacFx deployment preview..." : "Generating DacFx deployment script...",
+    percent: 65,
+  });
+
+  const preview = await compareGeneratedArtifacts({
+    taskId: `${task.taskId}_preview`,
+    sourceScripts: generatedScripts,
+    destinationProfile,
+  });
+
+  const deployScriptText = String(preview.deployScript || "");
+  let deploymentScriptPath = null;
+  if (deployScriptText.trim()) {
+    deploymentScriptPath = writeDeploymentSql(
+      deploymentScriptDir,
+      `${task.taskId}_${mode === "Rollback" ? "dacfx_preview" : "dacfx_deploy"}`,
+      deployScriptText
+    );
+    writeScriptArtifact(task.taskId, "deploy", "DACFX", sourceProfile.databaseName, destinationProfile.databaseName, deployScriptText);
+  }
+
+  (preview.alerts || []).forEach((alert) => {
+    logEvent("WARN", `DacFx alert: ${alert.name || alert.severity || "Alert"}`, alert);
+  });
+  (preview.warnings || []).forEach((warning) => {
+    logEvent("WARN", warning, { source: "dacfx-preview" });
+  });
+
+  if (mode !== "Rollback") {
+    broadcastProgress("taskProgress", {
+      taskId: task.taskId,
+      taskType: "Deploy",
+      key: "deploy",
+      operation: "Applying DacFx deployment...",
+      percent: 82,
+    });
+    try {
+      await deployGeneratedArtifacts({
+        taskId: task.taskId,
+        sourceScripts: generatedScripts,
+        destinationProfile,
+        mode: "apply",
+      });
+    } catch (error) {
+      for (const item of ordered) {
+        const current = resultsByKey.get(keyOf(item));
+        if (!current) continue;
+        current.status = "Failed";
+        current.errorMessage = error.message || "DacFx deployment failed.";
+        current.scriptPath = deploymentScriptPath;
+        doneCount += 1;
+        broadcastProgress("deployProgress", {
+          taskId: task.taskId,
+          objectType: current.objectType,
+          schemaName: current.schemaName,
+          objectName: current.objectName,
+          status: "Failed",
+          error: current.errorMessage,
+          done: doneCount,
+          total,
+        });
+      }
+
+      return {
+        plan: ordered,
+        results: [...resultsByKey.values()],
+        generatedRoot: generated.runRoot,
+        buildPathFile: generated.latestBuildPathFile,
+        rollbackApplied: false,
+        generationWarnings,
+        dacfxValidation,
+        engine: "DacFx",
+        deployScriptPath: deploymentScriptPath,
+      };
+    }
+  }
+
+  const changeByKey = new Map(
+    (preview.changes || []).map((change) => [keyOf(change), change])
+  );
+
+  for (const item of ordered) {
+    const current = resultsByKey.get(keyOf(item));
+    if (!current) continue;
+    const generatedScript = generatedScriptMap.get(keyOf(item));
+    const change = changeByKey.get(keyOf(item));
+    current.scriptPath = deploymentScriptPath;
+    current.errorMessage = null;
+
+    if (!generatedScript) {
+      current.status = "Skipped";
+      current.errorMessage = "No generated script found.";
+    } else if (change) {
+      current.status = mode === "Rollback" ? "RolledBack" : "Success";
+      current.action = mapDacFxAction(change.operation);
+    } else {
+      current.status = "Skipped";
+      current.action = "NoChange";
+    }
+
+    doneCount += 1;
+    broadcastProgress("deployProgress", {
+      taskId: task.taskId,
+      objectType: current.objectType,
+      schemaName: current.schemaName,
+      objectName: current.objectName,
+      status: current.status,
+      done: doneCount,
+      total,
+    });
+  }
+
+  logEvent("INFO", mode === "Rollback" ? "DacFx deployment preview completed" : "DacFx deployment completed", {
+    generatedRoot: generated.runRoot,
+    buildPathFile: generated.latestBuildPathFile,
+    deployScriptPath: deploymentScriptPath,
+    changeCount: preview.changes?.length || 0,
+  });
+
+  return {
+    plan: ordered,
+    results: [...resultsByKey.values()],
+    generatedRoot: generated.runRoot,
+    buildPathFile: generated.latestBuildPathFile,
+    rollbackApplied: mode === "Rollback",
+    generationWarnings,
+    dacfxValidation,
+    engine: "DacFx",
+    deployScriptPath: deploymentScriptPath,
+  };
 }
 
 async function runDeployment({
@@ -177,7 +607,15 @@ async function runDeployment({
   logEvent,
   broadcastProgress = () => {},
 }) {
-  const ordered = sortedByDependency(dedupeSelection(selectedObjects));
+  const requestedEngine = normalizeEngine(options?.engine || "Legacy");
+  if (isDacFxEngine(requestedEngine)) {
+    logEvent("INFO", "Deploy execution is using the legacy object-type contract instead of DacFx apply.", {
+      requestedEngine,
+      mode,
+    });
+  }
+
+  const ordered = await buildDependencyOrderedSelection(sourceProfile, selectedObjects, logEvent);
   const total = ordered.length;
   let doneCount = 0;
   const resultsByKey = new Map();
@@ -227,6 +665,13 @@ async function runDeployment({
   const combinedStoredProceduresPath = generatedInfo.combinedStoredProceduresPath;
   const hasTables = ordered.some((item) => item.objectType === "TABLE");
   const generationWarnings = generatedInfo.generationWarnings || [];
+  const deploymentMetadata = buildLegacyDeploymentMetadata(generationWarnings);
+  const unchangedDirectExecutionKeys = await findUnchangedDirectExecutionKeys({
+    sourceProfile,
+    destinationProfile,
+    selectedObjects: ordered,
+    logEvent,
+  });
 
   generationWarnings.forEach((warning) => {
     logEvent("WARN", warning.message, warning);
@@ -345,6 +790,22 @@ async function runDeployment({
         `${task.taskId}_${item.objectType}_${item.schemaName}_${item.objectName}`,
         executableSql
       );
+      if (unchangedDirectExecutionKeys.has(keyOf(item))) {
+        current.status = "Skipped";
+        current.action = "NoChange";
+        current.errorMessage = null;
+        doneCount += 1;
+        broadcastProgress("deployProgress", {
+          taskId: task.taskId,
+          objectType: current.objectType,
+          schemaName: current.schemaName,
+          objectName: current.objectName,
+          status: "Skipped",
+          done: doneCount,
+          total,
+        });
+        continue;
+      }
       rollbackBatches.push(...splitBatches(executableSql));
     }
 
@@ -356,7 +817,7 @@ async function runDeployment({
         await executeSql(destinationProfile, rollbackSql);
         for (const item of ordered) {
           const current = resultsByKey.get(keyOf(item));
-          if (current && current.scriptPath && current.status !== "Failed") {
+          if (current && current.scriptPath && current.status !== "Failed" && current.status !== "RolledBack") {
             current.status = "RolledBack";
             current.errorMessage = null;
             doneCount += 1;
@@ -400,7 +861,7 @@ async function runDeployment({
       generatedRoot: generated.runRoot,
       buildPathFile: generated.latestBuildPathFile,
       rollbackApplied: true,
-      generationWarnings,
+      ...deploymentMetadata,
     };
   }
 
@@ -408,6 +869,7 @@ async function runDeployment({
   // shared session, preserving exact object attribution without reconnecting
   // for every script. Tables remain a grouped delta operation at their order position.
   let tablesProcessed = false;
+  let proceduresProcessed = false;
   let stopDirectExecution = false;
   broadcastProgress("taskProgress", {
     taskId: task.taskId,
@@ -418,6 +880,99 @@ async function runDeployment({
   });
   for (let index = 0; index < ordered.length && !stopDirectExecution;) {
     const item = ordered[index];
+    if (item.objectType === "PROCEDURE") {
+      if (proceduresProcessed) {
+        index += 1;
+        continue;
+      }
+      proceduresProcessed = true;
+
+      const procedureItems = ordered.filter((x) => x.objectType === "PROCEDURE");
+      if (!combinedStoredProceduresPath || !fs.existsSync(combinedStoredProceduresPath)) {
+        const procedureError = "Combined stored procedure deployment script was not generated.";
+        logEvent("ERROR", "Stored procedure deployment skipped because the combined script is missing", {
+          combinedStoredProceduresPath,
+          errorMessage: procedureError,
+        });
+        markProcedureResults(resultsByKey, procedureItems, "Failed", procedureError, combinedStoredProceduresPath);
+        doneCount = broadcastProcedureResults({
+          resultsByKey,
+          selectedProcedures: procedureItems,
+          taskId: task.taskId,
+          status: "Failed",
+          errorMessage: procedureError,
+          total,
+          doneCount,
+          broadcastProgress,
+        });
+        if (!continueOnError) {
+          return {
+            plan: ordered,
+            results: [...resultsByKey.values()],
+            generatedRoot: generated.runRoot,
+            buildPathFile: generated.latestBuildPathFile,
+            ...deploymentMetadata,
+          };
+        }
+        while (index < ordered.length && ordered[index].objectType === "PROCEDURE") {
+          index += 1;
+        }
+        continue;
+      }
+
+      markProcedureResults(resultsByKey, procedureItems, "PendingExecution", null, combinedStoredProceduresPath);
+
+      try {
+        const combinedSql = fs.readFileSync(combinedStoredProceduresPath, "utf8");
+        await executeSqlBatches(destinationProfile, combinedSql);
+        logEvent("INFO", "Stored procedures deployed from combined script", {
+          scriptPath: combinedStoredProceduresPath,
+          objectCount: procedureItems.length,
+        });
+        markProcedureResults(resultsByKey, procedureItems, "Success", null, combinedStoredProceduresPath);
+        doneCount = broadcastProcedureResults({
+          resultsByKey,
+          selectedProcedures: procedureItems,
+          taskId: task.taskId,
+          status: "Success",
+          total,
+          doneCount,
+          broadcastProgress,
+        });
+      } catch (error) {
+        const procedureError = error.message || "Stored procedure deployment failed.";
+        logEvent("ERROR", "Stored procedure deployment failed", {
+          scriptPath: combinedStoredProceduresPath,
+          errorMessage: procedureError,
+        });
+        markProcedureResults(resultsByKey, procedureItems, "Failed", procedureError, combinedStoredProceduresPath);
+        doneCount = broadcastProcedureResults({
+          resultsByKey,
+          selectedProcedures: procedureItems,
+          taskId: task.taskId,
+          status: "Failed",
+          errorMessage: procedureError,
+          total,
+          doneCount,
+          broadcastProgress,
+        });
+        if (!continueOnError) {
+          return {
+            plan: ordered,
+            results: [...resultsByKey.values()],
+            generatedRoot: generated.runRoot,
+            buildPathFile: generated.latestBuildPathFile,
+            ...deploymentMetadata,
+          };
+        }
+      }
+
+      while (index < ordered.length && ordered[index].objectType === "PROCEDURE") {
+        index += 1;
+      }
+      continue;
+    }
+
     if (item.objectType === "TABLE") {
       if (tablesProcessed) {
         index += 1;
@@ -480,7 +1035,7 @@ async function runDeployment({
             results: [...resultsByKey.values()],
             generatedRoot: generated.runRoot,
             buildPathFile: generated.latestBuildPathFile,
-            generationWarnings,
+            ...deploymentMetadata,
           };
         }
       }
@@ -491,7 +1046,11 @@ async function runDeployment({
     }
 
     const executionGroup = [];
-    while (index < ordered.length && ordered[index].objectType !== "TABLE") {
+    while (
+      index < ordered.length &&
+      ordered[index].objectType !== "TABLE" &&
+      ordered[index].objectType !== "PROCEDURE"
+    ) {
       const groupItem = ordered[index];
       index += 1;
       const genItem = generatedScriptMap.get(keyOf(groupItem));
@@ -513,6 +1072,28 @@ async function runDeployment({
       );
       current.scriptPath = deploymentScriptPath;
       current.errorMessage = null;
+      if (unchangedDirectExecutionKeys.has(keyOf(groupItem))) {
+        current.status = "Skipped";
+        current.action = "NoChange";
+        logEvent("INFO", "Object already matches source; skipping live execution of generated script.", {
+          objectType: current.objectType,
+          schemaName: current.schemaName,
+          objectName: current.objectName,
+          scriptPath: current.scriptPath,
+          sourceScriptPath: genItem.scriptPath,
+        });
+        doneCount++;
+        broadcastProgress("deployProgress", {
+          taskId: task.taskId,
+          objectType: current.objectType,
+          schemaName: current.schemaName,
+          objectName: current.objectName,
+          status: "Skipped",
+          done: doneCount,
+          total,
+        });
+        continue;
+      }
       executionGroup.push({ item: groupItem, current, genItem, sqlText: executableSql });
     }
     if (!executionGroup.length) continue;
@@ -596,7 +1177,7 @@ async function runDeployment({
       results: [...resultsByKey.values()],
       generatedRoot: generated.runRoot,
       buildPathFile: generated.latestBuildPathFile,
-      generationWarnings,
+      ...deploymentMetadata,
     };
   }
 
@@ -605,11 +1186,12 @@ async function runDeployment({
     results: [...resultsByKey.values()],
     generatedRoot: generated.runRoot,
     buildPathFile: generated.latestBuildPathFile,
-    generationWarnings,
+    ...deploymentMetadata,
   };
 }
 
 module.exports = {
   runDeployment,
   buildDeploymentPlan,
+  buildDerivedDeploymentPlan,
 };

@@ -15,12 +15,12 @@ Repository: [HarshaDidSmtg/Pebloy](https://github.com/HarshaDidSmtg/Pebloy)
 | **Connection Profiles** | Named server/database connections. SQL passwords encrypted with Windows DPAPI — never plaintext. |
 | **Live Code Diff** | Side-by-side diff of object definitions fetched directly from source and destination at runtime. Covers stored procedures, views, functions, triggers, tables (columns + indexes + PK + defaults), synonyms, sequences, and UDTs. |
 | **Backup** | Scripts selected objects to SQL files under Connection Alias → run date → database → schema → object type. Script-generation only — no database modification. |
-| **Deployment** | Object-type-aware execution: individually tracked module scripts for procedures/views/functions/triggers, delta ALTER for tables, DROP+CREATE for synonyms/sequences/UDTs. UI modes: Apply Changes (`ExecuteDirectly`) and Validate Only (Rollback). |
-| **Object Selection** | Build one shared object list for Diff, Backup, and Deploy. Manual Entry uses a Monaco-based editor with find/replace and case-transform shortcuts; Browse Database supports type/schema filters, header-checkbox bulk selection, and 50-row pagination. |
+| **Deployment** | Object-type-aware execution: individually tracked module scripts for procedures/views/functions/triggers, delta ALTER for tables, DROP+CREATE for synonyms/sequences/UDTs. Modes: Execute Directly and Rollback (Test Run — wraps all scripts in a transaction that always rolls back). |
+| **Object Discovery** | Browse live DB objects with type/schema filters and use the header checkbox to select or clear the visible result set. |
 | **Task Progress** | Backup, Code Diff, and Deploy emit stage-specific progress text, while Deploy also streams per-object status updates during execution. |
-| **Deployment Plan Preview** | Review ordered per-object deployment actions before running a deployment. |
+| **Offline SQL Formatter** | Monaco-based T-SQL formatter workbench with local open/save/save-as, drag/drop, search/replace, compare mode, inline diff, and persisted interactive-only formatter preferences. |
 | **Native Picker Flow** | Folder browse actions and object-list file selection use the same native dialog flow when running in Electron, with backend picker fallbacks available. |
-| **Persistent App State** | Default paths, theme, font, and working object inputs are stored in `data/app-state.json` so they survive app restarts. |
+| **Persistent App State** | Default paths, theme, font, working object inputs, and formatter UI/options are stored in `data/app-state.json` so they survive app restarts. |
 | **Factory Reset** | Clears saved profiles, preferences, logs, exports, reports, and temp artifacts so the project can be shared cleanly. |
 | **Dependency Ordering** | UDTs → Sequences → Tables → Views → Functions → Procedures → Synonyms → Triggers. |
 | **Audit Logging** | Every task produces a `.log` (human-readable) and `.json` (structured) file in `artifacts/logs/`, and the Logs tab opens the preferred text log directly. |
@@ -51,9 +51,7 @@ npm install
 npm start
 ```
 
-Open the URL shown in the terminal (default `http://localhost:5089`) or double-click **Launch-Pebloy.cmd**.
-
-If port 5089 is already in use, Pebloy automatically selects the next available port and writes the active URL to `data/server-info.json`.
+Open `http://localhost:5089` or double-click **Launch-Pebloy.cmd**.
 
 `Launch-Pebloy.cmd` starts the Electron desktop app and refreshes the `Pebloy.lnk` desktop shortcut.
 
@@ -69,7 +67,35 @@ See [INSTALLATION.md](INSTALLATION.md) for full setup options including the Wind
 2. **Code Diff** — Review what changed between environments.
 3. **Backup** — Script the current source objects for reference (optional).
 4. **Deploy** — Deploy selected objects with per-object status tracking.
-5. **Logs** — Audit the task result.
+5. **Formatter** — Open or paste local SQL, format it offline, and optionally review a before/after diff.
+6. **Logs** — Audit the task result.
+
+---
+
+## SQL Formatter
+
+The Formatter tab is a fully local T-SQL workbench. It never connects to SQL Server, never calls a remote API, and never emits telemetry.
+
+What it supports:
+
+- Monaco editing with folding, bracket matching, line numbers, multiple cursors, undo/redo, and find/replace.
+- Open, drag/drop, save, save as, copy, and clear for local `.sql` and `.txt` files.
+- Before/after comparison with Monaco diff view, including inline diff mode.
+- Background formatting through a local worker-backed backend path so large scripts do not block the UI.
+- Persisted interactive formatter options and editor toggles in `data/app-state.json`.
+
+Safety boundaries:
+
+- Interactive formatter options are stored separately from `settings.formatting.formatGeneratedSql`.
+- Backup, Code Diff, and Deploy continue using Pebloy’s shared generated-SQL formatting path.
+- The desktop shell binds the formatter backend to loopback only, and Save overwrites only the file opened or created in the current Pebloy session.
+- GO separators, comments, BOM, EOL style, trailing newline, and string literal content are preserved.
+- If a batch cannot be parsed safely, Pebloy keeps the original batch text instead of guessing.
+
+Current option groups:
+
+- Configurable: Formatting, Indentation, Keywords, Boolean, Output, Misc.
+- Intentionally fixed in this release: Comma Style, CASE, and JOIN layout. The UI shows those groups explicitly as deterministic/fixed so their absence is never silent.
 
 ---
 
@@ -87,16 +113,18 @@ pebloy/
 │       ├── deploymentService.js        # Deployment orchestration
 │       ├── backupService.js            # Backup orchestration
 │       ├── sqlService.js               # SQL via PowerShell ADO.NET
-│       ├── errorService.js             # User-facing error shaping + resolution steps
-│       ├── paths.js                    # Centralized artifact/export paths
 │       ├── profileService.js           # Connection profile CRUD
 │       ├── appStateService.js          # Persistent UI/app-state storage
+│       ├── formatterOptions.js         # Interactive formatter option normalization + capabilities
+│       ├── formatterService.js         # Shared generated-SQL formatting + interactive worker entry point
+│       ├── formatterWorker.js          # Local worker-thread formatter execution
 │       ├── settingsService.js          # Folder-name + deployment-order settings
 │       ├── factoryResetService.js      # Runtime data/artifact reset
 │       ├── loggingService.js           # Per-task audit logs
 │       ├── systemService.js            # Folder picker / file open
 │       ├── secretStore.js              # DPAPI password encryption
 │       ├── storage.js                  # JSON file I/O
+│       ├── tsqlFormatterProvider.js    # Offline T-SQL formatter provider and post-fixes
 │       └── utils.js                    # Auth type + name helpers
 ├── scripts/
 │   └── powershell/
@@ -104,10 +132,6 @@ pebloy/
 │       ├── DBObjectsBulkScriptGenerator.ps1 # Bulk object script generator
 │       └── Launch-Pebloy.ps1           # Desktop launcher
 ├── public/                             # Frontend (vanilla HTML/CSS/JS)
-│   ├── app.js                          # Main UI wiring
-│   ├── editorHelpers.js                # Shared editor shortcut/help text
-│   ├── manualEntryEditor.js            # Monaco-backed multiline editor adapter
-│   └── index.html / style.css          # Shell + styling
 ├── data/                               # Runtime: profiles + encrypted secrets
 ├── artifacts/                          # Runtime: logs, scripts, reports
 └── build/                              # electron-builder assets

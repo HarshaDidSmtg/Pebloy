@@ -31,7 +31,6 @@ const fs = require("fs");
 const {
   generateObjectScripts,
   listGeneratedObjectScripts,
-  findLatestCombinedStoredProcedureScript,
 } = require("./scriptAutomationService");
 const { fetchObjectDefinitionMap } = require("./sqlService");
 const {
@@ -39,6 +38,7 @@ const {
   generateScriptsForProfile,
   validateCanonicalSourceArtifacts,
 } = require("./scriptGenerationService");
+const { UTF8_BOM } = require("./sqlFileEncoding");
 
 describe("buildCombinedStoredProcedureText", () => {
   it("rewrites procedure headers to CREATE OR ALTER without session-setting prefixes", () => {
@@ -73,6 +73,7 @@ describe("generateScriptsForProfile", () => {
     generateObjectScripts.mockResolvedValue({
       runRoot: "/exports/run/db",
       latestBuildPathFile: "/exports/run/db/BuildPaths.txt",
+      combinedStoredProceduresPath: "/exports/run/db/AllStoredProcedures_20260617_120000.sql",
     });
     listGeneratedObjectScripts.mockReturnValue([
       {
@@ -88,7 +89,6 @@ describe("generateScriptsForProfile", () => {
         scriptPath: "/exports/run/db/dbo/Tables/Tbl_UnifiedTrips.sql",
       },
     ]);
-    findLatestCombinedStoredProcedureScript.mockReturnValue("/exports/run/db/AllStoredProcedures_20260617_120000.sql");
     fetchObjectDefinitionMap.mockResolvedValue(new Map([
       [
         "PROCEDURE|Reports|UspUnifiedTripsIncrementalLoad",
@@ -122,12 +122,12 @@ describe("generateScriptsForProfile", () => {
     );
     expect(fs.writeFileSync).toHaveBeenCalledWith(
       "/exports/run/db/Reports/Stored Procedures/UspUnifiedTripsIncrementalLoad.sql",
-      "CREATE PROCEDURE Reports.UspUnifiedTripsIncrementalLoad\r\nAS\r\nSELECT 1",
+      `${UTF8_BOM}CREATE PROCEDURE Reports.UspUnifiedTripsIncrementalLoad\r\nAS\r\nSELECT 1`,
       "utf8"
     );
     expect(fs.writeFileSync).toHaveBeenCalledWith(
       "/exports/run/db/AllStoredProcedures_20260617_120000.sql",
-      expect.stringContaining("CREATE OR ALTER PROCEDURE Reports.UspUnifiedTripsIncrementalLoad"),
+      expect.stringContaining(`${UTF8_BOM}CREATE OR ALTER PROCEDURE Reports.UspUnifiedTripsIncrementalLoad`),
       "utf8"
     );
     expect(result.exactDefinitionsApplied).toBe(1);
@@ -144,6 +144,7 @@ describe("generateScriptsForProfile", () => {
     generateObjectScripts.mockResolvedValue({
       runRoot: "/exports/run/db",
       latestBuildPathFile: "/exports/run/db/BuildPaths.txt",
+      combinedStoredProceduresPath: "/exports/run/db/AllStoredProcedures_20260617_120000.sql",
     });
     listGeneratedObjectScripts.mockReturnValue([
       {
@@ -153,7 +154,6 @@ describe("generateScriptsForProfile", () => {
         scriptPath: "/exports/run/db/dbo/Stored Procedures/ProcA.sql",
       },
     ]);
-    findLatestCombinedStoredProcedureScript.mockReturnValue("/exports/run/db/AllStoredProcedures_20260617_120000.sql");
     fetchObjectDefinitionMap.mockResolvedValue(new Map([
       [
         "PROCEDURE|dbo|proca",
@@ -174,10 +174,15 @@ describe("generateScriptsForProfile", () => {
       appTaskMode: "code_diff",
     });
 
-    expect(fs.writeFileSync).toHaveBeenCalledTimes(1);
+    expect(fs.writeFileSync).toHaveBeenCalledTimes(2);
     expect(fs.writeFileSync).toHaveBeenCalledWith(
       "/exports/run/db/dbo/Stored Procedures/ProcA.sql",
-      "CREATE PROCEDURE dbo.ProcA\r\nAS\r\nSELECT 1",
+      `${UTF8_BOM}CREATE PROCEDURE dbo.ProcA\r\nAS\r\nSELECT 1`,
+      "utf8"
+    );
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      "/exports/run/db/AllStoredProcedures_20260617_120000.sql",
+      expect.stringContaining(`${UTF8_BOM}CREATE OR ALTER PROCEDURE dbo.ProcA`),
       "utf8"
     );
   });
@@ -195,7 +200,6 @@ describe("generateScriptsForProfile", () => {
         scriptPath: "/exports/run/db/dbo/Views/ViewA.sql",
       },
     ]);
-    findLatestCombinedStoredProcedureScript.mockReturnValue(null);
     fetchObjectDefinitionMap.mockRejectedValue(new Error("metadata lookup failed"));
 
     const result = await generateScriptsForProfile({
@@ -251,13 +255,24 @@ describe("validateCanonicalSourceArtifacts", () => {
     ])).toThrow(/deploy-only wrapper/);
   });
 
-  it("rejects function source that does not start with CREATE/ALTER", () => {
+  it("accepts programmable source with a leading comment before the first module DDL", () => {
+    expect(() => validateCanonicalSourceArtifacts([
+      {
+        objectType: "FUNCTION",
+        schemaName: "dbo",
+        objectName: "fn_with_comment",
+        definitionText: "-- some comment\nCREATE FUNCTION dbo.fn_with_comment() RETURNS INT AS BEGIN RETURN 1 END",
+      },
+    ])).not.toThrow();
+  });
+
+  it("rejects function source that never reaches a CREATE/ALTER module statement", () => {
     expect(() => validateCanonicalSourceArtifacts([
       {
         objectType: "FUNCTION",
         schemaName: "dbo",
         objectName: "fn_bad",
-        definitionText: "-- some comment\nCREATE FUNCTION dbo.fn_bad() RETURNS INT AS BEGIN RETURN 1 END",
+        definitionText: "-- some comment\nRETURN 1",
       },
     ])).toThrow(/Expected the canonical FUNCTION/);
   });
@@ -273,13 +288,13 @@ describe("validateCanonicalSourceArtifacts", () => {
     ])).toThrow(/CREATE TABLE/);
   });
 
-  it("rejects TABLE source with deploy-only session-setting headers", () => {
+  it("rejects TABLE source with session-setting headers", () => {
     expect(() => validateCanonicalSourceArtifacts([
       {
         objectType: "TABLE",
         schemaName: "dbo",
         objectName: "Orders",
-        definitionText: "SET ANSI_NULLS ON\nGO\nCREATE TABLE dbo.Orders (Id INT)",
+        definitionText: "SET ANSI_NULLS ON\nGO\nSET QUOTED_IDENTIFIER ON\nGO\nCREATE TABLE dbo.Orders (Id INT)",
       },
     ])).toThrow(/session-setting headers/);
   });
@@ -369,8 +384,7 @@ describe("generateScriptsForProfile — golden output for programmable object ty
 
   beforeEach(() => {
     jest.clearAllMocks();
-    generateObjectScripts.mockResolvedValue({ runRoot: "/exports/run/db", latestBuildPathFile: null });
-    findLatestCombinedStoredProcedureScript.mockReturnValue(null);
+    generateObjectScripts.mockResolvedValue({ runRoot: "/exports/run/db", latestBuildPathFile: null, combinedStoredProceduresPath: null });
     fs.readFileSync.mockReturnValue("CREATE VIEW dbo.vw_Test AS SELECT 1");
   });
 
@@ -435,5 +449,38 @@ describe("generateScriptsForProfile — golden output for programmable object ty
     const writtenText = fs.writeFileSync.mock.calls[0][1];
     expect(writtenText).toContain("\r\n");
     expect(writtenText).not.toMatch(/(?<!\r)\n/);
+  });
+
+  it("accepts exact definitions that were authored with CREATE OR ALTER after canonical rewrite", async () => {
+    listGeneratedObjectScripts.mockReturnValue([
+      makeScriptEntry("PROCEDURE", "dbo", "ProcDeploy", "CREATE OR ALTER PROCEDURE dbo.ProcDeploy AS SELECT 1"),
+    ]);
+    fetchObjectDefinitionMap.mockResolvedValue(new Map([
+      ["PROCEDURE|dbo|procdeploy", {
+        objectType: "PROCEDURE",
+        schemaName: "dbo",
+        objectName: "ProcDeploy",
+        definition: "CREATE PROCEDURE dbo.ProcDeploy\nAS\nSELECT 1",
+        usesAnsiNulls: true,
+        usesQuotedIdentifier: true,
+      }],
+    ]));
+
+    await expect(generateScriptsForProfile({
+      taskId: "t4",
+      profile: { serverName: "srv", databaseName: "db" },
+      selectedObjects: [{ objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcDeploy" }],
+      outputBasePath: "/exports",
+      appTaskMode: "deploy",
+    })).resolves.toMatchObject({
+      exactDefinitionsApplied: 1,
+      exactDefinitionWarning: null,
+    });
+
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      "/exports/run/db/dbo/PROCEDURE/ProcDeploy.sql",
+      `${UTF8_BOM}CREATE PROCEDURE dbo.ProcDeploy\r\nAS\r\nSELECT 1`,
+      "utf8"
+    );
   });
 });

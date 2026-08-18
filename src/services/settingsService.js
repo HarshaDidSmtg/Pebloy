@@ -26,6 +26,16 @@ const DEFAULTS = {
     "SYNONYM",
     "TRIGGER",
   ],
+  dacfx: {
+    validationEnabled: false,
+  },
+  time: {
+    useSystemTime: true,
+    timeZone: "",
+  },
+  formatting: {
+    formatGeneratedSql: false,
+  },
 };
 
 const VALID_OBJECT_TYPES = new Set([
@@ -66,9 +76,20 @@ function sanitizeFolderNames(folderNames) {
 }
 
 function sanitizeSettings(raw = {}) {
+  const source = raw && typeof raw === "object" ? raw : {};
   return {
-    folderNames: sanitizeFolderNames(raw.folderNames),
-    deploymentOrder: sanitizeDeploymentOrder(raw.deploymentOrder),
+    folderNames: sanitizeFolderNames(source.folderNames),
+    deploymentOrder: sanitizeDeploymentOrder(source.deploymentOrder),
+    dacfx: {
+      validationEnabled: Boolean(source.dacfx?.validationEnabled),
+    },
+    time: {
+      useSystemTime: source.time?.useSystemTime === undefined ? true : Boolean(source.time.useSystemTime),
+      timeZone: typeof source.time?.timeZone === "string" ? source.time.timeZone : "",
+    },
+    formatting: {
+      formatGeneratedSql: Boolean(source.formatting?.formatGeneratedSql),
+    },
   };
 }
 
@@ -98,6 +119,9 @@ function saveSettings(partial = {}) {
   const updated = sanitizeSettings({
     folderNames: { ...current.folderNames, ...(partial.folderNames || {}) },
     deploymentOrder: Array.isArray(partial.deploymentOrder) ? partial.deploymentOrder : current.deploymentOrder,
+    dacfx: partial.dacfx && typeof partial.dacfx === "object" ? partial.dacfx : current.dacfx,
+    time: partial.time && typeof partial.time === "object" ? partial.time : current.time,
+    formatting: partial.formatting && typeof partial.formatting === "object" ? partial.formatting : current.formatting,
   });
   fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(updated, null, 2), "utf8");

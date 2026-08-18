@@ -468,7 +468,7 @@ Do not redesign the PowerShell conventions.
 The current workspace implementation now also reflects the following session updates:
 
 - Selected-object export matches the visible filtered/sorted grid and includes Created / Modified columns.
-- UI dates are standardized to `dd:mm:yyyy`, log timestamps to `dd:mm:yyyy hh:mm:ss`, and durations to `mm:ss`.
+- UI dates are standardized to `dd/MM/YYYY`, log timestamps to `dd/MM/YYYY HH:mm:ss`, and durations to `mm:ss`.
 - Backup, CodeDiff, and Deploy emit stage-specific progress text; Deploy still reports per-object execution status.
 - Shared script-generation output now nests under Connection Alias → date → database.
 - `DBObjectsBulkScriptGenerator.ps1` now writes schema/object paths using resolved database metadata casing.

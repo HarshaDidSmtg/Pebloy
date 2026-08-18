@@ -42,9 +42,11 @@
 
         window.MonacoEnvironment = {
           getWorkerUrl() {
+            const baseUrl = `${window.location.origin}/vendor/monaco/`;
+            const workerMainUrl = `${baseUrl}vs/base/worker/workerMain.js`;
             const script = [
-              "self.MonacoEnvironment = { baseUrl: '/vendor/monaco/' };",
-              "importScripts('/vendor/monaco/vs/base/worker/workerMain.js');",
+              `self.MonacoEnvironment = { baseUrl: ${JSON.stringify(baseUrl)} };`,
+              `importScripts(${JSON.stringify(workerMainUrl)});`,
             ].join(" ");
             return `data:text/javascript;charset=utf-8,${encodeURIComponent(script)}`;
           },
