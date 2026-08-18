@@ -10,6 +10,9 @@ out/
 build/*.ico
 build/*.icns
 build/*.png
+build/dacfx-worker/
+src/dacfx-worker/bin/
+src/dacfx-worker/obj/
 
 # Runtime data
 data/app-state.json
@@ -28,6 +31,22 @@ vendor/ps-modules/
 .env
 .env.local
 .env.*.local
+.npmrc
+
+# Certificates / private keys
+certs/
+*.key
+*.pem
+*.p12
+*.pfx
+*.ppk
+*.jks
+*.keystore
+
+# Database deployment artifacts that may contain schema or credentials
+*.dacpac
+*.publish.xml
+*.pubxml
 
 # Temp files
 artifacts/temp/

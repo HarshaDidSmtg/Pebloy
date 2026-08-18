@@ -66,6 +66,7 @@ const DEFAULT_APP_STATE = {
     deployScriptPath: "",
     continueOnError: false,
     allowSameSource: false,
+    formatter: {},
   },
 };
 
@@ -142,6 +143,9 @@ function sanitizeState(raw = {}) {
       deployScriptPath: String(merged.ui.deployScriptPath || ""),
       continueOnError: Boolean(merged.ui.continueOnError),
       allowSameSource: Boolean(merged.ui.allowSameSource),
+      formatter: merged.ui.formatter && typeof merged.ui.formatter === "object" && !Array.isArray(merged.ui.formatter)
+        ? merged.ui.formatter
+        : {},
     },
   };
 }

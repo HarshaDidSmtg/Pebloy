@@ -23,13 +23,11 @@ src/
   electron/main.js      — Electron entry point
   services/
     scriptGenerationService.js — Shared generation entry points
-    paths.js            — Centralized artifact/export paths
     sqlService.js       — All SQL via PowerShell ADO.NET
     diffService.js      — Side-by-side object definition diff
     deploymentService.js — Deployment orchestration
     backupService.js    — Script-based backup
     scriptAutomationService.js — Wraps the two PS scripts
-    errorService.js     — User-facing error shaping
     profileService.js   — Connection profile CRUD + DPAPI secrets
     appStateService.js  — Persistent UI/app-state storage
     settingsService.js  — Folder-name + deployment-order settings
@@ -42,12 +40,10 @@ src/
 public/
   index.html            — Single-page UI shell
   app.js                — Vanilla JS frontend
-  editorHelpers.js      — Shared editor helper copy
-  manualEntryEditor.js  — Monaco-backed enhanced textarea adapter
   style.css             — CSS custom-property themes
   logo.svg              — Application logo
-scripts/powershell/CompareTablesGenerateDelta.ps1
-scripts/powershell/DBObjectsBulkScriptGenerator.ps1
+CompareTablesGenerateDelta.ps1
+DBObjectsBulkScriptGenerator.ps1
 ```
 
 ## Running Tests

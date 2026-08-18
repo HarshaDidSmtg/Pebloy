@@ -173,10 +173,13 @@ function startExpressServer() {
 
     serverProcess.stdout.on("data", (chunk) => {
       const text = String(chunk);
-      const match = text.match(/listening on http:\/\/localhost:(\d+)/);
+      const match = text.match(/listening on http:\/\/([^\s/:]+):(\d+)/i);
       if (match) {
         clearTimeout(startTimeout);
-        resolve(Number.parseInt(match[1], 10));
+        resolve({
+          host: match[1],
+          port: Number.parseInt(match[2], 10),
+        });
       }
     });
 
@@ -229,7 +232,7 @@ function createWindow(port) {
   // Remove the default application menu
   Menu.setApplicationMenu(null);
 
-  mainWindow.loadURL(`http://localhost:${port}`);
+  mainWindow.loadURL(`http://${port.host}:${port.port}`);
 
   mainWindow.once("ready-to-show", () => {
     mainWindow.show();
@@ -253,8 +256,8 @@ function createWindow(port) {
 
 app.whenReady().then(async () => {
   try {
-    const port = await startExpressServer();
-    createWindow(port);
+    const serverAddress = await startExpressServer();
+    createWindow(serverAddress);
   } catch (err) {
     console.error("[Electron] Failed to start:", err.message);
     app.quit();

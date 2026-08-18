@@ -101,4 +101,24 @@ describe("appStateService — shortcuts", () => {
     const state = getAppState();
     expect(state.ui.activeTab).toBe("diff");
   });
+
+  it("preserves formatter UI state across saves", () => {
+    saveAppState({
+      ui: {
+        formatter: {
+          compareMode: true,
+          options: { uppercaseKeywords: false, maxLineWidth: 120 },
+          editor: { wordWrap: true },
+        },
+      },
+    });
+    saveAppState({ preferences: { theme: "nord" } });
+
+    const state = getAppState();
+    expect(state.ui.formatter).toEqual({
+      compareMode: true,
+      options: { uppercaseKeywords: false, maxLineWidth: 120 },
+      editor: { wordWrap: true },
+    });
+  });
 });

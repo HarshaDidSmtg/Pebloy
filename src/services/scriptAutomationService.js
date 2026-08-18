@@ -26,17 +26,11 @@ function resolvePowerShellScriptPath(envValue, scriptName) {
 const DB_OBJECTS_SCRIPT = resolvePowerShellScriptPath(process.env.DB_OBJECTS_SCRIPT, "DBObjectsBulkScriptGenerator.ps1");
 const TABLE_DELTA_SCRIPT = resolvePowerShellScriptPath(process.env.TABLE_DELTA_SCRIPT, "CompareTablesGenerateDelta.ps1");
 
-function timestampForFile() {
-  const now = new Date();
-  const yyyy = now.getFullYear();
-  const mm = String(now.getMonth() + 1).padStart(2, "0");
-  const dd = String(now.getDate()).padStart(2, "0");
-  const hh = String(now.getHours()).padStart(2, "0");
-  const mi = String(now.getMinutes()).padStart(2, "0");
-  const ss = String(now.getSeconds()).padStart(2, "0");
-  return `${yyyy}${mm}${dd}_${hh}${mi}${ss}`;
-}
+const { timestampForFile } = require("./timeService");
 
+// NOTE: deliberately system-time based (NOT the configurable app timezone).
+// The PowerShell generator computes this same folder name with Get-Date on
+// the local machine, and both sides must resolve the identical path.
 function getRunDateFolderName(date = new Date()) {
   const dd = String(date.getDate()).padStart(2, "0");
   const mm = String(date.getMonth() + 1).padStart(2, "0");
@@ -62,6 +56,7 @@ function buildRunRoot(outputBasePath, databaseName) {
 
 const { normalizeAuthType, normalizeSqlName } = require("./utils");
 const { getSettings } = require("./settingsService");
+const { writeSqlFileSync } = require("./sqlFileEncoding");
 
 function dedupeObjectNames(selectedObjects = []) {
   const set = new Set();
@@ -147,8 +142,12 @@ function ensureSqlServerModule() {
   return _sqlServerModulePromise;
 }
 
+function stripAnsiCodes(text) {
+  return String(text || "").replace(/\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
 function extractPsErrorContext(stderr, stdout) {
-  const combined = [stderr, stdout].filter(Boolean).join("\n");
+  const combined = stripAnsiCodes([stderr, stdout].filter(Boolean).join("\n"));
 
   // Pull the first non-empty "At ... line N" or "CategoryInfo" or "FullyQualifiedErrorId" fragment
   const atMatch = combined.match(/At\s+.+?\.ps1\s*:\s*line\s+\d+/i);
@@ -166,7 +165,7 @@ function extractPsErrorContext(stderr, stdout) {
   return parts.length ? parts.join(" | ") : null;
 }
 
-function runPowerShellFile(scriptPath, args, timeoutMs = 900000) {
+function runPowerShellFile(scriptPath, args, timeoutMs = 0) {
   return new Promise((resolve, reject) => {
     const fullArgs = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...args];
 
@@ -176,10 +175,18 @@ function runPowerShellFile(scriptPath, args, timeoutMs = 900000) {
       env.PSModulePath = extraModulePaths + path.delimiter + (env.PSModulePath || "");
     }
 
-    execFile("pwsh", fullArgs, { encoding: "utf8", maxBuffer: 1024 * 1024 * 50, timeout: timeoutMs, env }, (error, stdout, stderr) => {
+    env.NO_COLOR = "1";
+    env.TERM = "dumb";
+
+    const execOptions = { encoding: "utf8", maxBuffer: 1024 * 1024 * 50, env };
+    if (timeoutMs > 0) {
+      execOptions.timeout = timeoutMs;
+    }
+
+    execFile("pwsh", fullArgs, execOptions, (error, stdout, stderr) => {
       if (error) {
         const context = extractPsErrorContext(String(stderr || ""), String(stdout || ""));
-        const base = String(stderr || stdout || error.message || "PowerShell script failed").trim();
+        const base = stripAnsiCodes(String(stderr || stdout || error.message || "PowerShell script failed")).trim();
         const message = context ? `${base}\n[Detail] ${context}` : base;
         reject(new Error(message));
         return;
@@ -224,30 +231,77 @@ function buildDbObjectsGeneratorArgs(profile, objectListPath, outputBasePath, op
   return args;
 }
 
+function listRunArtifactNames(runRoot, pattern) {
+  if (!runRoot || !fs.existsSync(runRoot)) {
+    return [];
+  }
+  return fs.readdirSync(runRoot).filter((name) => pattern.test(name)).sort();
+}
+
+function parseStdoutArtifactPath(stdout, label) {
+  const match = String(stdout || "").match(new RegExp(`^\\s*${label}:\\s*(.+?)\\s*$`, "im"));
+  if (!match) return null;
+  const candidate = match[1].trim();
+  return candidate && fs.existsSync(candidate) ? candidate : null;
+}
+
+// The run folder is shared by every run of the same day, so "latest by
+// filename" can belong to an earlier or concurrent run. Resolve THIS run's
+// artifacts: the path the PS script printed, else a file that did not exist
+// before the run started. Never silently fall back to an older run's file.
+function resolveRunArtifact({ runRoot, stdout, stdoutLabel, pattern, preexistingNames }) {
+  const fromStdout = parseStdoutArtifactPath(stdout, stdoutLabel);
+  if (fromStdout) return fromStdout;
+
+  const created = listRunArtifactNames(runRoot, pattern).filter((name) => !preexistingNames.has(name));
+  return created.length ? path.join(runRoot, created[created.length - 1]) : null;
+}
+
+const BUILD_PATHS_PATTERN = /^BuildPaths_\d{8}_\d{6}\.txt$/i;
+const COMBINED_SP_PATTERN = /^AllStoredProcedures_\d{8}_\d{6}\.sql$/i;
+
 async function generateObjectScripts({ taskId, profile, selectedObjects, outputBasePath, appTaskMode = "backup" }) {
   const objectListPath = createObjectListFile(taskId || randomUUID(), selectedObjects || []);
   const effectiveOutputBasePath = buildProfileOutputBasePath(outputBasePath, profile?.profileLabel);
   ensureDir(effectiveOutputBasePath);
 
+  const runRoot = buildRunRoot(effectiveOutputBasePath, profile.databaseName);
+  const preexistingBuildPaths = new Set(listRunArtifactNames(runRoot, BUILD_PATHS_PATTERN));
+  const preexistingCombinedSp = new Set(listRunArtifactNames(runRoot, COMBINED_SP_PATTERN));
+
   const args = buildDbObjectsGeneratorArgs(profile, objectListPath, effectiveOutputBasePath, { appTaskMode });
   try {
     const runResult = await runPowerShellFile(DB_OBJECTS_SCRIPT, args);
 
-    const runRoot = buildRunRoot(effectiveOutputBasePath, profile.databaseName);
-    const buildPathFiles = fs.existsSync(runRoot)
-      ? fs
-          .readdirSync(runRoot)
-          .filter((name) => /^BuildPaths_\d{8}_\d{6}\.txt$/i.test(name))
-          .sort()
-      : [];
+    const latestBuildPathFile = resolveRunArtifact({
+      runRoot,
+      stdout: runResult.stdout,
+      stdoutLabel: "BuildPaths file",
+      pattern: BUILD_PATHS_PATTERN,
+      preexistingNames: preexistingBuildPaths,
+    });
 
-    const latestBuildPathFile = buildPathFiles.length ? path.join(runRoot, buildPathFiles[buildPathFiles.length - 1]) : null;
+    if (!latestBuildPathFile) {
+      throw new Error(
+        "Script generation completed but did not produce a fresh BuildPaths manifest for this run. " +
+        "Refusing to reuse artifacts from a previous run."
+      );
+    }
+
+    const combinedStoredProceduresPath = resolveRunArtifact({
+      runRoot,
+      stdout: runResult.stdout,
+      stdoutLabel: "Combined SP file",
+      pattern: COMBINED_SP_PATTERN,
+      preexistingNames: preexistingCombinedSp,
+    });
 
     return {
       objectListPath,
       outputBasePath: effectiveOutputBasePath,
       runRoot,
       latestBuildPathFile,
+      combinedStoredProceduresPath,
       scriptStdout: runResult.stdout,
     };
   } catch (error) {
@@ -270,6 +324,7 @@ function mapFolderTypeToObjectType(folderName) {
   if (name === "sequences") return "SEQUENCE";
   if (name === "user defined types") return "USER_DEFINED_TYPE";
   if (name === "tables") return "TABLE";
+  if (name === "triggers") return "TRIGGER";
   return "OTHER";
 }
 
@@ -393,11 +448,29 @@ async function generateTableDelta({
 
   try {
     const runResult = await runPowerShellFile(TABLE_DELTA_SCRIPT, args);
+    let scriptText = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, "utf8").trim() : "";
+
+    // Optional formatting (Settings → "Format Generated SQL"); best-effort —
+    // the formatter keeps GO batches and falls back to original text on any
+    // batch it cannot parse, so execution behavior is unchanged.
+    try {
+      if (scriptText && getSettings()?.formatting?.formatGeneratedSql) {
+        const { formatGeneratedSql } = require("./formatterService");
+        const formatted = formatGeneratedSql(scriptText);
+        if (formatted !== scriptText) {
+          writeSqlFileSync(outputPath, formatted);
+          scriptText = formatted.trim();
+        }
+      }
+    } catch (_e) {
+      // keep unformatted delta
+    }
+
     return {
       objectListPath,
       outputPath,
       scriptStdout: runResult.stdout,
-      scriptText: fs.existsSync(outputPath) ? fs.readFileSync(outputPath, "utf8").trim() : "",
+      scriptText,
     };
   } catch (error) {
     throw new Error(`Table delta generation failed: ${error.message}`);
@@ -476,6 +549,79 @@ function normalizeModuleBatchHeaders(text, objectType, moduleMetadata = null) {
   return `${effectiveHeaderLines.join("\nGO\n")}\nGO\n${body}`.trim();
 }
 
+function wrapUserDefinedTypeDeploySql(sqlText, lookupName, qualifiedName) {
+  const escapedSql = String(sqlText || "").replace(/'/g, "''");
+  const escapedLookupName = String(lookupName || "").replace(/'/g, "''");
+  const escapedDropSql = `DROP TYPE ${qualifiedName};`.replace(/'/g, "''");
+  return [
+    `DECLARE @PebloyTypeName nvarchar(776) = N'${escapedLookupName}';`,
+    `DECLARE @PebloyTypeDropSql nvarchar(max) = N'${escapedDropSql}';`,
+    "DECLARE @PebloyTypeId int = TYPE_ID(@PebloyTypeName);",
+    "DECLARE @PebloyDependentModules TABLE (",
+    "  schemaName sysname NOT NULL,",
+    "  objectName sysname NOT NULL,",
+    "  objectType char(2) NOT NULL,",
+    "  definition nvarchar(max) NOT NULL,",
+    "  PRIMARY KEY (schemaName, objectName, objectType)",
+    ");",
+    "",
+    "IF @PebloyTypeId IS NOT NULL",
+    "BEGIN",
+    "  INSERT INTO @PebloyDependentModules (schemaName, objectName, objectType, definition)",
+    "  SELECT DISTINCT s.name, o.name, o.type, m.definition",
+    "  FROM (",
+    "    SELECT p.object_id",
+    "    FROM sys.parameters p",
+    "    WHERE p.user_type_id = @PebloyTypeId",
+    "    UNION",
+    "    SELECT sed.referencing_id",
+    "    FROM sys.sql_expression_dependencies sed",
+    "    WHERE sed.referenced_class = 6 AND sed.referenced_id = @PebloyTypeId",
+    "  ) dep",
+    "  INNER JOIN sys.objects o ON o.object_id = dep.object_id",
+    "  INNER JOIN sys.schemas s ON s.schema_id = o.schema_id",
+    "  INNER JOIN sys.sql_modules m ON m.object_id = o.object_id",
+    "  WHERE o.type IN ('P', 'FN', 'IF', 'TF')",
+    "    AND m.definition IS NOT NULL;",
+    "",
+    "  DECLARE @PebloyDropSql nvarchar(max);",
+    "  DECLARE PebloyDropCursor CURSOR LOCAL FAST_FORWARD FOR",
+    "    SELECT CASE WHEN objectType = 'P' THEN N'DROP PROCEDURE ' ELSE N'DROP FUNCTION ' END +",
+    "           QUOTENAME(schemaName) + N'.' + QUOTENAME(objectName) + N';'",
+    "    FROM @PebloyDependentModules",
+    "    ORDER BY CASE WHEN objectType = 'P' THEN 1 ELSE 2 END;",
+    "  OPEN PebloyDropCursor;",
+    "  FETCH NEXT FROM PebloyDropCursor INTO @PebloyDropSql;",
+    "  WHILE @@FETCH_STATUS = 0",
+    "  BEGIN",
+    "    EXEC(@PebloyDropSql);",
+    "    FETCH NEXT FROM PebloyDropCursor INTO @PebloyDropSql;",
+    "  END",
+    "  CLOSE PebloyDropCursor;",
+    "  DEALLOCATE PebloyDropCursor;",
+    "",
+    "  EXEC(@PebloyTypeDropSql);",
+    "END",
+    "",
+    `EXEC(N'${escapedSql}');`,
+    "",
+    "DECLARE @PebloyCreateSql nvarchar(max);",
+    "DECLARE PebloyCreateCursor CURSOR LOCAL FAST_FORWARD FOR",
+    "  SELECT definition",
+    "  FROM @PebloyDependentModules",
+    "  ORDER BY CASE WHEN objectType IN ('FN', 'IF', 'TF') THEN 1 ELSE 2 END;",
+    "OPEN PebloyCreateCursor;",
+    "FETCH NEXT FROM PebloyCreateCursor INTO @PebloyCreateSql;",
+    "WHILE @@FETCH_STATUS = 0",
+    "BEGIN",
+    "  EXEC(@PebloyCreateSql);",
+    "  FETCH NEXT FROM PebloyCreateCursor INTO @PebloyCreateSql;",
+    "END",
+    "CLOSE PebloyCreateCursor;",
+    "DEALLOCATE PebloyCreateCursor;",
+  ].join("\n");
+}
+
 function normalizeExecutableSql(sqlText, objectType, context = {}, options = {}) {
   let text = String(sqlText || "");
   text = normalizeDdlKeywords(text);
@@ -497,31 +643,34 @@ function normalizeExecutableSql(sqlText, objectType, context = {}, options = {})
 
   const { schemaName, objectName } = context;
   if (schemaName && objectName) {
-    const q = `[${String(schemaName).replace(/]/g, "]]")}].[${String(objectName).replace(/]/g, "]]")}]`;
+    const escapedSchemaName = String(schemaName).replace(/]/g, "]]");
+    const escapedObjectName = String(objectName).replace(/]/g, "]]");
+    const q = `[${escapedSchemaName}].[${escapedObjectName}]`;
+    const lookupName = `${String(schemaName).replace(/'/g, "''")}.${String(objectName).replace(/'/g, "''")}`;
 
     if (strategy === "dropCreate") {
       if (type === "VIEW") {
-        text = `IF OBJECT_ID(N'${q}', 'V') IS NOT NULL DROP VIEW ${q};\n${text}`;
+        text = `IF OBJECT_ID(N'${lookupName}', 'V') IS NOT NULL DROP VIEW ${q};\nGO\n${text}`;
       } else if (type === "FUNCTION") {
-        text = `IF OBJECT_ID(N'${q}', 'FN') IS NOT NULL DROP FUNCTION ${q};\nIF OBJECT_ID(N'${q}', 'TF') IS NOT NULL DROP FUNCTION ${q};\nIF OBJECT_ID(N'${q}', 'IF') IS NOT NULL DROP FUNCTION ${q};\n${text}`;
+        text = `IF OBJECT_ID(N'${lookupName}', 'FN') IS NOT NULL DROP FUNCTION ${q};\nIF OBJECT_ID(N'${lookupName}', 'TF') IS NOT NULL DROP FUNCTION ${q};\nIF OBJECT_ID(N'${lookupName}', 'IF') IS NOT NULL DROP FUNCTION ${q};\nGO\n${text}`;
       } else if (type === "TRIGGER") {
-        text = `IF OBJECT_ID(N'${q}', 'TR') IS NOT NULL DROP TRIGGER ${q};\n${text}`;
+        text = `IF OBJECT_ID(N'${lookupName}', 'TR') IS NOT NULL DROP TRIGGER ${q};\nGO\n${text}`;
       } else if (type === "SYNONYM") {
-        text = `IF OBJECT_ID(N'${q}', 'SN') IS NOT NULL DROP SYNONYM ${q};\n${text}`;
+        text = `IF OBJECT_ID(N'${lookupName}', 'SN') IS NOT NULL DROP SYNONYM ${q};\nGO\n${text}`;
       } else if (type === "SEQUENCE") {
-        text = `IF OBJECT_ID(N'${q}', 'SO') IS NOT NULL DROP SEQUENCE ${q};\n${text}`;
+        text = `IF OBJECT_ID(N'${lookupName}', 'SO') IS NOT NULL DROP SEQUENCE ${q};\nGO\n${text}`;
       } else if (type === "USER_DEFINED_TYPE") {
-        text = `IF TYPE_ID('${q}') IS NOT NULL DROP TYPE ${q};\n${text}`;
+        text = wrapUserDefinedTypeDeploySql(text, lookupName, q);
       }
       return text;
     }
 
     if (type === "SYNONYM") {
-      text = `IF OBJECT_ID(N'${q}', 'SN') IS NOT NULL DROP SYNONYM ${q};\n${text}`;
+      text = `IF OBJECT_ID(N'${lookupName}', 'SN') IS NOT NULL DROP SYNONYM ${q};\n${text}`;
     } else if (type === "SEQUENCE") {
-      text = `IF OBJECT_ID(N'${q}', 'SO') IS NOT NULL DROP SEQUENCE ${q};\n${text}`;
+      text = `IF OBJECT_ID(N'${lookupName}', 'SO') IS NOT NULL DROP SEQUENCE ${q};\nGO\n${text}`;
     } else if (type === "USER_DEFINED_TYPE") {
-      text = `IF TYPE_ID('${q}') IS NOT NULL DROP TYPE ${q};\n${text}`;
+      text = wrapUserDefinedTypeDeploySql(text, lookupName, q);
     }
   }
 

@@ -865,6 +865,9 @@ if ($IncludeTriggers) {
 }
 
 $content = Join-Batches $batches
-Set-Content -Path $OutputPath -Value $content -Encoding utf8
+$utf8WithBom = [System.Text.UTF8Encoding]::new($true)
+$contentText = [string]$content
+if (!$contentText.EndsWith("`n")) { $contentText += [Environment]::NewLine }
+[System.IO.File]::WriteAllText($OutputPath, $contentText, $utf8WithBom)
 
 Write-Host "Delta script generated: $OutputPath" -ForegroundColor Green

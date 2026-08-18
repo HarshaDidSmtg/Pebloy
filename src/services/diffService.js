@@ -3,7 +3,16 @@ const { randomUUID } = require("crypto");
 const { createPatch, diffLines } = require("diff");
 const { generateScriptsForProfile, getCodeDiffOutputPaths } = require("./scriptGenerationService");
 const { normalizeDdlKeywords } = require("./scriptAutomationService");
+const { compareGeneratedArtifacts, normalizeEngine, validateGeneratedArtifacts } = require("./dacfxService");
+const { getSettings } = require("./settingsService");
 const { writeReportArtifact } = require("./loggingService");
+
+const DACFX_COMPARE_TIMEOUT_MS = 30000;
+const DACFX_COMPARE_OBJECT_TYPES = new Set(["TABLE", "USER_DEFINED_TYPE"]);
+
+function buildObjectKey(objectType, schemaName, objectName) {
+  return `${String(objectType || "").toUpperCase().trim()}|${String(schemaName || "").trim().toLowerCase()}|${String(objectName || "").trim().toLowerCase()}`;
+}
 
 function escapeHtml(text) {
   return String(text || "")
@@ -117,6 +126,118 @@ function normalizeForCompare(text) {
     .trim();
 }
 
+function scriptsToMap(scripts) {
+  const result = new Map();
+  for (const script of scripts || []) {
+    const key = buildObjectKey(script.objectType, script.schemaName, script.objectName);
+    result.set(key, {
+      objectType: script.objectType,
+      schemaName: script.schemaName,
+      objectName: script.objectName,
+      definition: fs.existsSync(script.scriptPath) ? normalizeDdlKeywords(fs.readFileSync(script.scriptPath, "utf8").trim()) : "",
+    });
+  }
+  return result;
+}
+
+function compareMapsWithSemantic(sourceMap, destinationMap, semanticChanges = []) {
+  const semanticByKey = new Map(
+    (semanticChanges || []).map((change) => [
+      buildObjectKey(change.objectType, change.schemaName, change.objectName),
+      change,
+    ])
+  );
+  const keys = new Set([...sourceMap.keys(), ...destinationMap.keys()]);
+  const details = [];
+  const summary = {
+    added: 0,
+    missing: 0,
+    changed: 0,
+    unchanged: 0,
+  };
+
+  for (const key of keys) {
+    const left = sourceMap.get(key);
+    const right = destinationMap.get(key);
+    const semanticChange = semanticByKey.get(key);
+
+    if (left && !right) {
+      summary.added += 1;
+      details.push({
+        objectType: left.objectType,
+        schemaName: left.schemaName,
+        objectName: left.objectName,
+        status: "Added",
+        diffText: left.definition,
+        sourceDefinition: left.definition || "",
+        destinationDefinition: "",
+        lineDiff: buildSideBySideLines(left.definition, ""),
+        semanticOperation: semanticChange?.operation || "Create",
+      });
+      continue;
+    }
+
+    if (!left && right) {
+      summary.missing += 1;
+      details.push({
+        objectType: right.objectType,
+        schemaName: right.schemaName,
+        objectName: right.objectName,
+        status: "Missing",
+        diffText: right.definition,
+        sourceDefinition: "",
+        destinationDefinition: right.definition || "",
+        lineDiff: buildSideBySideLines("", right.definition),
+        semanticOperation: "Drop",
+      });
+      continue;
+    }
+
+    if (semanticChange) {
+      summary.changed += 1;
+      details.push({
+        objectType: left.objectType,
+        schemaName: left.schemaName,
+        objectName: left.objectName,
+        status: "Changed",
+        diffText: createPatch(
+          `${left.schemaName}.${left.objectName}`,
+          left.definition || "",
+          right.definition || "",
+          "source",
+          "destination"
+        ),
+        sourceDefinition: left.definition || "",
+        destinationDefinition: right.definition || "",
+        lineDiff: buildSideBySideLines(left.definition || "", right.definition || ""),
+        semanticOperation: semanticChange.operation,
+      });
+      continue;
+    }
+
+    summary.unchanged += 1;
+    details.push({
+      objectType: left.objectType,
+      schemaName: left.schemaName,
+      objectName: left.objectName,
+      status: "Unchanged",
+      diffText: "",
+      sourceDefinition: left.definition || "",
+      destinationDefinition: right.definition || "",
+      lineDiff: [],
+      semanticOperation: "None",
+    });
+  }
+
+  details.sort((a, b) => {
+    if (a.objectType !== b.objectType) return a.objectType.localeCompare(b.objectType);
+    if (a.schemaName !== b.schemaName) return a.schemaName.localeCompare(b.schemaName);
+    return a.objectName.localeCompare(b.objectName);
+  });
+
+  return { summary, details };
+}
+
 function compareMaps(sourceMap, destinationMap) {
   const keys = new Set([...sourceMap.keys(), ...destinationMap.keys()]);
   const details = [];
@@ -221,9 +342,9 @@ function filterMapBySelection(map, selectedObjects = []) {
     const name = String(item.objectName || "").trim();
     if (!schema || !name) continue;
     if (type) {
-      fullKeys.add(`${type}|${schema}|${name}`);
+      fullKeys.add(buildObjectKey(type, schema, name));
     } else {
-      partialKeys.add(`${schema}|${name}`);
+      partialKeys.add(`${schema.toLowerCase()}|${name.toLowerCase()}`);
     }
   }
 
@@ -239,12 +360,43 @@ function filterMapBySelection(map, selectedObjects = []) {
   );
 }
 
+function withTimeout(promise, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    const timeoutHandle = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs} ms`));
+    }, timeoutMs);
+
+    Promise.resolve(promise)
+      .then((result) => {
+        clearTimeout(timeoutHandle);
+        resolve(result);
+      })
+      .catch((error) => {
+        clearTimeout(timeoutHandle);
+        reject(error);
+      });
+  });
+}
+
+function shouldUseDacFxCompare(requestedEngine, selectedObjects = []) {
+  if (requestedEngine !== "DacFx") {
+    return false;
+  }
+
+  return (selectedObjects || []).some((item) =>
+    DACFX_COMPARE_OBJECT_TYPES.has(String(item.objectType || "").toUpperCase().trim())
+  );
+}
+
 async function compareObjects(sourceProfile, destinationProfile, selectedObjects = [], options = {}) {
   if (!selectedObjects.length) {
     throw new Error("Select at least one object before running CodeDiff.");
   }
 
   const taskId = options.taskId || randomUUID();
+  const requestedEngine = normalizeEngine(options.engine);
+  const useDacFxCompare = shouldUseDacFxCompare(requestedEngine, selectedObjects);
+  const engine = useDacFxCompare ? "DacFx" : "Legacy";
   const { sourceOut, destOut } = getCodeDiffOutputPaths(taskId);
   const onProgress = typeof options.onProgress === "function" ? options.onProgress : () => {};
 
@@ -259,33 +411,74 @@ async function compareObjects(sourceProfile, destinationProfile, selectedObjects
     throw new Error(`Script generation failed: ${error.message}`);
   }
 
-  function scriptsToMap(scripts) {
-    const m = new Map();
-    for (const s of scripts) {
-      const key = `${s.objectType}|${s.schemaName}|${s.objectName}`;
-      m.set(key, {
-        objectType: s.objectType,
-        schemaName: s.schemaName,
-        objectName: s.objectName,
-        definition: fs.existsSync(s.scriptPath) ? normalizeDdlKeywords(fs.readFileSync(s.scriptPath, "utf8").trim()) : "",
-      });
-    }
-    return m;
-  }
-
   const sourceMap = scriptsToMap(sourceGenerated.scripts);
   const destMap = scriptsToMap(destinationGenerated.scripts);
 
-  onProgress({ taskType: "Diff", key: "diff", operation: "Comparing object definitions...", percent: 75 });
+  let dacfxValidation = { enabled: false };
+  if (getSettings().dacfx?.validationEnabled) {
+    onProgress({ taskType: "Diff", key: "diff", operation: "Validating generated scripts with DacFx...", percent: 55 });
+    const [sourceValidation, destinationValidation] = await Promise.all([
+      validateGeneratedArtifacts({ taskId: `${taskId}_src_validate`, scripts: sourceGenerated.scripts }),
+      validateGeneratedArtifacts({ taskId: `${taskId}_dst_validate`, scripts: destinationGenerated.scripts }),
+    ]);
+    dacfxValidation = {
+      enabled: true,
+      source: sourceValidation,
+      destination: destinationValidation,
+    };
+  }
 
-  const compared = compareMaps(
-    filterMapBySelection(sourceMap, selectedObjects),
-    filterMapBySelection(destMap, selectedObjects)
-  );
+  onProgress({
+    taskType: "Diff",
+    key: "diff",
+    operation: engine === "DacFx" ? "Running DacFx semantic compare..." : "Comparing object definitions...",
+    percent: 75,
+  });
+
+  const filteredSourceMap = filterMapBySelection(sourceMap, selectedObjects);
+  const filteredDestMap = filterMapBySelection(destMap, selectedObjects);
+  let compared;
+  let semanticCompare = null;
+  let semanticAlerts = [];
+  let semanticWarnings = [];
+
+  if (requestedEngine === "DacFx" && !useDacFxCompare) {
+    semanticWarnings.push(
+      "DacFx semantic compare was skipped for a non-table selection to keep CodeDiff responsive; returning fresh-script textual diff."
+    );
+  }
+
+  if (useDacFxCompare) {
+    try {
+      semanticCompare = await withTimeout(
+        compareGeneratedArtifacts({
+          taskId,
+          sourceScripts: sourceGenerated.scripts,
+          destinationProfile,
+        }),
+        DACFX_COMPARE_TIMEOUT_MS,
+        "DacFx semantic compare"
+      );
+      semanticAlerts = semanticCompare.alerts || [];
+      semanticWarnings = semanticCompare.warnings || [];
+      compared = compareMapsWithSemantic(filteredSourceMap, filteredDestMap, semanticCompare.changes || []);
+    } catch (error) {
+      semanticWarnings = [
+        `DacFx semantic compare failed; returning fresh-script textual diff instead: ${error.message}`,
+      ];
+      compared = compareMaps(filteredSourceMap, filteredDestMap);
+    }
+  } else {
+    compared = compareMaps(filteredSourceMap, filteredDestMap);
+  }
 
   onProgress({ taskType: "Diff", key: "diff", operation: "Preparing diff results...", percent: 95 });
   return {
     ...compared,
+    engine,
+    dacfxValidation,
+    semanticAlerts,
+    semanticWarnings,
     generationWarnings: [
       ...(sourceGenerated.generationWarnings || []).map((warning) => ({ ...warning, profileRole: "source" })),
       ...(destinationGenerated.generationWarnings || []).map((warning) => ({ ...warning, profileRole: "destination" })),

@@ -32,7 +32,7 @@
     "prebuild": "node scripts/prebuild-win.js",
     "build": "electron-builder --win",
     "build:dir": "electron-builder --win --dir",
-    "check": "node --check src/server.js && node --check src/services/backupService.js && node --check src/services/deploymentService.js && node --check src/services/diffService.js && node --check src/services/loggingService.js && node --check src/services/profileService.js && node --check src/services/scriptAutomationService.js && node --check src/services/secretStore.js && node --check src/services/sqlService.js && node --check src/services/storage.js && node --check src/services/systemService.js && node --check src/electron/main.js && node --check public/app.js && node --check public/manualEntryEditor.js",
+    "check": "node --check src/server.js && node --check src/services/backupService.js && node --check src/services/deploymentService.js && node --check src/services/diffService.js && node --check src/services/loggingService.js && node --check src/services/profileService.js && node --check src/services/scriptAutomationService.js && node --check src/services/secretStore.js && node --check src/services/settingsService.js && node --check src/services/sqlService.js && node --check src/services/storage.js && node --check src/services/systemService.js && node --check src/electron/main.js && node --check public/app.js && node --check public/formatterWorkbench.js && node --check public/manualEntryEditor.js",
     "test": "jest"
   },
   "dependencies": {

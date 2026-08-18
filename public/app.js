@@ -12,11 +12,14 @@ const enhancedTextEditors = new Map();
 const DEFAULT_TAB = "credentials";
 const _profileHealth = new Map(); // profileId → { status: 'ok'|'error'|'unknown', testedAt: ISO|null }
 let _lastDeployResults = []; // for retry failed
+let _profileSort = { col: "profileLabel", dir: "asc" };
 let _selectionSort  = { col: null, dir: "asc" };
 let _discoveredSort = { col: null, dir: "asc" };
 let _discoverPage = 1;
 const DISCOVER_PAGE_SIZE = 50;
 let _logSort = { col: "startedAt", dir: "desc" };
+let _deployResultSort = { col: null, dir: "asc" };
+const dependencyFetchCache = new Map();
 const editorHelpers = globalThis.PebloyEditorHelpers || {
   normalizeFindMatchIndex(matchIdx, matchCount) {
     if (!matchCount) return -1;
@@ -43,38 +46,50 @@ const editorHelpers = globalThis.PebloyEditorHelpers || {
       toastMessage: hadSelection ? "Cleared object selection" : "Ready for manual object entry",
     };
   },
-  getManualEntryPlaceholderText(shortcuts = {}) {
-    const resolveObjects = shortcuts.resolveObjects || "Ctrl+D";
-    const findInEditor = shortcuts.findInEditor || "Ctrl+F";
-    const replaceInEditor = shortcuts.replaceInEditor || "Ctrl+H";
-    const uppercaseText = shortcuts.uppercaseText || "Ctrl+Shift+U";
-    const lowercaseText = shortcuts.lowercaseText || "Ctrl+Shift+L";
-    return [
-      "Paste schema.name or object name (one per line)",
-      "Example: dbo.MyProc",
-      "         vw_Orders",
-      "         reporting.usp_get_summary",
-      "",
-      `Shortcuts: ${resolveObjects} = Resolve & Add  ·  ${findInEditor} = Find  ·  ${replaceInEditor} = Replace  ·  ${uppercaseText} = UPPER  ·  ${lowercaseText} = lower`,
-    ].join("\n");
-  },
-  getManualEntryHelperText(shortcuts = {}) {
-    const resolveObjects = shortcuts.resolveObjects || "Ctrl+D";
-    const findInEditor = shortcuts.findInEditor || "Ctrl+F";
-    const replaceInEditor = shortcuts.replaceInEditor || "Ctrl+H";
-    const uppercaseText = shortcuts.uppercaseText || "Ctrl+Shift+U";
-    const lowercaseText = shortcuts.lowercaseText || "Ctrl+Shift+L";
-    return `One object per line. Use schema.name when names are ambiguous. Shortcuts: ${resolveObjects} Resolve & Add, ${findInEditor} Find, ${replaceInEditor} Replace, ${uppercaseText} UPPER, ${lowercaseText} lower.`;
-  },
 };
 
 function sortObjects(objects, { col, dir }) {
   if (!col) return objects;
   return [...objects].sort((a, b) => {
-    let av, bv;
+    let av = "";
+    let bv = "";
+    if (col === "type")     { av = a.objectType   || ""; bv = b.objectType   || ""; }
+    if (col === "object")   { av = `${a.schemaName || ""}.${a.objectName || ""}`; bv = `${b.schemaName || ""}.${b.objectName || ""}`; }
     if (col === "created")  { av = a.createdDate  || ""; bv = b.createdDate  || ""; }
     if (col === "modified") { av = a.modifiedDate || ""; bv = b.modifiedDate || ""; }
-    const cmp = String(av).localeCompare(String(bv));
+    const cmp = String(av).localeCompare(String(bv), undefined, { sensitivity: "base", numeric: true });
+    return dir === "asc" ? cmp : -cmp;
+  });
+}
+
+function sortProfiles(profiles, { col, dir }) {
+  if (!col) return profiles;
+  return [...profiles].sort((a, b) => {
+    const valueFor = (profile) => {
+      if (col === "profileLabel") return profile.profileLabel || "";
+      if (col === "serverName") return profile.serverName || "";
+      if (col === "databaseName") return profile.databaseName || "";
+      if (col === "authenticationType") return formatAuthenticationTypeLabel(profile.authenticationType);
+      if (col === "environmentTag") return profile.environmentTag || "";
+      return "";
+    };
+    const cmp = String(valueFor(a)).localeCompare(String(valueFor(b)), undefined, { sensitivity: "base", numeric: true });
+    return dir === "asc" ? cmp : -cmp;
+  });
+}
+
+function sortDeployResults(items, { col, dir }) {
+  if (!col) return items;
+  return [...items].sort((a, b) => {
+    const valueFor = (item) => {
+      if (col === "type") return item.objectType || "";
+      if (col === "object") return `${item.schemaName || ""}.${item.objectName || ""}`;
+      if (col === "action") return item.action || "";
+      if (col === "status") return item.status || "";
+      if (col === "error") return item.errorMessage || "";
+      return "";
+    };
+    const cmp = String(valueFor(a)).localeCompare(String(valueFor(b)), undefined, { sensitivity: "base", numeric: true });
     return dir === "asc" ? cmp : -cmp;
   });
 }
@@ -91,6 +106,9 @@ function sortLogs(logs, { col, dir }) {
     } else if (col === "status") {
       av = a.status || "";
       bv = b.status || "";
+    } else if (col === "eventLevel") {
+      av = a.highestLevel || "";
+      bv = b.highestLevel || "";
     } else if (col === "connectionFlow") {
       av = `${a.sourceProfileLabel || ""}${a.destinationProfileLabel ? ` -> ${a.destinationProfileLabel}` : ""}`;
       bv = `${b.sourceProfileLabel || ""}${b.destinationProfileLabel ? ` -> ${b.destinationProfileLabel}` : ""}`;
@@ -164,17 +182,19 @@ function renderShortcutBadges() {
 
   // Update the Specify textarea placeholder with the current shortcut
   const ta = document.getElementById("sharedObjectText");
-  if (ta) {
-    const placeholder = editorHelpers.getManualEntryPlaceholderText
-      ? editorHelpers.getManualEntryPlaceholderText(sc)
-      : ta.placeholder;
+  if (ta && sc.resolveObjects) {
+    const placeholder =
+      "Paste schema.name (one per line)\n" +
+      "Example: dbo.MyProc\n" +
+      "         dbo.vw_Orders\n" +
+      "         reporting.usp_get_summary\n\n" +
+      `Shortcuts: ${sc.resolveObjects} = Resolve & Add  ·  ` +
+      `${sc.findInEditor || "Ctrl+F"} = Find  ·  ` +
+      `${sc.replaceInEditor || "Ctrl+H"} = Replace  ·  ` +
+      `${sc.uppercaseText || "Ctrl+Shift+U"} = UPPER  ·  ` +
+      `${sc.lowercaseText || "Ctrl+Shift+L"} = lower`;
     ta.placeholder = placeholder;
     getEnhancedTextEditor("sharedObjectText")?.updatePlaceholder?.(placeholder);
-  }
-
-  const editorHelp = document.getElementById("sharedObjectEditorHelp");
-  if (editorHelp && editorHelpers.getManualEntryHelperText) {
-    editorHelp.textContent = editorHelpers.getManualEntryHelperText(sc);
   }
 }
 
@@ -222,8 +242,8 @@ function getSharedObjectTextValue() {
   return getTextEditorValue("sharedObjectText");
 }
 
-function setSharedObjectTextValue(value, { emit = false } = {}) {
-  setTextEditorValue("sharedObjectText", value, { emit });
+function setSharedObjectTextValue(value, options) {
+  setTextEditorValue("sharedObjectText", value, options);
 }
 
 function focusSharedObjectEntry() {
@@ -272,6 +292,10 @@ async function setupEnhancedTextEditors() {
 
 function getElectronApi() {
   return typeof window !== "undefined" ? window.electronAPI : null;
+}
+
+function getFormatterWorkbench() {
+  return globalThis.pebloyFormatterWorkbench || null;
 }
 
 async function chooseTextFile(options = {}) {
@@ -365,7 +389,8 @@ function showToast(message, isError = false) {
   }
 
   toast.textContent = message + (isError ? "  ✕" : "");
-  toast.style.background = isError ? "#a3142f" : "#0f2f2f";
+  toast.classList.toggle("toast-error", isError);
+  toast.classList.toggle("toast-success", !isError);
   toast.classList.add("visible");
 
   if (isError) {
@@ -390,14 +415,17 @@ function showToast(message, isError = false) {
 }
 
 function setButtonLoading(button, loadingText) {
-  const originalText = button.textContent;
+  const originalHtml = button.innerHTML;
   button.disabled = true;
   button.classList.add("btn-loading");
-  button.textContent = loadingText;
+  button.dataset.loadingLabel = loadingText;
+  button.setAttribute("aria-busy", "true");
   return () => {
     button.disabled = false;
     button.classList.remove("btn-loading");
-    button.textContent = originalText;
+    button.removeAttribute("aria-busy");
+    delete button.dataset.loadingLabel;
+    button.innerHTML = originalHtml;
   };
 }
 
@@ -504,8 +532,8 @@ function collectCurrentAppState() {
       notificationsEnabled: Boolean($("notificationsToggle")?.checked),
       defaultBackupPath: $("defaultBackupPath")?.value.trim() || "",
       defaultScriptPath: $("defaultScriptPath")?.value.trim() || "",
-      theme: document.body.dataset.theme || "dark",
-      fontFamily: $("fontSelector")?.value || "Space Grotesk",
+      theme: document.body.dataset.theme || "azure",
+      fontFamily: $("fontSelector")?.value || "Segoe UI",
       fontSize: Number($("fontSizeRange")?.value || 14),
       logLevel: $("logLevelSelect")?.value || "Normal",
       hiddenTabs: Array.from(document.querySelectorAll(".tab[data-tab].hidden")).map((b) => b.dataset.tab),
@@ -519,15 +547,18 @@ function collectCurrentAppState() {
       sharedSelectedObjects: cloneJson(sharedSelectedObjects),
       diffSourceProfileId: $("diffSourceProfile")?.value || "",
       diffDestProfileId: $("diffDestProfile")?.value || "",
+      diffEngine: $("diffEngine")?.value || "DacFx",
       diffExportFormat: $("diffExportFormat")?.value || "md",
       backupProfileId: $("backupProfile")?.value || "",
       backupPath: $("backupPath")?.value.trim() || "",
       deploySourceProfileId: $("deploySourceProfile")?.value || "",
       deployDestProfileId: $("deployDestProfile")?.value || "",
+      deployEngine: $("deployEngine")?.value || "DacFx",
       deployMode: $("deployMode")?.value || "ExecuteDirectly",
       deployScriptPath: $("deployScriptPath")?.value.trim() || "",
       continueOnError: Boolean($("continueOnError")?.checked),
       allowSameSource: Boolean($("allowSameSource")?.checked),
+      formatter: cloneJson(getFormatterWorkbench()?.getPersistedState?.() || appState?.ui?.formatter || {}),
     },
   };
 }
@@ -559,6 +590,7 @@ function applyPersistedUiState() {
 
     if ($("diffSourceProfile")) $("diffSourceProfile").value = ui.diffSourceProfileId || "";
     if ($("diffDestProfile")) $("diffDestProfile").value = ui.diffDestProfileId || "";
+    if ($("diffEngine")) $("diffEngine").value = ui.diffEngine || "DacFx";
     if ($("diffExportFormat")) $("diffExportFormat").value = ui.diffExportFormat || "md";
 
     if ($("backupProfile")) $("backupProfile").value = ui.backupProfileId || "";
@@ -568,6 +600,10 @@ function applyPersistedUiState() {
 
     if ($("deploySourceProfile")) $("deploySourceProfile").value = ui.deploySourceProfileId || "";
     if ($("deployDestProfile")) $("deployDestProfile").value = ui.deployDestProfileId || "";
+    if ($("deployEngine")) {
+      $("deployEngine").value = ui.deployEngine || "DacFx";
+      $("deployEngine").dispatchEvent(new Event("change"));
+    }
     if ($("deployMode")) {
       $("deployMode").value = ui.deployMode || "ExecuteDirectly";
       $("deployMode").dispatchEvent(new Event("change"));
@@ -577,6 +613,8 @@ function applyPersistedUiState() {
     }
     if ($("continueOnError")) $("continueOnError").checked = Boolean(ui.continueOnError);
     if ($("allowSameSource")) $("allowSameSource").checked = Boolean(ui.allowSameSource);
+
+    getFormatterWorkbench()?.applyPersistedState?.(ui.formatter || {});
 
     applyTabVisibility(prefs.hiddenTabs || []);
     if (ui.activeTab) setActiveTab(ui.activeTab);
@@ -592,10 +630,12 @@ function bindAppStatePersistence() {
     "objectsMode",
     "diffSourceProfile",
     "diffDestProfile",
+    "diffEngine",
     "diffExportFormat",
     "backupProfile",
     "deploySourceProfile",
     "deployDestProfile",
+    "deployEngine",
     "deployMode",
     "continueOnError",
     "allowSameSource",
@@ -726,9 +766,9 @@ function endTaskProgress(key, ok, label) {
   bar.style.width = "100%";
   text.textContent = ok ? `${label} completed` : `${label} failed`;
   if (!ok) {
-    bar.style.background = "linear-gradient(90deg, #c1121f, #ef233c)";
+    bar.style.background = "var(--danger)";
   } else {
-    bar.style.background = "linear-gradient(90deg, var(--accent), var(--accent-2))";
+    bar.style.background = "var(--accent)";
   }
 }
 
@@ -744,7 +784,7 @@ function resetTaskProgress(key) {
 
   bar.classList.remove("is-indeterminate");
   bar.style.width = "0%";
-  bar.style.background = "linear-gradient(90deg, var(--accent), var(--accent-2))";
+  bar.style.background = "var(--accent)";
   text.textContent = "Idle";
 }
 
@@ -757,7 +797,8 @@ function normalizeObject(item) {
 }
 
 function objectKey(item) {
-  return `${item.objectType}|${item.schemaName}|${item.objectName}`;
+  const normalized = normalizeObject(item);
+  return `${normalized.objectType}|${normalized.schemaName.toLowerCase()}|${normalized.objectName.toLowerCase()}`;
 }
 
 function dedupeObjects(items) {
@@ -772,6 +813,16 @@ function dedupeObjects(items) {
     out.push({ ...raw, ...normalized });
   }
   return out;
+}
+
+function objectOrigin(item) {
+  return String(item?.origin || item?.selectionOrigin || "original").toLowerCase() === "dependency"
+    ? "dependency"
+    : "original";
+}
+
+function objectOriginLabel(item) {
+  return objectOrigin(item) === "dependency" ? "Imported Dependency" : "Original";
 }
 
 function parseObjectLines(text) {
@@ -809,6 +860,63 @@ function padDatePart(value) {
   return String(value).padStart(2, "0");
 }
 
+// When null, dates render in the machine's local timezone (Use System Time).
+// Set from settings to render every timestamp in the configured timezone.
+let activeTimeZone = null;
+
+// One "Format Generated SQL" preference drives the Settings toggle and the
+// per-mode checkboxes on Deployment and Code Diff. Backup uses a three-state
+// dropdown instead: its off/format states mirror the shared preference, while
+// "Format & Execute in Source" is a per-run choice that never persists.
+const FORMAT_SQL_CONTROL_IDS = ["formatGeneratedSqlToggle", "formatSqlDeploy", "formatSqlDiff"];
+
+function applyFormattingSettings(formatting) {
+  const enabled = Boolean(formatting?.formatGeneratedSql);
+  for (const id of FORMAT_SQL_CONTROL_IDS) {
+    const el = $(id);
+    if (el) el.checked = enabled;
+  }
+  const backupMode = $("backupFormatMode");
+  if (backupMode && backupMode.value !== "formatExecute") {
+    backupMode.value = enabled ? "format" : "off";
+  }
+}
+
+function isFormatGeneratedSqlEnabled() {
+  return Boolean($("formatGeneratedSqlToggle")?.checked);
+}
+
+function setupFormatSqlCheckboxes() {
+  const persistFormatting = async (enabled) => {
+    applyFormattingSettings({ formatGeneratedSql: enabled });
+    try {
+      await api("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify({ formatting: { formatGeneratedSql: enabled } }),
+      });
+    } catch (error) {
+      showToast("Failed to save formatting preference: " + error.message, true);
+    }
+  };
+
+  for (const id of FORMAT_SQL_CONTROL_IDS) {
+    const el = $(id);
+    if (!el) continue;
+    el.addEventListener("change", () => persistFormatting(el.checked));
+  }
+
+  const backupMode = $("backupFormatMode");
+  if (backupMode) {
+    backupMode.addEventListener("change", () => {
+      // "formatExecute" is a per-run backup choice; only the off/format
+      // states feed the shared Format Generated SQL preference.
+      if (backupMode.value !== "formatExecute") {
+        persistFormatting(backupMode.value === "format");
+      }
+    });
+  }
+}
+
 function formatDateParts(value) {
   if (value === null || value === undefined || value === "" || (typeof value === "object" && !(value instanceof Date))) {
     return null;
@@ -817,6 +925,24 @@ function formatDateParts(value) {
   const date = new Date(value);
   if (isNaN(date.getTime())) {
     return null;
+  }
+
+  if (activeTimeZone) {
+    try {
+      const formatter = new Intl.DateTimeFormat("en-GB", {
+        timeZone: activeTimeZone,
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit",
+        hourCycle: "h23",
+      });
+      const p = {};
+      for (const part of formatter.formatToParts(date)) {
+        if (part.type !== "literal") p[part.type] = part.value;
+      }
+      return { dd: p.day, mm: p.month, yyyy: p.year, hh: p.hour, mi: p.minute, ss: p.second };
+    } catch (_e) {
+      // Invalid zone — fall through to local time
+    }
   }
 
   return {
@@ -831,12 +957,162 @@ function formatDateParts(value) {
 
 function formatDate(d) {
   const parts = formatDateParts(d);
-  return parts ? `${parts.dd}:${parts.mm}:${parts.yyyy}` : "—";
+  return parts ? `${parts.dd}/${parts.mm}/${parts.yyyy}` : "—";
 }
 
 function formatDateTime(d) {
   const parts = formatDateParts(d);
-  return parts ? `${parts.dd}:${parts.mm}:${parts.yyyy} ${parts.hh}:${parts.mi}:${parts.ss}` : "—";
+  return parts ? `${parts.dd}/${parts.mm}/${parts.yyyy} ${parts.hh}:${parts.mi}:${parts.ss}` : "—";
+}
+
+function parseDateMs(value) {
+  if (value === null || value === undefined || value === "" || (typeof value === "object" && !(value instanceof Date))) {
+    return null;
+  }
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return null;
+
+  // SQL/JSON placeholder values such as 0 or 1970-01-01 are not meaningful
+  // object modified dates and should never stretch the dependency window back
+  // to 1969 after the one-day buffer is applied.
+  const earliestMeaningfulDate = Date.UTC(1990, 0, 1);
+  return timestamp >= earliestMeaningfulDate ? timestamp : null;
+}
+
+function buildDependencyTimeWindow(objects) {
+  const modifiedTimestamps = (objects || [])
+    .map((item) => parseDateMs(item.modifiedDate))
+    .filter((timestamp) => timestamp !== null);
+  if (!modifiedTimestamps.length) return null;
+
+  const oneDayMs = 24 * 60 * 60 * 1000;
+  const minDate = new Date(Math.min(...modifiedTimestamps) - oneDayMs);
+  const maxDate = new Date(Math.max(...modifiedTimestamps));
+  return { minDate, maxDate };
+}
+
+function isWithinDependencyTimeWindow(item, timeWindow) {
+  if (!timeWindow) return true;
+  const modified = parseDateMs(item.modifiedDate);
+  if (modified === null) return false;
+  return modified >= timeWindow.minDate.getTime() && modified <= timeWindow.maxDate.getTime();
+}
+
+function getDependencyParentRefs(item) {
+  const refs = [];
+  if (Array.isArray(item?.parentObjects)) {
+    for (const parent of item.parentObjects) {
+      const normalized = normalizeObject(parent);
+      if (normalized.schemaName && normalized.objectName) refs.push(normalized);
+    }
+  }
+
+  if (item?.parentSchemaName && item?.parentObjectName) {
+    refs.push(normalizeObject({
+      objectType: item.parentObjectType || "",
+      schemaName: item.parentSchemaName,
+      objectName: item.parentObjectName,
+    }));
+  }
+
+  return refs.filter((ref, index, all) =>
+    all.findIndex((candidate) => objectKey(candidate) === objectKey(ref)) === index
+  );
+}
+
+function formatDependencyParentRefs(item) {
+  const refs = getDependencyParentRefs(item);
+  return refs.length
+    ? refs.map((ref) => `${ref.schemaName}.${ref.objectName}`).join(", ")
+    : "—";
+}
+
+function mergeDependencyCandidates(items) {
+  const byKey = new Map();
+  for (const raw of items || []) {
+    const normalized = normalizeObject(raw);
+    if (!normalized.objectType || !normalized.schemaName || !normalized.objectName) continue;
+    const key = objectKey(normalized);
+    const existing = byKey.get(key);
+    const parentObjects = [
+      ...(existing?.parentObjects || []),
+      ...getDependencyParentRefs(raw),
+    ];
+    const mergedParents = parentObjects.filter((ref, index, all) =>
+      all.findIndex((candidate) => objectKey(candidate) === objectKey(ref)) === index
+    );
+
+    byKey.set(key, {
+      ...(existing || {}),
+      ...raw,
+      ...normalized,
+      parentObjects: mergedParents,
+    });
+  }
+  return [...byKey.values()];
+}
+
+function dependencyRootKey(item) {
+  const normalized = normalizeObject(item);
+  return `${normalized.objectType}|${normalized.schemaName.toLowerCase()}|${normalized.objectName.toLowerCase()}`;
+}
+
+function getDependencyProfileCache(profileId) {
+  const key = String(profileId || "");
+  if (!dependencyFetchCache.has(key)) {
+    dependencyFetchCache.set(key, {
+      all: { processedRoots: new Set(), rowsByRoot: new Map() },
+      window: { processedRoots: new Set(), rowsByRoot: new Map() },
+    });
+  }
+  return dependencyFetchCache.get(key);
+}
+
+function clearDependencyProfileCache(profileId) {
+  dependencyFetchCache.delete(String(profileId || ""));
+}
+
+function dependencyWindowKey(timeWindow) {
+  if (!timeWindow) return "no-window";
+  return `${timeWindow.minDate.toISOString()}|${timeWindow.maxDate.toISOString()}`;
+}
+
+function getDependencyScopeCache(profileCache, scope, timeWindow) {
+  if (scope === "allDependencies") return profileCache.all;
+  return profileCache.window;
+}
+
+function getDependencyRowsForRoot(scopeCache, root) {
+  return scopeCache.rowsByRoot.get(dependencyRootKey(root)) || [];
+}
+
+function setDependencyRowsForRoot(scopeCache, root, rows) {
+  const rootKey = dependencyRootKey(root);
+  scopeCache.processedRoots.add(rootKey);
+  scopeCache.rowsByRoot.set(rootKey, mergeDependencyCandidates(rows));
+}
+
+function collectDependencyRows(scopeCache, roots) {
+  return mergeDependencyCandidates((roots || []).flatMap((root) => getDependencyRowsForRoot(scopeCache, root)));
+}
+
+function groupDependencyRowsByParent(rows, roots) {
+  const rootKeySet = new Set((roots || []).map((root) => dependencyRootKey(root)));
+  const rowsByRoot = new Map();
+  for (const row of rows || []) {
+    const parents = getDependencyParentRefs(row).filter((parent) => rootKeySet.has(dependencyRootKey(parent)));
+    for (const parent of parents) {
+      const key = dependencyRootKey(parent);
+      if (!rowsByRoot.has(key)) rowsByRoot.set(key, []);
+      rowsByRoot.get(key).push(row);
+    }
+  }
+  return rowsByRoot;
+}
+
+function filterObjectsNotInSelection(items, selectedObjects) {
+  const selectedKeys = new Set((selectedObjects || []).map((item) => objectKey(normalizeObject(item))));
+  return mergeDependencyCandidates(items || []).filter((item) => !selectedKeys.has(objectKey(item)));
 }
 
 function formatTimeOnly(d) {
@@ -887,12 +1163,13 @@ function exportSharedSelectionList() {
 
   const csvEscape = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
   const lines = [
-    ["Type", "Object", "Created", "Modified"],
+    ["Type", "Object", "Created", "Modified", "Origin"],
     ...sorted.map((item) => [
       item.objectType || "",
       `${item.schemaName || ""}.${item.objectName || ""}`.replace(/^\./, ""),
       formatDateTime(item.createdDate),
       formatDateTime(item.modifiedDate),
+      objectOriginLabel(item),
     ]),
   ].map((row) => row.map(csvEscape).join(",")).join("\n");
 
@@ -910,6 +1187,7 @@ function setupPanelToggles({ maximizeToggleId, wrapperId, bodyId, focusTargetId 
   const maximizeToggle = $(maximizeToggleId);
   const wrap = $(wrapperId);
   const body = $(bodyId);
+  const focusTarget = focusTargetId ? $(focusTargetId) : null;
   if (!maximizeToggle || !wrap || !body) return;
 
   const syncState = () => {
@@ -938,11 +1216,8 @@ function setupPanelToggles({ maximizeToggleId, wrapperId, bodyId, focusTargetId 
     if (shouldMaximize) {
       if (focusTargetId === "sharedObjectText" || focusTargetId === "sharedObjectEditor") {
         focusSharedObjectEntry();
-      } else {
-        const focusTarget = focusTargetId ? $(focusTargetId) : null;
-        if (focusTarget && typeof focusTarget.focus === "function") {
-          focusTarget.focus({ preventScroll: true });
-        }
+      } else if (focusTarget && typeof focusTarget.focus === "function") {
+        focusTarget.focus({ preventScroll: true });
       }
     }
   });
@@ -964,6 +1239,9 @@ function tabInit() {
       document.querySelectorAll(".panel").forEach((x) => x.classList.remove("active"));
       button.classList.add("active");
       $(`tab-${button.dataset.tab}`).classList.add("active");
+      if (button.dataset.tab === "formatter") {
+        requestAnimationFrame(() => getFormatterWorkbench()?.layout?.());
+      }
     });
   });
 }
@@ -1072,7 +1350,8 @@ function _timeAgo(iso) {
 }
 
 function renderProfilesTable(profiles, page = 1, pageSize = 20) {
-  const { items, pages } = paginate(profiles, page, pageSize);
+  const sortedProfiles = sortProfiles(profiles, _profileSort);
+  const { items, pages } = paginate(sortedProfiles, page, pageSize);
   const rows = items
     .map(
       (p) => `<tr>
@@ -1100,12 +1379,27 @@ function renderProfilesTable(profiles, page = 1, pageSize = 20) {
     paginationHtml += `</div>`;
   }
 
+  const sortArrow = (col) => _profileSort.col === col ? (_profileSort.dir === "asc" ? " ↑" : " ↓") : "";
+  const profileSortHeader = (col, label) => `<th data-sort-profile="${col}" style="cursor:pointer;user-select:none">${label}${sortArrow(col)}</th>`;
+
   $("profilesTable").innerHTML = `
 <table class='table'>
-<thead><tr><th>Connection Alias</th><th>SQL Server</th><th>Database</th><th>Authentication</th><th>Environment</th><th>Actions</th></tr></thead>
+<thead><tr>${profileSortHeader("profileLabel", "Connection Alias")}${profileSortHeader("serverName", "SQL Server")}${profileSortHeader("databaseName", "Database")}${profileSortHeader("authenticationType", "Authentication")}${profileSortHeader("environmentTag", "Environment")}<th>Actions</th></tr></thead>
 <tbody>${rows}</tbody>
 </table>
 ${paginationHtml}`;
+
+  document.querySelectorAll("[data-sort-profile]").forEach((th) => {
+    th.onclick = () => {
+      const col = th.dataset.sortProfile;
+      if (_profileSort.col === col) {
+        _profileSort.dir = _profileSort.dir === "asc" ? "desc" : "asc";
+      } else {
+        _profileSort = { col, dir: "asc" };
+      }
+      renderProfilesTable(profiles, 1, pageSize);
+    };
+  });
 
   document.querySelectorAll("button[data-edit]").forEach((btn) => {
     btn.onclick = () => beginEditProfile(btn.dataset.edit, profiles);
@@ -1230,6 +1524,7 @@ function renderSharedSelectionTable() {
 <td class="obj-name-cell"><span class="obj-schema">${escapeHtml(o.schemaName)}</span><span class="obj-dot">.</span><span class="obj-name">${escapeHtml(o.objectName)}</span>
   <button class="btn-copy-inline" data-copy="${fullName}" title="Copy name">&#x2398;</button></td>
 <td>${formatDateTime(o.createdDate)}</td><td>${formatDateTime(o.modifiedDate)}</td>
+<td><span class="selection-origin selection-origin-${objectOrigin(o)}">${objectOriginLabel(o)}</span></td>
 <td><button data-remove-shared='${realIdx}'>Remove</button></td>
 </tr>`;
       }
@@ -1250,9 +1545,10 @@ function renderSharedSelectionTable() {
   <th data-sort-sel="object" ${thClass("object")}>Object${sortArrow("object")}</th>
   <th data-sort-sel="created" ${thClass("created")}>Created${sortArrow("created")}</th>
   <th data-sort-sel="modified" ${thClass("modified")}>Modified${sortArrow("modified")}</th>
+  <th>Origin</th>
   <th></th>
 </tr></thead>
-<tbody>${rows || "<tr><td colspan='5' class='muted' style='text-align:center;padding:1rem'>No objects match filter.</td></tr>"}</tbody>
+<tbody>${rows || "<tr><td colspan='6' class='muted' style='text-align:center;padding:1rem'>No objects match filter.</td></tr>"}</tbody>
 </table>`;
 
   document.querySelectorAll("[data-sort-sel]").forEach((th) => {
@@ -1280,6 +1576,10 @@ function renderSharedSelectionTable() {
   document.querySelectorAll(".btn-copy-inline").forEach((btn) => {
     btn.onclick = () => copyToClipboard(btn.dataset.copy);
   });
+
+  document.dispatchEvent(new CustomEvent("pebloy:selection-changed", {
+    detail: { count: sharedSelectedObjects.length },
+  }));
 }
 
 function copyToClipboard(text) {
@@ -1595,6 +1895,386 @@ async function resolveAndAdd() {
   );
 }
 
+async function fetchDependenciesForSelection() {
+  const profileId = $("objectsProfile").value;
+  if (!profileId) {
+    showToast("Choose a source connection first", true);
+    return;
+  }
+  if (!sharedSelectedObjects.length) {
+    showToast("Select at least one object before fetching dependencies", true);
+    return;
+  }
+
+  const selectedCountBeforeCleanup = sharedSelectedObjects.length;
+  sharedSelectedObjects = dedupeObjects(sharedSelectedObjects);
+  const cleanedExistingDuplicates = selectedCountBeforeCleanup - sharedSelectedObjects.length;
+  if (cleanedExistingDuplicates > 0) {
+    renderSharedSelectionTable();
+    persistCurrentAppState({ delay: 0 });
+  }
+
+  const sourceObjects = [...sharedSelectedObjects];
+  const timeWindow = buildDependencyTimeWindow(sourceObjects);
+  beginTaskProgress("objects", `Opening dependency picker for ${sharedSelectedObjects.length} selected object${sharedSelectedObjects.length === 1 ? "" : "s"}...`);
+
+  const selectedDependencies = await showDependencyPickerModal({
+    requestedCount: sourceObjects.length,
+    timeWindow,
+    loadCandidates: (scope) => loadDependencyPickerCandidates({ profileId, sourceObjects, timeWindow, scope }),
+    exportQuery: (scope) => exportDependencyQuery({ profileId, sourceObjects, timeWindow, scope }),
+    refreshCache: () => clearDependencyProfileCache(profileId),
+  });
+
+  if (selectedDependencies === null) {
+    endTaskProgress("objects", true, "Objects");
+    showToast(cleanedExistingDuplicates > 0
+      ? `Dependency import cancelled; removed ${cleanedExistingDuplicates} duplicate selected object${cleanedExistingDuplicates === 1 ? "" : "s"}`
+      : "Dependency import cancelled");
+    return;
+  }
+
+  if (!selectedDependencies.length) {
+    endTaskProgress("objects", true, "Objects");
+    showToast(cleanedExistingDuplicates > 0
+      ? `No dependencies selected; removed ${cleanedExistingDuplicates} duplicate selected object${cleanedExistingDuplicates === 1 ? "" : "s"}`
+      : "No dependencies selected for import");
+    return;
+  }
+
+  const before = sharedSelectedObjects.length;
+  const beforeUnique = dedupeObjects(sharedSelectedObjects).length;
+  const importedDependencies = selectedDependencies.map((item) => ({ ...item, origin: "dependency" }));
+  sharedSelectedObjects = dedupeObjects([...sharedSelectedObjects, ...importedDependencies]);
+  renderSharedSelectionTable();
+  persistCurrentAppState({ delay: 0 });
+  endTaskProgress("objects", true, "Objects");
+
+  const added = Math.max(0, sharedSelectedObjects.length - beforeUnique);
+  const existingDuplicatesRemoved = cleanedExistingDuplicates + Math.max(0, before - beforeUnique);
+  if (added > 0 && existingDuplicatesRemoved > 0) {
+    showToast(`Added ${added} dependenc${added === 1 ? "y" : "ies"}; removed ${existingDuplicatesRemoved} duplicate selected object${existingDuplicatesRemoved === 1 ? "" : "s"}`);
+  } else if (added > 0) {
+    showToast(`Added ${added} dependenc${added === 1 ? "y" : "ies"} to the selection`);
+  } else if (existingDuplicatesRemoved > 0) {
+    showToast(`No new dependencies added; removed ${existingDuplicatesRemoved} duplicate selected object${existingDuplicatesRemoved === 1 ? "" : "s"}`);
+  } else {
+    showToast("Selected dependencies were already in the list");
+  }
+}
+
+async function loadDependencyPickerCandidates({ profileId, sourceObjects, timeWindow, scope }) {
+  const roots = dedupeObjects(sourceObjects);
+  const activeScope = scope === "allDependencies" ? "allDependencies" : "windowDependencies";
+  const profileCache = getDependencyProfileCache(profileId);
+  const scopeCache = getDependencyScopeCache(profileCache, activeScope, timeWindow);
+  const rootsToFetch = roots.filter((root) => !scopeCache.processedRoots.has(dependencyRootKey(root)));
+
+  if (rootsToFetch.length) {
+    updateTaskProgress("objects", `Fetching dependencies for ${rootsToFetch.length} new object${rootsToFetch.length === 1 ? "" : "s"}...`, 35);
+    const result = await api("/api/objects/dependencies", {
+      method: "POST",
+      body: JSON.stringify({
+        profileId,
+        objects: rootsToFetch,
+        dateWindow: activeScope === "windowDependencies" && timeWindow
+          ? { start: timeWindow.minDate.toISOString(), end: timeWindow.maxDate.toISOString() }
+          : null,
+      }),
+    });
+
+    const rowsByRoot = groupDependencyRowsByParent(
+      Array.isArray(result.dependencies) ? result.dependencies : [],
+      rootsToFetch
+    );
+    for (const root of rootsToFetch) {
+      setDependencyRowsForRoot(scopeCache, root, rowsByRoot.get(dependencyRootKey(root)) || []);
+    }
+  } else {
+    updateTaskProgress("objects", "Using cached dependency results...", 75);
+  }
+
+  const dependencies = filterObjectsNotInSelection(collectDependencyRows(scopeCache, roots), roots);
+
+  updateTaskProgress("objects", "Preparing dependency picker...", 90);
+  return {
+    dependencies,
+    requestedCount: roots.length,
+    fetchedRootCount: rootsToFetch.length,
+    cachedRootCount: roots.length - rootsToFetch.length,
+  };
+}
+
+async function exportDependencyQuery({ profileId, sourceObjects, timeWindow, scope }) {
+  const activeScope = scope === "allDependencies" ? "allDependencies" : "windowDependencies";
+  const result = await api("/api/objects/dependencies/query", {
+    method: "POST",
+    body: JSON.stringify({
+      profileId,
+      objects: dedupeObjects(sourceObjects),
+      dateWindow: activeScope === "windowDependencies" && timeWindow
+        ? { start: timeWindow.minDate.toISOString(), end: timeWindow.maxDate.toISOString() }
+        : null,
+    }),
+  });
+
+  const query = String(result.query || "").trim();
+  if (!query) {
+    showToast("No dependency query to export", true);
+    return;
+  }
+
+  const suffix = activeScope === "allDependencies" ? "all" : "window";
+  downloadTextFile(`fetch-dependencies_${suffix}_${buildTimestampFileSuffix()}.sql`, query + "\n", "text/x-sql");
+  showToast("Dependency query exported");
+}
+
+function showDependencyPickerModal({ dependencies = [], requestedCount, timeWindow, loadCandidates = null, exportQuery = null, refreshCache = null }) {
+  return new Promise((resolve) => {
+    let dependencyItems = sortObjects(mergeDependencyCandidates(dependencies), { col: "modified", dir: "desc" });
+    const selectedKeys = new Set();
+    let scope = timeWindow ? "windowDependencies" : "allDependencies";
+    let searchText = "";
+    let loading = typeof loadCandidates === "function";
+    let loadError = null;
+    let initializedSelection = false;
+    let closed = false;
+    let loadGeneration = 0;
+    let fetchedRootCount = 0;
+    let cachedRootCount = 0;
+
+    const dependencyWindowItems = () => timeWindow
+      ? dependencyItems.filter((item) => isWithinDependencyTimeWindow(item, timeWindow))
+      : [];
+
+    const resetScopeIfNeeded = () => {
+      if (scope === "windowDependencies" && dependencyWindowItems().length > 0) return;
+      if (scope === "allDependencies" && dependencyItems.length > 0) return;
+      if (timeWindow) scope = "windowDependencies";
+      else scope = "allDependencies";
+    };
+
+    resetScopeIfNeeded();
+
+    const visibleItems = () => {
+      const scopedItems = scope === "windowDependencies" ? dependencyWindowItems() : dependencyItems;
+      const query = searchText.trim().toLowerCase();
+      if (!query) return scopedItems;
+      return scopedItems.filter((item) => {
+        const parentText = formatDependencyParentRefs(item);
+        return [item.objectType, item.schemaName, item.objectName, parentText]
+          .some((value) => String(value || "").toLowerCase().includes(query));
+      });
+    };
+
+    const selectVisibleDefaults = () => {
+      if (initializedSelection) return;
+      const shown = visibleItems();
+      if (!shown.length) return;
+      for (const item of shown) {
+        selectedKeys.add(objectKey(item));
+      }
+      initializedSelection = true;
+    };
+
+    selectVisibleDefaults();
+
+    const overlay = document.createElement("div");
+    overlay.className = "confirm-modal-overlay dependency-modal-overlay";
+    overlay.innerHTML = `
+      <div class="confirm-modal dependency-modal" role="dialog" aria-modal="true" aria-labelledby="dependencyModalTitle">
+        <div class="dependency-modal-header">
+          <div>
+            <h4 id="dependencyModalTitle">Fetch Dependencies</h4>
+            <p class="dependency-modal-summary"></p>
+          </div>
+          <button type="button" class="btn-ghost dependency-modal-close" title="Close">Close</button>
+        </div>
+        <div class="dependency-window-card">
+          <strong>Time Window</strong>
+          <span>${timeWindow ? `${formatDateTime(timeWindow.minDate)} to ${formatDateTime(timeWindow.maxDate)}` : "No valid modified dates on the current list; showing all dependencies."}</span>
+        </div>
+        <div class="dependency-modal-controls">
+          <label class="flag-label"><input type="radio" name="dependencyScope" value="windowDependencies" /> <span data-dependency-label="windowDependencies"></span></label>
+          <label class="flag-label"><input type="radio" name="dependencyScope" value="allDependencies" /> <span data-dependency-label="allDependencies"></span></label>
+        </div>
+        <div class="dependency-modal-search-row">
+          <input id="dependencySearchInput" class="dependency-search-input" placeholder="Search by type, schema, object, or parent..." />
+          <button type="button" class="btn-ghost btn-sm" data-dependency-select="all">Select All</button>
+          <button type="button" class="btn-ghost btn-sm" data-dependency-select="none">Deselect All</button>
+          <button type="button" class="btn-ghost btn-sm" data-dependency-export-query>Export Query</button>
+          <button type="button" class="btn-ghost btn-sm" data-dependency-refresh-cache>Refresh Cache</button>
+        </div>
+        <div class="dependency-modal-count muted"></div>
+        <div class="dependency-modal-table"></div>
+        <div class="confirm-modal-actions dependency-modal-actions">
+          <button type="button" class="btn-ghost" data-dependency-action="cancel">Cancel</button>
+          <button type="button" class="btn-primary" data-dependency-action="import">Import Selected</button>
+        </div>
+      </div>`;
+
+    const close = (value) => {
+      closed = true;
+      overlay.remove();
+      resolve(value);
+    };
+
+    const render = () => {
+      const windowCount = dependencyWindowItems().length;
+      const shown = visibleItems();
+      const selectedVisible = shown.filter((item) => selectedKeys.has(objectKey(item))).length;
+      const summary = overlay.querySelector(".dependency-modal-summary");
+      const table = overlay.querySelector(".dependency-modal-table");
+      const count = overlay.querySelector(".dependency-modal-count");
+      const importButton = overlay.querySelector("[data-dependency-action='import']");
+      const selectAllButton = overlay.querySelector("[data-dependency-select='all']");
+      const unselectAllButton = overlay.querySelector("[data-dependency-select='none']");
+      const exportQueryButton = overlay.querySelector("[data-dependency-export-query]");
+      const refreshCacheButton = overlay.querySelector("[data-dependency-refresh-cache]");
+
+      summary.textContent = loading
+        ? `Loading dependency candidates for ${requestedCount} selected object${requestedCount === 1 ? "" : "s"}...`
+        : loadError
+          ? `Could not load dependency candidates: ${loadError.message}`
+          : `Fetched ${dependencyItems.length} missing dependenc${dependencyItems.length === 1 ? "y" : "ies"} from ${requestedCount} selected object${requestedCount === 1 ? "" : "s"}. ${cachedRootCount} root${cachedRootCount === 1 ? "" : "s"} reused from cache; ${fetchedRootCount} queried.`;
+
+      overlay.querySelectorAll("input[name='dependencyScope']").forEach((input) => {
+        input.checked = input.value === scope;
+        input.disabled = loading || Boolean(loadError) ||
+          (input.value === "windowDependencies" && !timeWindow) ||
+          (input.value === "allDependencies" && dependencyItems.length === 0);
+      });
+      overlay.querySelector("[data-dependency-label='windowDependencies']").textContent = `Modified within calculated time window (${windowCount})`;
+      overlay.querySelector("[data-dependency-label='allDependencies']").textContent = `All dependencies (${dependencyItems.length})`;
+
+      count.textContent = loading
+        ? "Loading..."
+        : loadError
+          ? "Loading failed. Close this window and try again."
+          : `Showing ${shown.length} object${shown.length === 1 ? "" : "s"}; ${selectedVisible} selected in this view, ${selectedKeys.size} selected total.`;
+
+      importButton.disabled = loading || Boolean(loadError) || selectedKeys.size === 0;
+      selectAllButton.disabled = loading || Boolean(loadError) || shown.length === 0;
+      unselectAllButton.disabled = loading || Boolean(loadError) || shown.length === 0;
+      exportQueryButton.disabled = loading || typeof exportQuery !== "function";
+      refreshCacheButton.disabled = loading || typeof refreshCache !== "function" || typeof loadCandidates !== "function";
+
+      if (loading || loadError) {
+        const message = loading ? "Loading dependency candidates..." : escapeHtml(loadError.message || "Unable to load dependency candidates.");
+        table.innerHTML = `<table class="table"><tbody><tr><td class="muted dependency-empty-cell">${message}</td></tr></tbody></table>`;
+        return;
+      }
+
+      const rows = shown.map((item, index) => {
+        const key = objectKey(item);
+        return `<tr>
+<td><input type="checkbox" data-dependency-index="${index}" ${selectedKeys.has(key) ? "checked" : ""} /></td>
+<td>${escapeHtml(item.objectType)}</td>
+      <td>${escapeHtml(item.schemaName)}</td>
+      <td>${escapeHtml(item.objectName)}</td>
+<td>${formatDateTime(item.createdDate)}</td>
+<td>${formatDateTime(item.modifiedDate)}</td>
+      <td>${escapeHtml(formatDependencyParentRefs(item))}</td>
+</tr>`;
+      }).join("");
+
+      table.innerHTML = `<table class="table">
+      <thead><tr><th></th><th>Type</th><th>Schema</th><th>Object</th><th>Created</th><th>Modified</th><th>Parent Object</th></tr></thead>
+      <tbody>${rows || "<tr><td colspan='7' class='muted dependency-empty-cell'>No dependencies match this scope or search.</td></tr>"}</tbody>
+</table>`;
+
+      table.querySelectorAll("[data-dependency-index]").forEach((checkbox) => {
+        checkbox.onchange = () => {
+          const item = shown[Number(checkbox.dataset.dependencyIndex)];
+          const key = objectKey(item);
+          if (checkbox.checked) selectedKeys.add(key);
+          else selectedKeys.delete(key);
+          render();
+        };
+      });
+    };
+
+    overlay.querySelectorAll("input[name='dependencyScope']").forEach((input) => {
+      input.onchange = () => {
+        scope = input.value;
+        if (loadCandidates) loadScope(scope);
+        else render();
+      };
+    });
+    overlay.querySelector("#dependencySearchInput").oninput = (event) => {
+      searchText = event.target.value || "";
+      render();
+    };
+    overlay.querySelector("[data-dependency-select='all']").onclick = () => {
+      for (const item of visibleItems()) selectedKeys.add(objectKey(item));
+      render();
+    };
+    overlay.querySelector("[data-dependency-select='none']").onclick = () => {
+      for (const item of visibleItems()) selectedKeys.delete(objectKey(item));
+      render();
+    };
+    overlay.querySelector("[data-dependency-export-query]").onclick = async () => {
+      if (typeof exportQuery !== "function") return;
+      try {
+        await exportQuery(scope);
+      } catch (error) {
+        showToast(`Export query failed: ${error.message}`, true);
+      }
+    };
+    overlay.querySelector("[data-dependency-refresh-cache]").onclick = () => {
+      if (typeof refreshCache !== "function" || typeof loadCandidates !== "function") return;
+      refreshCache();
+      selectedKeys.clear();
+      initializedSelection = false;
+      loadScope(scope);
+      showToast("Dependency cache refreshed");
+    };
+    overlay.querySelector("[data-dependency-action='cancel']").onclick = () => close(null);
+    overlay.querySelector(".dependency-modal-close").onclick = () => close(null);
+    overlay.querySelector("[data-dependency-action='import']").onclick = () => {
+      close(dependencyItems.filter((item) => selectedKeys.has(objectKey(item))));
+    };
+    overlay.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") close(null);
+    });
+
+    document.body.appendChild(overlay);
+    render();
+    overlay.querySelector("[data-dependency-action='import']").focus();
+
+    function loadScope(nextScope) {
+      const generation = ++loadGeneration;
+      loading = true;
+      loadError = null;
+      render();
+
+      Promise.resolve()
+        .then(() => loadCandidates(nextScope))
+        .then((result) => {
+          if (closed || generation !== loadGeneration) return;
+          requestedCount = result?.requestedCount || requestedCount;
+          dependencyItems = sortObjects(mergeDependencyCandidates(result?.dependencies || []), { col: "modified", dir: "desc" });
+          fetchedRootCount = Number(result?.fetchedRootCount || 0);
+          cachedRootCount = Number(result?.cachedRootCount || 0);
+          loading = false;
+          resetScopeIfNeeded();
+          selectVisibleDefaults();
+          render();
+        })
+        .catch((error) => {
+          if (closed || generation !== loadGeneration) return;
+          loading = false;
+          loadError = error instanceof Error ? error : new Error(String(error));
+          render();
+        });
+    }
+
+    if (loadCandidates) {
+      loadScope(scope);
+    }
+  });
+}
+
 function transformSelection(ta, fn) {
   const s = ta.selectionStart, e = ta.selectionEnd;
   if (s === e) {
@@ -1772,7 +2452,7 @@ function setupEnhancedEditorShortcuts() {
     if (matchesShortcut(e, sc.resolveObjects || "Ctrl+D")) {
       e.preventDefault();
       e.stopPropagation();
-      $("resolveAndAddObjects").click();
+      $("resolveAndAddObjects")?.click();
       return;
     }
     if (matchesShortcut(e, sc.findInEditor || "Ctrl+F")) {
@@ -1827,7 +2507,7 @@ async function setupObjectsTab() {
       });
       if (!file) return;
 
-      setSharedObjectTextValue(file.content);
+      setSharedObjectTextValue(file.content, { emit: true });
       if (sharedObjectFileName) sharedObjectFileName.textContent = file.fileName || "File selected";
       persistCurrentAppState({ delay: 0 });
       showToast(`Loaded object list: ${file.fileName || "selected file"}`);
@@ -1841,7 +2521,7 @@ async function setupObjectsTab() {
   try {
     await setupEnhancedTextEditors();
   } catch (error) {
-    showToast(`Enhanced text editor unavailable: ${error.message}`, true);
+    showToast(`Monaco editor unavailable: ${error.message}`, true);
   }
 
   $("resolveAndAddObjects").onclick = async () => {
@@ -1938,8 +2618,97 @@ async function setupObjectsTab() {
     saveListBtn.onclick = () => exportSharedSelectionList();
   }
 
+  const refreshBtn = $("refreshSelectedObjects");
+  if (refreshBtn) {
+    refreshBtn.onclick = async () => {
+      const restore = setButtonLoading(refreshBtn, "Refreshing...");
+      try {
+        await refreshSharedSelection();
+      } catch (error) {
+        endTaskProgress("objects", false, "Objects");
+        showToast(`Refresh failed: ${error.message}`, true);
+      } finally {
+        restore();
+      }
+    };
+  }
+
+  const dependenciesBtn = $("fetchObjectDependencies");
+  if (dependenciesBtn) {
+    dependenciesBtn.onclick = async () => {
+      const restore = setButtonLoading(dependenciesBtn, "Fetching...");
+      try {
+        await fetchDependenciesForSelection();
+      } catch (error) {
+        endTaskProgress("objects", false, "Objects");
+        showToast(`Fetch dependencies failed: ${error.message}`, true);
+      } finally {
+        restore();
+      }
+    };
+  }
+
   renderSharedSelectionTable();
   applyObjectModeUI();
+}
+
+// Reload metadata for the current selection straight from the database.
+// Keeps the selection, filter text, and sort intact; only object metadata
+// (authoritative casing, type, created/modified dates) is updated.
+async function refreshSharedSelection() {
+  const profileId = $("objectsProfile").value;
+  if (!profileId) {
+    showToast("Choose a source connection first", true);
+    return;
+  }
+  if (!sharedSelectedObjects.length) {
+    showToast("No selected objects to refresh", true);
+    return;
+  }
+
+  beginTaskProgress("objects", `Refreshing ${sharedSelectedObjects.length} selected object${sharedSelectedObjects.length === 1 ? "" : "s"} from database...`);
+
+  const resolved = await api("/api/objects/resolve-types", {
+    method: "POST",
+    body: JSON.stringify({
+      profileId,
+      objects: sharedSelectedObjects.map((o) => ({ schemaName: o.schemaName, objectName: o.objectName })),
+    }),
+  });
+
+  const resolvedMap = new Map();
+  for (const r of resolved) {
+    const key = `${String(r.inputSchemaName || "").trim().toLowerCase()}|${String(r.inputObjectName || "").trim().toLowerCase()}`;
+    resolvedMap.set(key, r);
+  }
+
+  let refreshed = 0;
+  let missing = 0;
+  for (const o of sharedSelectedObjects) {
+    const key = `${String(o.schemaName || "").toLowerCase()}|${String(o.objectName || "").toLowerCase()}`;
+    const r = resolvedMap.get(key);
+    if (!r || r.matchStatus === "NotFound") {
+      missing += 1;
+      continue;
+    }
+    o.objectType = String(r.objectType || o.objectType || "").toUpperCase();
+    o.schemaName = String(r.schemaName || o.schemaName).trim();
+    o.objectName = String(r.objectName || o.objectName).trim();
+    o.createdDate = r.createdDate ?? o.createdDate ?? null;
+    o.modifiedDate = r.modifiedDate ?? o.modifiedDate ?? null;
+    refreshed += 1;
+  }
+
+  sharedSelectedObjects = dedupeObjects(sharedSelectedObjects);
+  renderSharedSelectionTable();
+  persistCurrentAppState({ delay: 0 });
+  endTaskProgress("objects", true, "Objects");
+  showToast(
+    missing > 0
+      ? `Refreshed ${refreshed} object${refreshed === 1 ? "" : "s"}; ${missing} not found in the database (kept in selection)`
+      : `Refreshed ${refreshed} object${refreshed === 1 ? "" : "s"} from database`,
+    missing > 0
+  );
 }
 
 function filterDiffBySharedObjects(report) {
@@ -1968,6 +2737,18 @@ function filterDiffBySharedObjects(report) {
 function setupDiff() {
   $("goToObjectsFromDiff").onclick = () => setActiveTab("objects");
 
+  function updateDiffEngineHint() {
+    const engine = $("diffEngine")?.value || "Legacy";
+    const hint = engine === "DacFx"
+      ? "DacFx runs only for structural comparisons like tables and types. Other selections fall back automatically to fresh-script text diff."
+      : "Legacy Text Compare is the default for speed and uses fresh scripts from both databases.";
+    const hintEl = $("diffEngineHint");
+    if (hintEl) hintEl.textContent = hint;
+  }
+
+  $("diffEngine")?.addEventListener("change", updateDiffEngineHint);
+  updateDiffEngineHint();
+
   $("runDiff").onclick = async function () {
     const restoreBtn = setButtonLoading(this, "Running…");
     try {
@@ -1981,6 +2762,7 @@ function setupDiff() {
           logLevel: $("logLevelSelect")?.value || "Normal",
           sourceProfileId,
           destinationProfileId,
+          engine: $("diffEngine")?.value || "DacFx",
           selectedObjects: sharedSelectedObjects,
         }),
       });
@@ -2037,20 +2819,60 @@ function renderDiff(report) {
   const listHtml = changedRows
     .map(
       (d, idx) => `<button class='diff-object-item ${idx === currentDiffIndex ? "active" : ""}' data-diff-index='${idx}'>
-  <span>${d.objectType} ${d.schemaName}.${d.objectName}</span>
-  <span class='muted'>${d.status}</span>
+  <span class='diff-object-main'>
+    <span class='diff-object-type'>${d.objectType}</span>
+    <span class='diff-object-name'>${d.schemaName}.${d.objectName}</span>
+  </span>
+  <span class='diff-object-status diff-object-status-${String(d.status || "").toLowerCase()}'>${d.status}</span>
 </button>`
     )
     .join("");
 
   const selected = changedRows[currentDiffIndex] || changedRows[0];
+  const sourceLabel = getSelectedConnectionLabel("diffSourceProfile", "Source");
+  const targetLabel = getSelectedConnectionLabel("diffDestProfile", "Target");
+  const overview = buildDiffOverview(selected);
 
   $("diffList").innerHTML = `<div class='diff-layout'>
-<aside class='diff-object-list'>${listHtml}</aside>
+<aside class='diff-object-list'>
+  <div class='diff-object-list-header'>
+    <div class='diff-object-list-title'>Changed Objects</div>
+    <div class='diff-object-list-meta'>${changedRows.length} item${changedRows.length === 1 ? "" : "s"}</div>
+  </div>
+  ${listHtml}
+</aside>
 <section class='diff-view'>
-  <div class='diff-block'>
-    <div class='diff-head'>${selected.objectType} ${selected.schemaName}.${selected.objectName} - ${selected.status}</div>
-    ${renderDiffUnified(selected.lineDiff || [])}
+  <div class='diff-block diff-ado-shell'>
+    <div class='diff-head diff-head-detail'>
+      <div class='diff-head-main'>
+        <div class='diff-head-title'>${selected.objectType} ${selected.schemaName}.${selected.objectName}</div>
+        <div class='diff-head-subtitle'>${escapeHtml(sourceLabel)} vs ${escapeHtml(targetLabel)}</div>
+      </div>
+      <span class='diff-status-pill diff-status-${String(selected.status || "").toLowerCase()}'>${selected.status}</span>
+    </div>
+    <div class='diff-overview-bar'>
+      <div class='diff-overview-card'>
+        <span class='diff-overview-label'>Source Lines</span>
+        <strong class='diff-overview-value'>${overview.sourceLines}</strong>
+        <span class='diff-overview-note'>${escapeHtml(sourceLabel)}</span>
+      </div>
+      <div class='diff-overview-card'>
+        <span class='diff-overview-label'>Target Lines</span>
+        <strong class='diff-overview-value'>${overview.targetLines}</strong>
+        <span class='diff-overview-note'>${escapeHtml(targetLabel)}</span>
+      </div>
+      <div class='diff-overview-card'>
+        <span class='diff-overview-label'>Modified Rows</span>
+        <strong class='diff-overview-value'>${overview.modifiedRows}</strong>
+        <span class='diff-overview-note'>Changed on both sides</span>
+      </div>
+      <div class='diff-overview-card'>
+        <span class='diff-overview-label'>Added / Removed</span>
+        <strong class='diff-overview-value'>+${overview.addedRows} / -${overview.removedRows}</strong>
+        <span class='diff-overview-note'>Target / Source only</span>
+      </div>
+    </div>
+    ${renderDiffSideBySide(selected, { sourceLabel, targetLabel })}
   </div>
 </section>
 </div>`;
@@ -2063,33 +2885,61 @@ function renderDiff(report) {
   });
 }
 
-function renderDiffUnified(lineDiff) {
+function getSelectedConnectionLabel(selectId, fallback) {
+  const select = $(selectId);
+  const option = select?.selectedOptions?.[0];
+  return option?.textContent?.trim() || fallback;
+}
+
+function splitLinesPreserve(text) {
+  const value = String(text || "").replace(/\r\n/g, "\n");
+  const lines = value.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines;
+}
+
+function countDefinitionLines(text) {
+  return splitLinesPreserve(String(text || "")).length;
+}
+
+function buildDiffOverview(detail) {
+  const overview = {
+    sourceLines: countDefinitionLines(detail?.sourceDefinition),
+    targetLines: countDefinitionLines(detail?.destinationDefinition),
+    modifiedRows: 0,
+    addedRows: 0,
+    removedRows: 0,
+  };
+
+  for (const row of detail?.lineDiff || []) {
+    const status = String(row.status || "").toLowerCase();
+    if (status === "modified") overview.modifiedRows += 1;
+    if (status === "added") overview.addedRows += 1;
+    if (status === "removed") overview.removedRows += 1;
+  }
+
+  return overview;
+}
+
+function renderDiffSideBySide(detail, labels = {}) {
+  const lineDiff = detail?.lineDiff || [];
   if (!lineDiff.length) {
     return "<div class='diff-empty muted'>No line changes.</div>";
   }
 
   const CONTEXT = 3;
 
-  // Flatten modified rows into del + ins
-  const all = lineDiff.flatMap((row) => {
-    if (row.status === "modified") {
-      return [
-        { type: "del", ln1: row.leftLineNumber, ln2: null, text: row.leftText || "" },
-        { type: "ins", ln1: null, ln2: row.rightLineNumber, text: row.rightText || "" },
-      ];
-    }
-    if (row.status === "added" || row.status === "Added") {
-      return [{ type: "ins", ln1: null, ln2: row.rightLineNumber, text: row.rightText || "" }];
-    }
-    if (row.status === "removed" || row.status === "Removed") {
-      return [{ type: "del", ln1: row.leftLineNumber, ln2: null, text: row.leftText || "" }];
-    }
-    return [{ type: "ctx", ln1: row.leftLineNumber, ln2: row.rightLineNumber, text: row.leftText || "" }];
-  });
+  const all = lineDiff.map((row) => ({
+    ...row,
+    normalizedStatus: String(row.status || "").toLowerCase(),
+  }));
 
-  // Determine which indices are visible (changed ± CONTEXT)
   const changed = new Set();
-  all.forEach((l, i) => { if (l.type !== "ctx") changed.add(i); });
+  all.forEach((row, index) => {
+    if (row.normalizedStatus !== "unchanged") changed.add(index);
+  });
   const visible = new Set();
   for (const idx of changed) {
     for (let d = -CONTEXT; d <= CONTEXT; d++) {
@@ -2110,24 +2960,43 @@ function renderDiffUnified(lineDiff) {
 
     if (lastIdx !== -1 && i > lastIdx + 1) {
       const skipped = i - lastIdx - 1;
-      html += `<tr class="diff-hunk"><td></td><td></td><td></td><td>@@ ${skipped} unchanged line${skipped !== 1 ? "s" : ""} @@</td></tr>`;
+      html += `<tr class="diff-hunk"><td colspan="4">@@ ${skipped} unchanged line${skipped !== 1 ? "s" : ""} @@</td></tr>`;
     }
 
-    const l = all[i];
-    const prefix = l.type === "ins" ? "+" : l.type === "del" ? "-" : " ";
-    const cls = l.type === "ins" ? "diff-ins" : l.type === "del" ? "diff-del" : "diff-ctx";
-    const ln1 = l.ln1 != null ? l.ln1 : "";
-    const ln2 = l.ln2 != null ? l.ln2 : "";
-    html += `<tr class="diff-line ${cls}">
-<td class="diff-ln">${ln1}</td>
-<td class="diff-ln">${ln2}</td>
-<td class="diff-prefix">${prefix}</td>
-<td class="diff-code mono">${escapeHtml(l.text)}</td>
+    const row = all[i];
+    const status = row.normalizedStatus;
+    const leftType = status === "added" ? "ghost" : status === "modified" ? "del" : status === "removed" ? "del" : "ctx";
+    const rightType = status === "removed" ? "ghost" : status === "modified" ? "ins" : status === "added" ? "ins" : "ctx";
+    const leftLine = row.leftLineNumber == null ? "" : String(row.leftLineNumber);
+    const rightLine = row.rightLineNumber == null ? "" : String(row.rightLineNumber);
+    html += `<tr class="diff-ado-row diff-status-${status}">
+<td class="diff-ado-cell diff-ado-cell-${leftType}">
+  <span class="diff-ado-ln">${leftLine}</span>
+  <span class="diff-ado-code mono">${escapeHtml(row.leftText || "")}</span>
+</td>
+<td class="diff-ado-cell diff-ado-cell-${rightType}">
+  <span class="diff-ado-ln">${rightLine}</span>
+  <span class="diff-ado-code mono">${escapeHtml(row.rightText || "")}</span>
+</td>
 </tr>`;
     lastIdx = i;
   }
 
-  return `<div class="diff-unified-wrap"><table class="diff-unified"><tbody>${html}</tbody></table></div>`;
+  return `<div class="diff-unified-wrap diff-ado-wrap">
+  <div class="diff-ado-headers">
+    <div class="diff-ado-header-pane">
+      <span class="diff-ado-header-label">Left</span>
+      <strong>${escapeHtml(labels.sourceLabel || "Source")}</strong>
+    </div>
+    <div class="diff-ado-header-pane">
+      <span class="diff-ado-header-label">Right</span>
+      <strong>${escapeHtml(labels.targetLabel || "Target")}</strong>
+    </div>
+  </div>
+  <table class="diff-ado-table">
+    <tbody>${html}</tbody>
+  </table>
+</div>`;
 }
 
 function escapeHtml(text) {
@@ -2151,6 +3020,13 @@ function setupBackup() {
   };
 
   $("runBackup").onclick = async function () {
+    const formatAndExecute = $("backupFormatMode")?.value === "formatExecute";
+    if (formatAndExecute) {
+      const profileLabel = $("backupProfile").selectedOptions?.[0]?.textContent || "the source connection";
+      if (!confirm(
+        `Format & Execute in Source is on.\n\nAfter generating scripts, every procedure, view, function, and trigger will be re-applied to ${profileLabel} with its formatted definition (CREATE OR ALTER).\n\nContinue?`
+      )) return;
+    }
     const restoreBtn = setButtonLoading(this, "Running…");
     try {
       beginTaskProgress("backup", "Generating scripts...");
@@ -2168,20 +3044,38 @@ function setupBackup() {
           selectedObjects: sharedSelectedObjects,
           options: {
             destinationPath: $("backupPath").value,
+            formatAndExecute,
           },
         }),
       });
-      endTaskProgress("backup", true, "Backup");
-      $("backupResult").textContent = [
+      const fx = result.formatAndExecute || { enabled: false };
+      endTaskProgress("backup", fx.failedCount ? false : true, "Backup");
+      const lines = [
         `Objects backed up : ${result.objectCount}`,
         `Output folder     : ${result.generatedRoot || result.backupFolder}`,
         `Build path file   : ${result.buildPathFile || "(none)"}`,
         `Exact SQL sync    : ${result.exactDefinitionsApplied || 0} programmable object${(result.exactDefinitionsApplied || 0) === 1 ? "" : "s"}`,
+        `DacFx validation  : ${result.dacfxValidation?.enabled ? `Enabled (${result.dacfxValidation.objectCount || 0} objects)` : "Disabled"}`,
+      ];
+      if (fx.enabled) {
+        lines.push(`Format & Execute  : ${fx.executedCount} executed in source, ${fx.failedCount} failed, ${fx.skippedCount} skipped (non-module objects)`);
+        for (const failure of fx.failures || []) {
+          lines.push(`  FAILED ${failure.object}: ${failure.error}`);
+        }
+      }
+      lines.push(
         `Generated at      : ${formatDateTime(result.restoreReadiness?.generatedAt || new Date())}`,
-        `Task ID           : ${result.taskId}`,
-      ].join("\n");
+        `Task ID           : ${result.taskId}`
+      );
+      $("backupResult").textContent = lines.join("\n");
       renderGenerationWarnings(result.generationWarnings, "backupResult");
-      showToast(`Backup scripts generated in ${result.generatedRoot || result.backupFolder}`);
+      if (fx.enabled && fx.failedCount) {
+        showToast(`Backup finished, but ${fx.failedCount} object${fx.failedCount === 1 ? "" : "s"} failed to execute in source — see result panel`, true);
+      } else if (fx.enabled) {
+        showToast(`Backup complete — ${fx.executedCount} formatted module${fx.executedCount === 1 ? "" : "s"} applied to source`);
+      } else {
+        showToast(`Backup scripts generated in ${result.generatedRoot || result.backupFolder}`);
+      }
       await refreshLogs();
     } catch (error) {
       endTaskProgress("backup", false, "Backup");
@@ -2199,6 +3093,7 @@ function setupDeployment() {
   const previewBtn = $("previewDeployPlan");
   const previewEl = $("deployPlanPreview");
   const deployResultEl = $("deployResult");
+  let previewRequestToken = 0;
 
   const deployModeHints = {
     ExecuteDirectly: "",
@@ -2217,6 +3112,69 @@ function setupDeployment() {
     syncPreviewButtonLabel();
   }
 
+  async function refreshDeploymentPlanPreview(forceOpen = false) {
+    if (!previewEl || !previewBtn) return;
+    if (!forceOpen && previewEl.classList.contains("hidden")) return;
+
+    const requestToken = ++previewRequestToken;
+    const originalText = previewBtn.textContent;
+    previewBtn.disabled = true;
+    previewBtn.classList.add("btn-loading");
+    previewBtn.textContent = forceOpen ? "Loading…" : "Refreshing…";
+
+    try {
+      if (!sharedSelectedObjects.length) {
+        hideDeployPlanPreview();
+        showToast("No objects selected.", true);
+        return;
+      }
+
+      const { plan } = await api("/api/deploy/plan", {
+        method: "POST",
+        body: JSON.stringify({
+          sourceProfileId: $("deploySourceProfile")?.value || "",
+          selectedObjects: sharedSelectedObjects,
+          engine: $("deployEngine")?.value || "DacFx",
+        }),
+      });
+
+      if (requestToken !== previewRequestToken) return;
+
+      const actionLabels = {
+        AlterDelta: "Generate and apply table delta",
+        ExecuteIndividually: "Execute object script individually",
+        ExecuteCombinedProcedures: "Execute combined stored procedure script",
+        CreateOrAlterIndividually: "Create or alter object script individually",
+        DropAndCreate: "Drop and recreate object",
+        DacFxDeploy: "Preview and deploy through DacFx",
+        DacFxCreate: "Create through DacFx",
+        DacFxAlter: "Alter through DacFx",
+        DacFxDrop: "Drop through DacFx",
+        NoChange: "No semantic change",
+      };
+      const rows = plan.map((item, i) => `<tr>
+<td class="muted">${i + 1}</td>
+<td>${escapeHtml(item.objectType)}</td>
+<td>${escapeHtml(item.schemaName)}.${escapeHtml(item.objectName)}</td>
+<td class="muted">${escapeHtml(actionLabels[item.action] || item.action)}</td>
+</tr>`).join("");
+      previewEl.innerHTML = `<h4 style="margin:0 0 0.4rem">Execution Plan (${plan.length} objects)</h4>
+<table class="table"><thead><tr><th>#</th><th>Type</th><th>Object</th><th>Action</th></tr></thead>
+<tbody>${rows}</tbody></table>`;
+      previewEl.classList.remove("hidden");
+    } catch (error) {
+      if (requestToken !== previewRequestToken) return;
+      showToast(error.message, true);
+    } finally {
+      if (requestToken === previewRequestToken) {
+        previewBtn.disabled = false;
+        previewBtn.classList.remove("btn-loading");
+        previewBtn.textContent = originalText;
+        syncPreviewButtonLabel();
+      }
+    }
+  }
+
   function resetDeployRunArtifacts() {
     if (progressEl) {
       progressEl.innerHTML = "";
@@ -2233,13 +3191,26 @@ function setupDeployment() {
   }
 
   function updateDeployModeHint() {
-    const hint = deployModeHints[$("deployMode").value] || "";
+    const engine = $("deployEngine")?.value || "DacFx";
+    const baseHint = deployModeHints[$("deployMode").value] || "";
+    const engineHint = engine === "DacFx"
+      ? "DacFx mode uses semantic schema compare and a generated deployment script."
+      : "Legacy mode uses the existing per-type execution flow and table delta PowerShell path.";
+    const hint = [engineHint, baseHint].filter(Boolean).join(" ");
     const hintEl = $("deployModeHint");
     if (hintEl) hintEl.textContent = hint;
   }
 
   $("deployMode").addEventListener("change", updateDeployModeHint);
+  $("deployEngine").addEventListener("change", () => {
+    updateDeployModeHint();
+    refreshDeploymentPlanPreview();
+  });
   updateDeployModeHint();
+
+  $("deploySourceProfile")?.addEventListener("change", () => refreshDeploymentPlanPreview());
+  $("deployDestProfile")?.addEventListener("change", () => refreshDeploymentPlanPreview());
+  document.addEventListener("pebloy:selection-changed", () => refreshDeploymentPlanPreview());
 
   $("deployPathBrowse").onclick = async () => {
     try {
@@ -2255,44 +3226,7 @@ function setupDeployment() {
       return;
     }
 
-    const button = this;
-    const originalText = button.textContent;
-    button.disabled = true;
-    button.classList.add("btn-loading");
-    button.textContent = "Loading…";
-    try {
-      if (!sharedSelectedObjects.length) {
-        showToast("No objects selected.", true);
-        return;
-      }
-      const { plan } = await api("/api/deploy/plan", {
-        method: "POST",
-        body: JSON.stringify({ selectedObjects: sharedSelectedObjects }),
-      });
-      const actionLabels = {
-        AlterDelta: "Generate and apply table delta",
-        ExecuteIndividually: "Execute object script individually",
-        CreateOrAlterIndividually: "Create or alter object script individually",
-        DropAndCreate: "Drop and recreate object",
-      };
-      const rows = plan.map((item, i) => `<tr>
-<td class="muted">${i + 1}</td>
-<td>${escapeHtml(item.objectType)}</td>
-<td>${escapeHtml(item.schemaName)}.${escapeHtml(item.objectName)}</td>
-<td class="muted">${escapeHtml(actionLabels[item.action] || item.action)}</td>
-</tr>`).join("");
-      previewEl.innerHTML = `<h4 style="margin:0 0 0.4rem">Execution Plan (${plan.length} objects)</h4>
-<table class="table"><thead><tr><th>#</th><th>Type</th><th>Object</th><th>Action</th></tr></thead>
-<tbody>${rows}</tbody></table>`;
-      previewEl.classList.remove("hidden");
-    } catch (error) {
-      showToast(error.message, true);
-    } finally {
-      button.disabled = false;
-      button.classList.remove("btn-loading");
-      button.textContent = originalText;
-      syncPreviewButtonLabel();
-    }
+    await refreshDeploymentPlanPreview(true);
   };
 
   syncPreviewButtonLabel();
@@ -2340,6 +3274,7 @@ function setupDeployment() {
           logLevel: $("logLevelSelect")?.value || "Normal",
           sourceProfileId: srcProfileId,
           destinationProfileId: destProfileId,
+          engine: $("deployEngine")?.value || "DacFx",
           mode: $("deployMode").value,
           continueOnError: $("continueOnError").checked,
           allowSameSourceDestination: $("allowSameSource").checked,
@@ -2406,7 +3341,14 @@ function renderDeployResult(result) {
   const s = result.summary || {};
   const isRollback = result.rollbackApplied === true;
   const statusClass = { Success: "deploy-status-success", Failed: "deploy-status-failed", RolledBack: "deploy-status-accent", Skipped: "deploy-status-skipped", PendingDelta: "deploy-status-warning" };
-  const rows = (result.itemResults || [])
+  const validationSummary = result.dacfxValidation?.enabled
+    ? `Enabled (${result.dacfxValidation.objectCount || 0} objects)`
+    : "Disabled";
+  const showMetadata = Boolean(result.engine || result.deployScriptPath || result.dacfxValidation?.enabled);
+  const sortedItems = sortDeployResults(result.itemResults || [], _deployResultSort);
+  const sortArrow = (col) => _deployResultSort.col === col ? (_deployResultSort.dir === "asc" ? " ↑" : " ↓") : "";
+  const resultSortHeader = (col, label) => `<th data-sort-deploy-result="${col}" style="cursor:pointer;user-select:none">${label}${sortArrow(col)}</th>`;
+  const rows = sortedItems
     .map((item) => {
       const cls = statusClass[item.status] || "";
       const name = `${item.schemaName}.${item.objectName}`;
@@ -2430,9 +3372,17 @@ function renderDeployResult(result) {
   const rolledBackCard = isRollback
     ? `<div class="card"><strong class="text-accent">Validated</strong><div>${rolledBackCount}</div></div>`
     : "";
+  const metadataBlock = showMetadata
+    ? `<div class="mono" style="white-space:pre-wrap;margin:0 0 0.75rem;font-size:0.82rem">${[
+        `Engine           : ${escapeHtml(result.engine || "")}`,
+        `DacFx validation : ${escapeHtml(validationSummary)}`,
+        `Deploy script    : ${escapeHtml(result.deployScriptPath || "(none)")}`,
+      ].join("\n")}</div>`
+    : "";
 
   $("deployResult").innerHTML = `
 ${rollbackNote}
+${metadataBlock}
 <div class="summary-cards" style="margin-bottom:0.6rem">
   <div class="card"><strong>Total</strong><div>${s.total ?? 0}</div></div>
   ${isRollback ? rolledBackCard : `<div class="card"><strong class="text-success">Success</strong><div>${s.success ?? 0}</div></div>`}
@@ -2441,10 +3391,22 @@ ${rollbackNote}
 </div>
 <div style="overflow:auto;max-height:18rem">
 <table class="table">
-<thead><tr><th>Type</th><th>Object</th><th>Action</th><th>Status</th><th>Error</th></tr></thead>
+<thead><tr>${resultSortHeader("type", "Type")}${resultSortHeader("object", "Object")}${resultSortHeader("action", "Action")}${resultSortHeader("status", "Status")}${resultSortHeader("error", "Error")}</tr></thead>
 <tbody>${rows}</tbody>
 </table>
 </div>`;
+
+  $("deployResult").querySelectorAll("[data-sort-deploy-result]").forEach((th) => {
+    th.onclick = () => {
+      const col = th.dataset.sortDeployResult;
+      if (_deployResultSort.col === col) {
+        _deployResultSort.dir = _deployResultSort.dir === "asc" ? "desc" : "asc";
+      } else {
+        _deployResultSort = { col, dir: "asc" };
+      }
+      renderDeployResult(result);
+    };
+  });
 
   $("deployResult").querySelectorAll(".btn-copy-inline").forEach((btn) => {
     btn.onclick = () => copyToClipboard(btn.dataset.copy);
@@ -2638,7 +3600,7 @@ function sendDesktopNotification(data) {
   } else if (data.error) {
     body = String(data.error).slice(0, 100);
   }
-  try { new Notification(title, { body, icon: "/logo.svg?v=20260729-logo-refresh" }); } catch (_e) {}
+  try { new Notification(title, { body, icon: "/logo.svg" }); } catch (_e) {}
 }
 
 // ─── Logs table ────────────────────────────────────────────────────────────
@@ -2721,7 +3683,7 @@ async function refreshLogs(page = 1, pageSize = 20) {
 <div style="font-size:0.78rem;color:var(--muted);margin-bottom:0.4rem">${countLabel}</div>
 <table class='table'>
 <thead><tr>
-  ${logSortHeader("taskType", "Task Type")}${logSortHeader("status", "Status")}<th>Event Level</th>${logSortHeader("connectionFlow", "Connection Flow")}${logSortHeader("objectCount", "Objects")}${logSortHeader("startedAt", "Started At")}${logSortHeader("duration", "Duration")}<th>Actions</th>
+  ${logSortHeader("taskType", "Task Type")}${logSortHeader("status", "Status")}${logSortHeader("eventLevel", "Event Level")}${logSortHeader("connectionFlow", "Connection Flow")}${logSortHeader("objectCount", "Objects")}${logSortHeader("startedAt", "Started At")}${logSortHeader("duration", "Duration")}<th>Actions</th>
 </tr></thead>
 <tbody>${rows || "<tr><td colspan='8' class='muted' style='text-align:center;padding:1rem'>No logs match filters.</td></tr>"}</tbody>
 </table>
@@ -2934,14 +3896,24 @@ function setupTheme() {
     themeSelect.addEventListener("change", () => applyTheme(themeSelect.value));
   }
 
+  // Union of every token any theme defines. Tokens the incoming theme does
+  // not set must be REMOVED from body's inline style, otherwise the previous
+  // theme's value leaks through (e.g. unreadable toast/dialog colors).
+  const allThemeTokens = new Set(themes.flatMap((t) => Object.keys(t.tokens || {})));
+
   function applyTheme(themeId, persist = true) {
     const theme = themeMap.get(themeId) || themeMap.get(fallbackThemeId);
     if (!theme) return;
 
     document.body.setAttribute("data-theme", theme.id);
     document.documentElement.style.colorScheme = theme.colorScheme || "dark";
-    for (const [token, value] of Object.entries(theme.tokens || {})) {
-      document.body.style.setProperty(`--${token}`, value);
+    const tokens = theme.tokens || {};
+    for (const token of allThemeTokens) {
+      if (Object.prototype.hasOwnProperty.call(tokens, token)) {
+        document.body.style.setProperty(`--${token}`, tokens[token]);
+      } else {
+        document.body.style.removeProperty(`--${token}`);
+      }
     }
     if (themeSelect) themeSelect.value = theme.id;
 
@@ -3023,7 +3995,51 @@ function setupCustomize() {
     return {
       folderNames: safeFolderNames,
       deploymentOrder: safeOrder,
+      dacfx: {
+        validationEnabled: Boolean(settings?.dacfx?.validationEnabled),
+      },
+      time: {
+        useSystemTime: settings?.time?.useSystemTime === undefined ? true : Boolean(settings.time.useSystemTime),
+        timeZone: typeof settings?.time?.timeZone === "string" ? settings.time.timeZone : "",
+      },
+      formatting: {
+        formatGeneratedSql: Boolean(settings?.formatting?.formatGeneratedSql),
+      },
     };
+  }
+
+  const systemTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  function populateTimeZoneSelect() {
+    const select = $("timeZoneSelect");
+    if (!select || select.options.length) return;
+    const zones = typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("timeZone") : [systemTimeZone];
+    select.innerHTML = zones.map((z) => `<option value="${escapeHtml(z)}">${escapeHtml(z)}</option>`).join("");
+    select.value = systemTimeZone;
+  }
+
+  // Applies the time settings to the whole UI: the timezone every rendered
+  // timestamp uses, plus the Settings card controls and active-zone label.
+  function applyTimeSettings(time) {
+    populateTimeZoneSelect();
+    const useSystem = time?.useSystemTime !== false;
+    const zone = time?.timeZone || systemTimeZone;
+
+    const toggle = $("useSystemTimeToggle");
+    const select = $("timeZoneSelect");
+    const label = $("activeTimeZoneLabel");
+
+    if (toggle) toggle.checked = useSystem;
+    if (select) {
+      select.disabled = useSystem;
+      if (time?.timeZone) select.value = time.timeZone;
+    }
+
+    activeTimeZone = useSystem ? null : zone;
+    if (label) label.textContent = useSystem ? `${systemTimeZone} (system)` : zone;
+
+    // Re-render tables that show timestamps so they pick up the new zone.
+    renderSharedSelectionTable();
   }
 
   async function loadSettings() {
@@ -3033,10 +4049,20 @@ function setupCustomize() {
       currentSettings = normalizeCustomizeSettings(await api("/api/settings"));
       renderFolderNames(currentSettings.folderNames);
       renderDeployOrder(currentSettings.deploymentOrder);
+      if ($("dacfxValidationEnabled")) {
+        $("dacfxValidationEnabled").checked = Boolean(currentSettings.dacfx?.validationEnabled);
+      }
+      applyTimeSettings(currentSettings.time);
+      applyFormattingSettings(currentSettings.formatting);
     } catch (error) {
       currentSettings = normalizeCustomizeSettings();
       renderFolderNames(currentSettings.folderNames);
       renderDeployOrder(currentSettings.deploymentOrder);
+      if ($("dacfxValidationEnabled")) {
+        $("dacfxValidationEnabled").checked = Boolean(currentSettings.dacfx?.validationEnabled);
+      }
+      applyTimeSettings(currentSettings.time);
+      applyFormattingSettings(currentSettings.formatting);
       showToast("Failed to load settings: " + error.message, true);
     }
   }
@@ -3124,10 +4150,23 @@ function setupCustomize() {
 
       const folderNames = collectFolderNames();
       const deploymentOrder = currentSettings?.deploymentOrder || DEFAULT_DEPLOYMENT_ORDER;
-      await api("/api/settings", {
+      const dacfx = {
+        validationEnabled: Boolean($("dacfxValidationEnabled")?.checked),
+      };
+      const time = {
+        useSystemTime: $("useSystemTimeToggle") ? Boolean($("useSystemTimeToggle").checked) : true,
+        timeZone: $("timeZoneSelect")?.value || "",
+      };
+      const formatting = {
+        formatGeneratedSql: Boolean($("formatGeneratedSqlToggle")?.checked),
+      };
+      const saved = await api("/api/settings", {
         method: "PUT",
-        body: JSON.stringify({ folderNames, deploymentOrder }),
+        body: JSON.stringify({ folderNames, deploymentOrder, dacfx, time, formatting }),
       });
+      currentSettings = normalizeCustomizeSettings(saved);
+      applyTimeSettings(currentSettings.time);
+      applyFormattingSettings(currentSettings.formatting);
 
       showToast("All settings saved");
     } catch (error) {
@@ -3137,6 +4176,26 @@ function setupCustomize() {
     }
   };
 
+  // Live preview for the timezone controls (persisted on Save All)
+  const useSystemTimeToggle = $("useSystemTimeToggle");
+  const timeZoneSelect = $("timeZoneSelect");
+  if (useSystemTimeToggle) {
+    useSystemTimeToggle.addEventListener("change", () => {
+      applyTimeSettings({
+        useSystemTime: useSystemTimeToggle.checked,
+        timeZone: timeZoneSelect?.value || "",
+      });
+    });
+  }
+  if (timeZoneSelect) {
+    timeZoneSelect.addEventListener("change", () => {
+      applyTimeSettings({
+        useSystemTime: Boolean(useSystemTimeToggle?.checked),
+        timeZone: timeZoneSelect.value,
+      });
+    });
+  }
+
   $("resetCustomize").onclick = async function () {
     if (!confirm("Reset all customize settings to defaults?")) return;
     const restore = setButtonLoading(this, "Resetting…");
@@ -3144,7 +4203,7 @@ function setupCustomize() {
       showToast("Resetting script settings...", false);
       await api("/api/settings", {
         method: "PUT",
-        body: JSON.stringify({ folderNames: DEFAULT_FOLDER_NAMES, deploymentOrder: DEFAULT_DEPLOYMENT_ORDER }),
+        body: JSON.stringify({ folderNames: DEFAULT_FOLDER_NAMES, deploymentOrder: DEFAULT_DEPLOYMENT_ORDER, dacfx: { validationEnabled: false } }),
       });
       await loadSettings();
       applyTabVisibility([]);
@@ -3454,7 +4513,7 @@ function setupFontSelector() {
     if (persist) scheduleAppStateSave({ preferences: { fontSize: size } }, { delay: 0 });
   }
 
-  const savedFont = appState?.preferences?.fontFamily || readAppPreference("font", "Space Grotesk");
+  const savedFont = appState?.preferences?.fontFamily || readAppPreference("font", "Segoe UI");
   if (savedFont) applyFont(savedFont, false);
 
   const savedSize = appState?.preferences?.fontSize || Number(readAppPreference("fontSize", 14));
@@ -3520,10 +4579,51 @@ function setupProfileImportExport() {
   }
 }
 
+function downloadTextFile(fileName, content, mimeType = "text/plain") {
+  const blob = new Blob([content], { type: `${mimeType};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+async function setupFormatter() {
+  const host = $("formatterShell");
+  if (!host) return;
+
+  if (getFormatterWorkbench()?.destroy) {
+    getFormatterWorkbench().destroy();
+    globalThis.pebloyFormatterWorkbench = null;
+  }
+
+  if (!globalThis.PebloyFormatterWorkbench?.createFormatterWorkbench) {
+    throw new Error("Formatter workbench assets failed to load.");
+  }
+
+  globalThis.pebloyFormatterWorkbench = await globalThis.PebloyFormatterWorkbench.createFormatterWorkbench({
+    api,
+    beginTaskProgress,
+    buildTimestampFileSuffix,
+    downloadTextFile,
+    electronAPI: getElectronApi(),
+    endTaskProgress,
+    initialState: cloneJson(appState?.ui?.formatter || {}),
+    onStateChange(formatterState, { delay = 250 } = {}) {
+      scheduleAppStateSave({ ui: { formatter: formatterState } }, { delay, silent: true });
+    },
+    resetTaskProgress,
+    showToast,
+    updateTaskProgress,
+  });
+  requestAnimationFrame(() => getFormatterWorkbench()?.layout?.());
+}
+
 function setupKeyboardShortcuts() {
   document.addEventListener("keydown", (e) => {
     const sc = getShortcuts();
-    const runBtnIds = { objects: "resolveAndAddObjects", diff: "runDiff", backup: "runBackup", deploy: "runDeployment" };
+    const runBtnIds = { objects: "resolveAndAddObjects", diff: "runDiff", backup: "runBackup", deploy: "runDeployment", formatter: "formatterFormatBtn" };
     if (matchesShortcut(e, sc.runActiveTab || "Ctrl+Enter")) {
       e.preventDefault();
       const btn = $(runBtnIds[getActiveTabName()]);
@@ -3555,6 +4655,8 @@ async function start() {
   setupBackup();
   setupDeployment();
   setupCustomize();
+  await setupFormatter();
+  setupFormatSqlCheckboxes();
   setupUpdater();
   setupParallelTasksPanel();
   setupKeyboardShortcuts();
