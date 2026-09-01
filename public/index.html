@@ -108,13 +108,6 @@
           <label class="flag-label"><input type="checkbox" id="formatSqlDiff" /> Format Generated SQL</label>
           <button id="goToObjectsFromDiff" type="button" class="btn-ghost">Select Objects</button>
           <button id="runDiff" type="button">Run Diff</button>
-          <label>Export Format
-            <select id="diffExportFormat">
-              <option value="md">Markdown</option>
-              <option value="html">HTML</option>
-            </select>
-          </label>
-          <button id="exportDiff" type="button" class="btn-ghost">Export Diff</button>
         </div>
         <div id="diffEngineHint" class="deploy-mode-hint muted">Legacy Text Compare is the default for speed. DacFx is used only for structural comparisons like tables and types, and otherwise falls back automatically.</div>
         <div class="task-progress-wrap">
@@ -172,7 +165,7 @@
             <div class="upload-field">
               <div class="upload-field-label">Import Object List</div>
               <div class="path-input-row">
-                <button id="sharedObjectFileBrowse" type="button" class="btn-ghost">Choose File</button>
+                    <button id="sharedObjectFileBrowse" type="button" class="btn-ghost browse-icon-btn" title="Choose object list file" aria-label="Choose object list file"><span class="icon-file" aria-hidden="true"></span></button>
                 <span id="sharedObjectFileName" class="muted">No file selected</span>
               </div>
             </div>
@@ -218,8 +211,8 @@
         <p id="backupObjectSummary" class="muted"></p>
         <div class="inline-form">
           <label>Source Connection <select id="backupProfile"></select></label>
-          <label>Output Folder <input id="backupPath" placeholder="C:/Backups" /></label>
-          <button id="backupPathBrowse" type="button" class="btn-ghost">Choose Folder</button>
+          <label class="path-field path-field-wide">Output Folder <input id="backupPath" placeholder="C:/Backups" /></label>
+          <button id="backupPathBrowse" type="button" class="btn-ghost browse-icon-btn" title="Choose backup folder" aria-label="Choose backup folder"><span class="icon-folder" aria-hidden="true"></span></button>
           <label title="Format &amp; Execute additionally re-applies each procedure, view, function, and trigger to the SOURCE database via CREATE OR ALTER, so the stored definitions become formatted">
             SQL Formatting
             <select id="backupFormatMode">
@@ -247,8 +240,8 @@
           <label>Target Connection <select id="deployDestProfile"></select></label>
           <label>Engine
             <select id="deployEngine">
+              <option value="Legacy" selected>Legacy Per-Object Deployment</option>
               <option value="DacFx">DacFx Deployment</option>
-              <option value="Legacy">Legacy Per-Object Deployment</option>
             </select>
           </label>
           <label>
@@ -258,10 +251,9 @@
               <option value="Rollback">Validate Only (Rollback)</option>
             </select>
           </label>
-          <label>Script Output Folder <input id="deployScriptPath" placeholder="C:/ScriptExports" /></label>
-          <button id="deployPathBrowse" type="button" class="btn-ghost">Choose Folder</button>
+          <label class="path-field path-field-wide">Script Output Folder <input id="deployScriptPath" placeholder="C:/ScriptExports" /></label>
+          <button id="deployPathBrowse" type="button" class="btn-ghost browse-icon-btn" title="Choose script output folder" aria-label="Choose script output folder"><span class="icon-folder" aria-hidden="true"></span></button>
           <label class="flag-label"><input type="checkbox" id="continueOnError" /> Continue On Error</label>
-          <label class="flag-label"><input type="checkbox" id="allowSameSource" /> Allow Same Source and Target</label>
           <label class="flag-label"><input type="checkbox" id="formatSqlDeploy" /> Format Generated SQL</label>
           <button id="goToObjects" type="button" class="btn-ghost">Select Objects</button>
         </div>
@@ -431,14 +423,14 @@
               <label for="defaultBackupPath">Default Backup Folder</label>
               <div class="path-input-row">
                 <input id="defaultBackupPath" placeholder="C:/Backups" />
-                <button id="defaultBackupBrowse" type="button" class="btn-ghost">Choose Folder</button>
+                <button id="defaultBackupBrowse" type="button" class="btn-ghost browse-icon-btn" title="Choose default backup folder" aria-label="Choose default backup folder"><span class="icon-folder" aria-hidden="true"></span></button>
               </div>
             </div>
             <div class="customize-field">
               <label for="defaultScriptPath">Default Script Output Folder</label>
               <div class="path-input-row">
                 <input id="defaultScriptPath" placeholder="C:/ScriptExports" />
-                <button id="defaultScriptBrowse" type="button" class="btn-ghost">Choose Folder</button>
+                <button id="defaultScriptBrowse" type="button" class="btn-ghost browse-icon-btn" title="Choose default script output folder" aria-label="Choose default script output folder"><span class="icon-folder" aria-hidden="true"></span></button>
               </div>
             </div>
             <div class="customize-field">

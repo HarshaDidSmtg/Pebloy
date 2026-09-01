@@ -3,7 +3,7 @@ const { randomUUID } = require("crypto");
 const { readJson, writeJson, ensureJsonFile } = require("./storage");
 const { encryptPassword, decryptPassword } = require("./secretStore");
 
-const DATA_DIR = path.resolve(__dirname, "..", "..", "data");
+const DATA_DIR = process.env.DATA_DIR || path.resolve(__dirname, "..", "..", "data");
 const PROFILE_FILE = path.join(DATA_DIR, "profiles.json");
 const SECRET_FILE = path.join(DATA_DIR, "secrets.json");
 

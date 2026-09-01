@@ -37,6 +37,95 @@ function toWindowsLineEndings(text) {
   return String(text || "").replace(/\r?\n/g, "\r\n");
 }
 
+function isSqlIdentifierChar(char) {
+  return /[A-Za-z0-9_#$@]/.test(char || "");
+}
+
+function skipSqlString(text, index) {
+  let cursor = index + 1;
+  while (cursor < text.length) {
+    if (text[cursor] === "'") {
+      if (text[cursor + 1] === "'") {
+        cursor += 2;
+        continue;
+      }
+      return cursor + 1;
+    }
+    cursor += 1;
+  }
+  return text.length;
+}
+
+function skipBracketIdentifier(text, index) {
+  let cursor = index + 1;
+  while (cursor < text.length) {
+    if (text[cursor] === "]") {
+      if (text[cursor + 1] === "]") {
+        cursor += 2;
+        continue;
+      }
+      return cursor + 1;
+    }
+    cursor += 1;
+  }
+  return text.length;
+}
+
+function skipBlockComment(text, index) {
+  let cursor = index + 2;
+  let depth = 1;
+  while (cursor < text.length && depth > 0) {
+    if (text[cursor] === "/" && text[cursor + 1] === "*") {
+      depth += 1;
+      cursor += 2;
+      continue;
+    }
+    if (text[cursor] === "*" && text[cursor + 1] === "/") {
+      depth -= 1;
+      cursor += 2;
+      continue;
+    }
+    cursor += 1;
+  }
+  return cursor;
+}
+
+function findModuleDdlStart(text) {
+  const normalized = String(text || "");
+  const ddlPattern = /^(?:CREATE(?:\s+OR\s+ALTER)?|ALTER)\s+(?:PROCEDURE|PROC|VIEW|FUNCTION|TRIGGER)\b/i;
+  let index = 0;
+
+  while (index < normalized.length) {
+    const char = normalized[index];
+    const next = normalized[index + 1];
+
+    if (char === "-" && next === "-") {
+      const newlineIndex = normalized.indexOf("\n", index + 2);
+      index = newlineIndex === -1 ? normalized.length : newlineIndex + 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      index = skipBlockComment(normalized, index);
+      continue;
+    }
+    if (char === "'") {
+      index = skipSqlString(normalized, index);
+      continue;
+    }
+    if (char === "[") {
+      index = skipBracketIdentifier(normalized, index);
+      continue;
+    }
+
+    if (!isSqlIdentifierChar(normalized[index - 1]) && ddlPattern.test(normalized.slice(index))) {
+      return index;
+    }
+    index += 1;
+  }
+
+  return -1;
+}
+
 function definitionRows(definitions) {
   if (definitions instanceof Map) {
     return [...definitions.values()];
@@ -79,8 +168,8 @@ function getExpectedModulePattern(objectType) {
 
 function extractModuleValidationSegments(text) {
   const normalized = normalizeExactDefinitionText(text);
-  const match = MODULE_DDL_START_PATTERN.exec(normalized);
-  if (!match) {
+  const moduleStartIndex = findModuleDdlStart(normalized);
+  if (moduleStartIndex < 0) {
     return {
       normalized,
       leadingText: normalized,
@@ -88,7 +177,6 @@ function extractModuleValidationSegments(text) {
     };
   }
 
-  const moduleStartIndex = match.index + match[0].length - match[2].length;
   return {
     normalized,
     leadingText: normalized.slice(0, moduleStartIndex).trim(),

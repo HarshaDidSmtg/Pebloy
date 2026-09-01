@@ -4,6 +4,12 @@ function escapeSingleQuotes(value) {
   return String(value || "").replace(/'/g, "''");
 }
 
+function getWindowsPowerShellEnvironment() {
+  const env = { ...process.env };
+  delete env.PSModulePath;
+  return env;
+}
+
 function encryptPassword(plainText) {
   if (!plainText) {
     return null;
@@ -16,8 +22,9 @@ function encryptPassword(plainText) {
     "Write-Output $enc",
   ].join("; ");
 
-  const encrypted = execFileSync("powershell", ["-NoProfile", "-Command", script], {
+  const encrypted = execFileSync("powershell.exe", ["-NoProfile", "-Command", script], {
     encoding: "utf8",
+    env: getWindowsPowerShellEnvironment(),
   }).replace(/\r?\n$/, "");
 
   return encrypted;
@@ -37,8 +44,9 @@ function decryptPassword(cipherText) {
     "Write-Output $plain",
   ].join("; ");
 
-  const plain = execFileSync("powershell", ["-NoProfile", "-Command", script], {
+  const plain = execFileSync("powershell.exe", ["-NoProfile", "-Command", script], {
     encoding: "utf8",
+    env: getWindowsPowerShellEnvironment(),
   }).replace(/\r?\n$/, "");
 
   return plain;

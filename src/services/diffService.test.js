@@ -78,6 +78,22 @@ describe("compareObjects", () => {
     expect(result.details[0].status).toBe("Unchanged");
   });
 
+  it("compares generated definitionText from both connections when present", async () => {
+    generateScriptsForProfile
+      .mockResolvedValueOnce(
+        makeGeneratedInfo([{ objectType: "PROCEDURE", schemaName: "dbo", objectName: "GetUser", scriptPath: "/src/GetUser.sql", definitionText: "\uFEFFFORMATTED SQL" }])
+      )
+      .mockResolvedValueOnce(
+        makeGeneratedInfo([{ objectType: "PROCEDURE", schemaName: "dbo", objectName: "GetUser", scriptPath: "/dst/GetUser.sql", definitionText: "FORMATTED SQL" }])
+      );
+    fs.readFileSync.mockImplementation(() => "UNFORMATTED DIFFERENT SQL");
+
+    const result = await compareObjects({}, {}, [{ objectType: "PROCEDURE", schemaName: "dbo", objectName: "GetUser" }], { engine: "Legacy" });
+
+    expect(fs.readFileSync).not.toHaveBeenCalled();
+    expect(result.summary.unchanged).toBe(1);
+  });
+
   it("reports Changed when definitions differ", async () => {
     generateScriptsForProfile
       .mockResolvedValueOnce(

@@ -1,6 +1,6 @@
 {
   "name": "pebloy",
-  "version": "1.3.2",
+  "version": "2.0.0",
   "description": "SQL Server schema diff, backup, and deployment tool for Windows — compare, script, and deploy database objects.",
   "main": "src/electron/main.js",
   "author": "Pebloy Contributors",
@@ -32,13 +32,14 @@
     "prebuild": "node scripts/prebuild-win.js",
     "build": "electron-builder --win",
     "build:dir": "electron-builder --win --dir",
-    "check": "node --check src/server.js && node --check src/services/backupService.js && node --check src/services/deploymentService.js && node --check src/services/diffService.js && node --check src/services/loggingService.js && node --check src/services/profileService.js && node --check src/services/scriptAutomationService.js && node --check src/services/secretStore.js && node --check src/services/settingsService.js && node --check src/services/sqlService.js && node --check src/services/storage.js && node --check src/services/systemService.js && node --check src/electron/main.js && node --check public/app.js && node --check public/formatterWorkbench.js && node --check public/manualEntryEditor.js",
+    "check": "node --check src/server.js && node --check src/services/backupService.js && node --check src/services/deploymentService.js && node --check src/services/diffService.js && node --check src/services/loggingService.js && node --check src/services/profileService.js && node --check src/services/scriptAutomationService.js && node --check src/services/secretStore.js && node --check src/services/settingsService.js && node --check src/services/sqlService.js && node --check src/services/storage.js && node --check src/services/systemService.js && node --check src/services/updaterService.js && node --check src/electron/main.js && node --check src/electron/preload.js && node --check public/app.js && node --check public/formatterWorkbench.js && node --check public/manualEntryEditor.js",
     "test": "jest"
   },
   "dependencies": {
     "diff": "^5.2.0",
     "express": "^4.19.2",
     "monaco-editor": "^0.52.2",
+    "poor-mans-t-sql-formatter": "^1.6.10",
     "uuid": "^11.0.3"
   },
   "devDependencies": {
@@ -87,6 +88,7 @@
         }
       ],
       "icon": "build/icon.ico",
+      "requestedExecutionLevel": "asInvoker",
       "sign": null,
       "signingHashAlgorithms": null,
       "certificateSubjectName": null
@@ -95,7 +97,8 @@
       "oneClick": false,
       "perMachine": false,
       "allowElevation": false,
-      "allowToChangeInstallationDirectory": true,
+      "allowToChangeInstallationDirectory": false,
+      "artifactName": "Pebloy-Setup.exe",
       "installerIcon": "build/icon.ico",
       "uninstallerIcon": "build/icon.ico",
       "createDesktopShortcut": true,

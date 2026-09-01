@@ -25,11 +25,12 @@ describe("errorService", () => {
   });
 
   it("maps identical source and destination conflicts to conflict responses", () => {
-    const result = buildClientError(new Error("Source and destination are identical. Confirm override to proceed."));
+    const result = buildClientError(new Error("Source and destination are identical. Use Backup > Format & Execute in Source when you need to format objects in the same database."));
 
     expect(result.status).toBe(409);
     expect(result.resolutionSteps).toEqual([
-      "Choose different source and target profiles, or enable the explicit override if this is intentional.",
+      "Choose different source and target profiles for deployment.",
+      "Use Backup > Format & Execute in Source when you need to format objects in the same database.",
     ]);
   });
 });

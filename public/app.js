@@ -10,6 +10,9 @@ let appStateSaveTimer = null;
 let isApplyingAppState = false;
 const enhancedTextEditors = new Map();
 const DEFAULT_TAB = "credentials";
+const DEFAULT_APPEARANCE_THEME = "sepia";
+const DEFAULT_APPEARANCE_FONT_FAMILY = "JetBrains Mono";
+const DEFAULT_APPEARANCE_FONT_SIZE = 14;
 const _profileHealth = new Map(); // profileId → { status: 'ok'|'error'|'unknown', testedAt: ISO|null }
 let _lastDeployResults = []; // for retry failed
 let _profileSort = { col: "profileLabel", dir: "asc" };
@@ -17,6 +20,7 @@ let _selectionSort  = { col: null, dir: "asc" };
 let _discoveredSort = { col: null, dir: "asc" };
 let _discoverPage = 1;
 const DISCOVER_PAGE_SIZE = 50;
+const DEPENDENCY_REQUEST_TIMEOUT_MS = 45000;
 let _logSort = { col: "startedAt", dir: "desc" };
 let _deployResultSort = { col: null, dir: "asc" };
 const dependencyFetchCache = new Map();
@@ -430,10 +434,28 @@ function setButtonLoading(button, loadingText) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
+  const { timeoutMs = 0, ...fetchOptions } = options;
+  let timeoutId = null;
+  if (timeoutMs > 0) {
+    const controller = new AbortController();
+    fetchOptions.signal = controller.signal;
+    timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  }
+
+  let response;
+  try {
+    response = await fetch(path, {
+      headers: { "Content-Type": "application/json" },
+      ...fetchOptions,
+    });
+  } catch (error) {
+    if (timeoutMs > 0 && error?.name === "AbortError") {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)} seconds. Try again, refresh the dependency cache, or reduce the selected objects.`);
+    }
+    throw error;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
 
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
@@ -532,9 +554,9 @@ function collectCurrentAppState() {
       notificationsEnabled: Boolean($("notificationsToggle")?.checked),
       defaultBackupPath: $("defaultBackupPath")?.value.trim() || "",
       defaultScriptPath: $("defaultScriptPath")?.value.trim() || "",
-      theme: document.body.dataset.theme || "azure",
-      fontFamily: $("fontSelector")?.value || "Segoe UI",
-      fontSize: Number($("fontSizeRange")?.value || 14),
+      theme: document.body.dataset.theme || DEFAULT_APPEARANCE_THEME,
+      fontFamily: $("fontSelector")?.value || DEFAULT_APPEARANCE_FONT_FAMILY,
+      fontSize: Number($("fontSizeRange")?.value || DEFAULT_APPEARANCE_FONT_SIZE),
       logLevel: $("logLevelSelect")?.value || "Normal",
       hiddenTabs: Array.from(document.querySelectorAll(".tab[data-tab].hidden")).map((b) => b.dataset.tab),
       shortcuts,
@@ -547,17 +569,15 @@ function collectCurrentAppState() {
       sharedSelectedObjects: cloneJson(sharedSelectedObjects),
       diffSourceProfileId: $("diffSourceProfile")?.value || "",
       diffDestProfileId: $("diffDestProfile")?.value || "",
-      diffEngine: $("diffEngine")?.value || "DacFx",
-      diffExportFormat: $("diffExportFormat")?.value || "md",
+      diffEngine: $("diffEngine")?.value || "Legacy",
       backupProfileId: $("backupProfile")?.value || "",
       backupPath: $("backupPath")?.value.trim() || "",
       deploySourceProfileId: $("deploySourceProfile")?.value || "",
       deployDestProfileId: $("deployDestProfile")?.value || "",
-      deployEngine: $("deployEngine")?.value || "DacFx",
+      deployEngine: $("deployEngine")?.value || "Legacy",
       deployMode: $("deployMode")?.value || "ExecuteDirectly",
       deployScriptPath: $("deployScriptPath")?.value.trim() || "",
       continueOnError: Boolean($("continueOnError")?.checked),
-      allowSameSource: Boolean($("allowSameSource")?.checked),
       formatter: cloneJson(getFormatterWorkbench()?.getPersistedState?.() || appState?.ui?.formatter || {}),
     },
   };
@@ -590,8 +610,7 @@ function applyPersistedUiState() {
 
     if ($("diffSourceProfile")) $("diffSourceProfile").value = ui.diffSourceProfileId || "";
     if ($("diffDestProfile")) $("diffDestProfile").value = ui.diffDestProfileId || "";
-    if ($("diffEngine")) $("diffEngine").value = ui.diffEngine || "DacFx";
-    if ($("diffExportFormat")) $("diffExportFormat").value = ui.diffExportFormat || "md";
+    if ($("diffEngine")) $("diffEngine").value = ui.diffEngine || "Legacy";
 
     if ($("backupProfile")) $("backupProfile").value = ui.backupProfileId || "";
     if ($("backupPath")) {
@@ -601,7 +620,7 @@ function applyPersistedUiState() {
     if ($("deploySourceProfile")) $("deploySourceProfile").value = ui.deploySourceProfileId || "";
     if ($("deployDestProfile")) $("deployDestProfile").value = ui.deployDestProfileId || "";
     if ($("deployEngine")) {
-      $("deployEngine").value = ui.deployEngine || "DacFx";
+      $("deployEngine").value = ui.deployEngine || "Legacy";
       $("deployEngine").dispatchEvent(new Event("change"));
     }
     if ($("deployMode")) {
@@ -612,7 +631,6 @@ function applyPersistedUiState() {
       $("deployScriptPath").value = ui.deployScriptPath || prefs.defaultScriptPath || "";
     }
     if ($("continueOnError")) $("continueOnError").checked = Boolean(ui.continueOnError);
-    if ($("allowSameSource")) $("allowSameSource").checked = Boolean(ui.allowSameSource);
 
     getFormatterWorkbench()?.applyPersistedState?.(ui.formatter || {});
 
@@ -631,14 +649,12 @@ function bindAppStatePersistence() {
     "diffSourceProfile",
     "diffDestProfile",
     "diffEngine",
-    "diffExportFormat",
     "backupProfile",
     "deploySourceProfile",
     "deployDestProfile",
     "deployEngine",
     "deployMode",
     "continueOnError",
-    "allowSameSource",
     "notificationsToggle",
     "fontSelector",
     "fontSizeRange",
@@ -1974,6 +1990,7 @@ async function loadDependencyPickerCandidates({ profileId, sourceObjects, timeWi
     updateTaskProgress("objects", `Fetching dependencies for ${rootsToFetch.length} new object${rootsToFetch.length === 1 ? "" : "s"}...`, 35);
     const result = await api("/api/objects/dependencies", {
       method: "POST",
+      timeoutMs: DEPENDENCY_REQUEST_TIMEOUT_MS,
       body: JSON.stringify({
         profileId,
         objects: rootsToFetch,
@@ -2009,6 +2026,7 @@ async function exportDependencyQuery({ profileId, sourceObjects, timeWindow, sco
   const activeScope = scope === "allDependencies" ? "allDependencies" : "windowDependencies";
   const result = await api("/api/objects/dependencies/query", {
     method: "POST",
+    timeoutMs: DEPENDENCY_REQUEST_TIMEOUT_MS,
     body: JSON.stringify({
       profileId,
       objects: dedupeObjects(sourceObjects),
@@ -2762,7 +2780,7 @@ function setupDiff() {
           logLevel: $("logLevelSelect")?.value || "Normal",
           sourceProfileId,
           destinationProfileId,
-          engine: $("diffEngine")?.value || "DacFx",
+          engine: $("diffEngine")?.value || "Legacy",
           selectedObjects: sharedSelectedObjects,
         }),
       });
@@ -2783,24 +2801,6 @@ function setupDiff() {
     }
   };
 
-  $("exportDiff").onclick = async () => {
-    if (!currentDiffReport) {
-      showToast("Run a comparison first", true);
-      return;
-    }
-
-    try {
-      const format = $("diffExportFormat").value;
-      showToast("Exporting diff report...", false);
-      const result = await api("/api/diff/export", {
-        method: "POST",
-        body: JSON.stringify({ format, report: currentDiffReport }),
-      });
-      showToast(`Comparison report exported: ${result.filePath}`);
-    } catch (error) {
-      showToast(error.message, true);
-    }
-  };
 }
 
 function renderDiff(report) {
@@ -3134,7 +3134,7 @@ function setupDeployment() {
         body: JSON.stringify({
           sourceProfileId: $("deploySourceProfile")?.value || "",
           selectedObjects: sharedSelectedObjects,
-          engine: $("deployEngine")?.value || "DacFx",
+          engine: $("deployEngine")?.value || "Legacy",
         }),
       });
 
@@ -3191,7 +3191,7 @@ function setupDeployment() {
   }
 
   function updateDeployModeHint() {
-    const engine = $("deployEngine")?.value || "DacFx";
+    const engine = $("deployEngine")?.value || "Legacy";
     const baseHint = deployModeHints[$("deployMode").value] || "";
     const engineHint = engine === "DacFx"
       ? "DacFx mode uses semantic schema compare and a generated deployment script."
@@ -3274,10 +3274,9 @@ function setupDeployment() {
           logLevel: $("logLevelSelect")?.value || "Normal",
           sourceProfileId: srcProfileId,
           destinationProfileId: destProfileId,
-          engine: $("deployEngine")?.value || "DacFx",
+          engine: $("deployEngine")?.value || "Legacy",
           mode: $("deployMode").value,
           continueOnError: $("continueOnError").checked,
-          allowSameSourceDestination: $("allowSameSource").checked,
           selectedObjects: sharedSelectedObjects,
           options: {
             scriptOutputPath: $("deployScriptPath").value,
@@ -3829,10 +3828,13 @@ function setupUpdater() {
       if (!info.hasUpdate) {
         setStatus(`You're up to date (v${info.current}).`, "ok");
       } else {
-        setStatus(`v${info.latest} is available${info.releaseName ? ` — ${info.releaseName}` : ""}.`, "available");
         pendingDownloadUrl = info.downloadUrl;
         if (info.downloadUrl) {
+          const assetName = info.installerAssetName ? ` (${info.installerAssetName})` : "";
+          setStatus(`v${info.latest} is available${info.releaseName ? ` — ${info.releaseName}` : ""}${assetName}.`, "available");
           installBtn.hidden = false;
+        } else {
+          setStatus(`v${info.latest} is available, but the GitHub release has no installable Setup .exe asset.`, "error");
         }
         if (info.releaseUrl) {
           releaseLink.href = info.releaseUrl;
@@ -3881,9 +3883,9 @@ function setupTheme() {
     ? globalThis.PebloyThemes
     : [];
   const themeMap = new Map(themes.map((t) => [t.id, t]));
-  const fallbackThemeId = themeMap.has("azure") ? "azure" : themes[0]?.id;
+  const fallbackThemeId = themeMap.has(DEFAULT_APPEARANCE_THEME) ? DEFAULT_APPEARANCE_THEME : themes[0]?.id;
   const validThemes = themes.map((t) => t.id);
-  const savedTheme = appState?.preferences?.theme || readAppPreference("theme", "azure");
+  const savedTheme = appState?.preferences?.theme || readAppPreference("theme", DEFAULT_APPEARANCE_THEME);
   const saved = validThemes.includes(savedTheme) ? savedTheme : fallbackThemeId;
 
   const themeSelect = $("themeSelect");
@@ -4207,6 +4209,21 @@ function setupCustomize() {
       });
       await loadSettings();
       applyTabVisibility([]);
+      const themeSelect = $("themeSelect");
+      if (themeSelect) {
+        themeSelect.value = DEFAULT_APPEARANCE_THEME;
+        themeSelect.dispatchEvent(new Event("change"));
+      }
+      const fontSelect = $("fontSelector");
+      if (fontSelect) {
+        fontSelect.value = DEFAULT_APPEARANCE_FONT_FAMILY;
+        fontSelect.dispatchEvent(new Event("change"));
+      }
+      const fontSizeRange = $("fontSizeRange");
+      if (fontSizeRange) {
+        fontSizeRange.value = DEFAULT_APPEARANCE_FONT_SIZE;
+        fontSizeRange.dispatchEvent(new Event("input"));
+      }
       persistCurrentAppState();
       showToast("Settings reset to defaults");
     } catch (error) {
@@ -4513,12 +4530,12 @@ function setupFontSelector() {
     if (persist) scheduleAppStateSave({ preferences: { fontSize: size } }, { delay: 0 });
   }
 
-  const savedFont = appState?.preferences?.fontFamily || readAppPreference("font", "Segoe UI");
+  const savedFont = appState?.preferences?.fontFamily || readAppPreference("font", DEFAULT_APPEARANCE_FONT_FAMILY);
   if (savedFont) applyFont(savedFont, false);
 
-  const savedSize = appState?.preferences?.fontSize || Number(readAppPreference("fontSize", 14));
+  const savedSize = appState?.preferences?.fontSize || Number(readAppPreference("fontSize", DEFAULT_APPEARANCE_FONT_SIZE));
   if (savedSize) applyFontSize(Number(savedSize), false);
-  else if (sizeLabel) sizeLabel.textContent = sizeEl ? sizeEl.value + "px" : "14px";
+  else if (sizeLabel) sizeLabel.textContent = sizeEl ? sizeEl.value + "px" : `${DEFAULT_APPEARANCE_FONT_SIZE}px`;
 
   if (fontEl) fontEl.onchange = () => applyFont(fontEl.value);
   if (sizeEl) sizeEl.oninput = () => applyFontSize(Number(sizeEl.value));

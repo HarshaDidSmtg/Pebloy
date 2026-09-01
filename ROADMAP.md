@@ -44,9 +44,9 @@ All Backup, Diff, and Deploy modes currently require live database profiles. A f
 
 Current canonical-source validation is pattern-based (prefix checks, keyword scans). Compiler-grade validation using `sqlproj` / DacFx would catch syntax errors, unresolved references, and compatibility issues before execution. This requires a .NET toolchain dependency; the backend remains PowerShell-first.
 
-### Check for Updates — End-to-End Validation
+### Check for Updates — Release Publishing
 
-The updater IPC flow (check → download → stream progress → `shell.openPath` + `app.quit`) is implemented in `src/electron/main.js` and wired to the Settings UI. It has not been exercised against a real GitHub release because no release has been published yet. Validate the full round-trip once the first release is pushed to `HarshaDidSmtg/Pebloy`.
+The updater IPC flow is implemented and covered by service tests for release checks, installer asset selection, download progress, `shell.openPath`, and app quit scheduling. A real user-facing update still requires publishing a semantic-versioned GitHub release with a non-portable Setup `.exe` asset, for example `Pebloy-Setup.exe`.
 
 ### Diff Export Improvements
 

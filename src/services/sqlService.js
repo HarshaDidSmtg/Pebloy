@@ -80,9 +80,19 @@ function cleanPowerShellError(raw) {
   return xmlText || fallbackText;
 }
 
+function withUtf8PowerShellPreamble(scriptText) {
+  const normalized = String(scriptText || "").replace(/^\uFEFF/, "");
+  return [
+    "$OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+    "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)",
+    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+    normalized,
+  ].join("\n");
+}
+
 function runPowerShell(scriptText, maxBuffer = 1024 * 1024 * 20) {
   const tempFile = path.join(os.tmpdir(), `pebloy_${randomUUID()}.ps1`);
-  fs.writeFileSync(tempFile, scriptText, "utf8");
+  fs.writeFileSync(tempFile, withUtf8PowerShellPreamble(scriptText), "utf8");
 
   return new Promise((resolve, reject) => {
     execFile(
@@ -119,7 +129,7 @@ function runPowerShellLines(
   timeoutMs = POWERSHELL_TIMEOUT_MS
 ) {
   const tempFile = path.join(os.tmpdir(), `pebloy_${randomUUID()}.ps1`);
-  fs.writeFileSync(tempFile, scriptText, "utf8");
+  fs.writeFileSync(tempFile, withUtf8PowerShellPreamble(scriptText), "utf8");
 
   return new Promise((resolve, reject) => {
     let pending = "";
@@ -1319,91 +1329,141 @@ function buildObjectDependenciesQuery(objects = [], options = {}) {
     ? { start: dateWindow.start.replace(/Z$/i, ""), end: dateWindow.end.replace(/Z$/i, "") }
     : null;
   const dependencyDateFilter = sqlDateWindow
-    ? `\n    AND oc.modifiedDate IS NOT NULL\n    AND oc.modifiedDate >= CONVERT(datetime2, ${escapeSqlLiteral(sqlDateWindow.start)}, 126)\n    AND oc.modifiedDate <= CONVERT(datetime2, ${escapeSqlLiteral(sqlDateWindow.end)}, 126)`
+    ? `\n    AND dep.modifiedDate IS NOT NULL\n    AND dep.modifiedDate >= CONVERT(datetime2, ${escapeSqlLiteral(sqlDateWindow.start)}, 126)\n    AND dep.modifiedDate <= CONVERT(datetime2, ${escapeSqlLiteral(sqlDateWindow.end)}, 126)`
     : "";
 
   return `
 WITH InputObjects AS (
 ${inputCte}
 ),
-ObjectCatalog AS (
-  SELECT N'TABLE' AS objectType, s.name AS schemaName, t.name AS objectName, N'OBJECT:' + CONVERT(nvarchar(30), t.object_id) AS catalogKey, t.create_date AS createdDate, t.modify_date AS modifiedDate
-  FROM sys.tables t
-  INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
-  UNION ALL
-  SELECT CASE o.type WHEN 'V' THEN N'VIEW'
-                     WHEN 'P' THEN N'PROCEDURE'
-                     WHEN 'FN' THEN N'FUNCTION'
-                     WHEN 'TF' THEN N'FUNCTION'
-                     WHEN 'IF' THEN N'FUNCTION'
-                     WHEN 'TR' THEN N'TRIGGER' END,
-         s.name,
-         o.name,
-         N'OBJECT:' + CONVERT(nvarchar(30), o.object_id),
-         o.create_date,
-         o.modify_date
-  FROM sys.objects o
-  INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
-  WHERE o.type IN ('V','P','FN','TF','IF','TR')
-  UNION ALL
-  SELECT N'SYNONYM', s.name, sn.name, N'OBJECT:' + CONVERT(nvarchar(30), sn.object_id), sn.create_date, sn.modify_date
-  FROM sys.synonyms sn
-  INNER JOIN sys.schemas s ON s.schema_id = sn.schema_id
-  UNION ALL
-  SELECT N'SEQUENCE', s.name, sq.name, N'OBJECT:' + CONVERT(nvarchar(30), sq.object_id), sq.create_date, sq.modify_date
-  FROM sys.sequences sq
-  INNER JOIN sys.schemas s ON s.schema_id = sq.schema_id
-  UNION ALL
-  SELECT N'USER_DEFINED_TYPE', s.name, ty.name, N'TYPE:' + CONVERT(nvarchar(30), ty.user_type_id), NULL, NULL
-  FROM sys.types ty
-  INNER JOIN sys.schemas s ON s.schema_id = ty.schema_id
-  WHERE ty.is_user_defined = 1
-),
 RootObjects AS (
-  SELECT DISTINCT oc.catalogKey, oc.objectType, oc.schemaName, oc.objectName, oc.createdDate, oc.modifiedDate
+  SELECT DISTINCT
+    CASE o.type WHEN 'U' THEN N'TABLE'
+                WHEN 'V' THEN N'VIEW'
+                WHEN 'P' THEN N'PROCEDURE'
+                WHEN 'FN' THEN N'FUNCTION'
+                WHEN 'TF' THEN N'FUNCTION'
+                WHEN 'IF' THEN N'FUNCTION'
+                WHEN 'TR' THEN N'TRIGGER'
+                WHEN 'SN' THEN N'SYNONYM'
+                WHEN 'SO' THEN N'SEQUENCE' END AS objectType,
+    s.name AS schemaName,
+    o.name AS objectName,
+    N'OBJECT:' + CONVERT(nvarchar(30), o.object_id) AS catalogKey,
+    o.object_id AS objectId,
+    CAST(NULL AS int) AS typeId,
+    o.create_date AS createdDate,
+    o.modify_date AS modifiedDate
   FROM InputObjects io
-  INNER JOIN ObjectCatalog oc
-    ON LOWER(oc.objectName) = LOWER(io.objectName)
+  INNER JOIN sys.objects o
+    ON LOWER(o.name) = LOWER(io.objectName)
+   AND o.type IN ('U','V','P','FN','TF','IF','TR','SN','SO')
+  INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
    AND (
       NULLIF(LTRIM(RTRIM(io.schemaName)), '') IS NULL
-      OR LOWER(oc.schemaName) = LOWER(io.schemaName)
+      OR LOWER(s.name) = LOWER(io.schemaName)
+   )
+  UNION ALL
+  SELECT DISTINCT
+    N'USER_DEFINED_TYPE',
+    s.name,
+    ty.name,
+    N'TYPE:' + CONVERT(nvarchar(30), ty.user_type_id),
+    CAST(NULL AS int),
+    ty.user_type_id,
+    NULL,
+    NULL
+  FROM InputObjects io
+  INNER JOIN sys.types ty
+    ON LOWER(ty.name) = LOWER(io.objectName)
+   AND ty.is_user_defined = 1
+  INNER JOIN sys.schemas s ON s.schema_id = ty.schema_id
+   AND (
+      NULLIF(LTRIM(RTRIM(io.schemaName)), '') IS NULL
+      OR LOWER(s.name) = LOWER(io.schemaName)
    )
 ),
 DependencyEdges AS (
   SELECT
-    N'OBJECT:' + CONVERT(nvarchar(30), sed.referencing_id) AS sourceKey,
+    root.catalogKey AS sourceKey,
+    CASE WHEN sed.referenced_class = 6 THEN N'TYPE' ELSE N'OBJECT' END AS dependencyClass,
+    CASE WHEN sed.referenced_class = 6 THEN NULL ELSE sed.referenced_id END AS dependencyObjectId,
+    CASE WHEN sed.referenced_class = 6 THEN sed.referenced_id ELSE NULL END AS dependencyTypeId,
     CASE WHEN sed.referenced_class = 6
          THEN N'TYPE:' + CONVERT(nvarchar(30), sed.referenced_id)
          ELSE N'OBJECT:' + CONVERT(nvarchar(30), sed.referenced_id)
     END AS dependencyKey
-  FROM sys.sql_expression_dependencies sed
-  WHERE sed.referenced_id IS NOT NULL
+  FROM RootObjects root
+  INNER JOIN sys.sql_expression_dependencies sed ON sed.referencing_id = root.objectId
+  WHERE root.objectId IS NOT NULL
+    AND sed.referenced_id IS NOT NULL
     AND sed.referenced_class IN (1, 6)
   UNION
-  SELECT N'OBJECT:' + CONVERT(nvarchar(30), fk.parent_object_id), N'OBJECT:' + CONVERT(nvarchar(30), fk.referenced_object_id)
-  FROM sys.foreign_keys fk
+  SELECT root.catalogKey, N'OBJECT', fk.referenced_object_id, NULL, N'OBJECT:' + CONVERT(nvarchar(30), fk.referenced_object_id)
+  FROM RootObjects root
+  INNER JOIN sys.foreign_keys fk ON fk.parent_object_id = root.objectId
+  WHERE root.objectId IS NOT NULL
   UNION
-  SELECT N'OBJECT:' + CONVERT(nvarchar(30), c.object_id), N'TYPE:' + CONVERT(nvarchar(30), c.user_type_id)
-  FROM sys.columns c
+  SELECT root.catalogKey, N'TYPE', NULL, c.user_type_id, N'TYPE:' + CONVERT(nvarchar(30), c.user_type_id)
+  FROM RootObjects root
+  INNER JOIN sys.columns c ON c.object_id = root.objectId
   INNER JOIN sys.types ty ON ty.user_type_id = c.user_type_id
-  WHERE ty.is_user_defined = 1
+  WHERE root.objectId IS NOT NULL
+    AND ty.is_user_defined = 1
   UNION
-  SELECT N'OBJECT:' + CONVERT(nvarchar(30), sn.object_id), N'OBJECT:' + CONVERT(nvarchar(30), OBJECT_ID(sn.base_object_name))
-  FROM sys.synonyms sn
-  WHERE OBJECT_ID(sn.base_object_name) IS NOT NULL
+  SELECT root.catalogKey, N'OBJECT', OBJECT_ID(sn.base_object_name), NULL, N'OBJECT:' + CONVERT(nvarchar(30), OBJECT_ID(sn.base_object_name))
+  FROM RootObjects root
+  INNER JOIN sys.synonyms sn ON sn.object_id = root.objectId
+  WHERE root.objectId IS NOT NULL
+    AND OBJECT_ID(sn.base_object_name) IS NOT NULL
+),
+DependencyObjects AS (
+  SELECT DISTINCT
+    CASE o.type WHEN 'U' THEN N'TABLE'
+                WHEN 'V' THEN N'VIEW'
+                WHEN 'P' THEN N'PROCEDURE'
+                WHEN 'FN' THEN N'FUNCTION'
+                WHEN 'TF' THEN N'FUNCTION'
+                WHEN 'IF' THEN N'FUNCTION'
+                WHEN 'TR' THEN N'TRIGGER'
+                WHEN 'SN' THEN N'SYNONYM'
+                WHEN 'SO' THEN N'SEQUENCE' END AS objectType,
+    s.name AS schemaName,
+    o.name AS objectName,
+    N'OBJECT:' + CONVERT(nvarchar(30), o.object_id) AS catalogKey,
+    o.create_date AS createdDate,
+    o.modify_date AS modifiedDate
+  FROM (SELECT DISTINCT dependencyObjectId FROM DependencyEdges WHERE dependencyObjectId IS NOT NULL) target
+  INNER JOIN sys.objects o
+    ON o.object_id = target.dependencyObjectId
+   AND o.type IN ('U','V','P','FN','TF','IF','TR','SN','SO')
+  INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
+  UNION ALL
+  SELECT DISTINCT
+    N'USER_DEFINED_TYPE',
+    s.name,
+    ty.name,
+    N'TYPE:' + CONVERT(nvarchar(30), ty.user_type_id),
+    NULL,
+    NULL
+  FROM (SELECT DISTINCT dependencyTypeId FROM DependencyEdges WHERE dependencyTypeId IS NOT NULL) target
+  INNER JOIN sys.types ty
+    ON ty.user_type_id = target.dependencyTypeId
+   AND ty.is_user_defined = 1
+  INNER JOIN sys.schemas s ON s.schema_id = ty.schema_id
 )
 SELECT objectType, schemaName, objectName, createdDate, modifiedDate, parentObjectType, parentSchemaName, parentObjectName
 FROM (
   SELECT DISTINCT
-    oc.objectType,
-    oc.schemaName,
-    oc.objectName,
-    oc.createdDate,
-    oc.modifiedDate,
+    dep.objectType,
+    dep.schemaName,
+    dep.objectName,
+    dep.createdDate,
+    dep.modifiedDate,
     root.objectType AS parentObjectType,
     root.schemaName AS parentSchemaName,
     root.objectName AS parentObjectName,
-    CASE oc.objectType
+    CASE dep.objectType
       WHEN 'USER_DEFINED_TYPE' THEN 1
       WHEN 'SEQUENCE' THEN 2
       WHEN 'TABLE' THEN 3
@@ -1416,11 +1476,11 @@ FROM (
     END AS sortOrder
   FROM RootObjects root
   INNER JOIN DependencyEdges edge ON edge.sourceKey = root.catalogKey
-  INNER JOIN ObjectCatalog oc ON oc.catalogKey = edge.dependencyKey
+  INNER JOIN DependencyObjects dep ON dep.catalogKey = edge.dependencyKey
   WHERE NOT EXISTS (
     SELECT 1
     FROM RootObjects existingRoot
-    WHERE existingRoot.catalogKey = oc.catalogKey
+    WHERE existingRoot.catalogKey = dep.catalogKey
   )${dependencyDateFilter}
 ) DependencyResults
 ORDER BY sortOrder, schemaName, objectName

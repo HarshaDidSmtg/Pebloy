@@ -62,7 +62,9 @@ npm run electron:dev
 npm run build
 ```
 
-Output: `dist/Pebloy Setup <version>.exe`
+Output: `dist/Pebloy-Setup.exe`
+
+The generated Setup `.exe` installs per user under the current Windows account. It does not request administrator credentials because the installer is configured with `perMachine: false`, `allowElevation: false`, and `requestedExecutionLevel: asInvoker`.
 
 ---
 

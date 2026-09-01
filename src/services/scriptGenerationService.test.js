@@ -266,6 +266,28 @@ describe("validateCanonicalSourceArtifacts", () => {
     ])).not.toThrow();
   });
 
+  it("accepts procedure source when a block comment closes immediately before CREATE", () => {
+    expect(() => validateCanonicalSourceArtifacts([
+      {
+        objectType: "PROCEDURE",
+        schemaName: "Reports",
+        objectName: "UspGetEECCSummaryReport",
+        definitionText: "/*\nEXEC [Reports].[UspGetEECCSummaryReport]\n*/CREATE         PROCEDURE Reports.UspGetEECCSummaryReport AS SELECT 1",
+      },
+    ])).not.toThrow();
+  });
+
+  it("does not treat CREATE text inside a leading block comment as module DDL", () => {
+    expect(() => validateCanonicalSourceArtifacts([
+      {
+        objectType: "PROCEDURE",
+        schemaName: "dbo",
+        objectName: "BadCommentOnlyProc",
+        definitionText: "/*\nCREATE PROCEDURE dbo.BadCommentOnlyProc AS SELECT 1\n*/\nRETURN 1",
+      },
+    ])).toThrow(/Expected the canonical PROCEDURE/);
+  });
+
   it("rejects function source that never reaches a CREATE/ALTER module statement", () => {
     expect(() => validateCanonicalSourceArtifacts([
       {

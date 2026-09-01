@@ -1,7 +1,7 @@
 const path = require("path");
 const { readJson, writeJson, writeJsonAtomic } = require("./storage");
 
-const DATA_DIR = path.resolve(__dirname, "..", "..", "data");
+const DATA_DIR = process.env.DATA_DIR || path.resolve(__dirname, "..", "..", "data");
 const APP_STATE_PATH = path.join(DATA_DIR, "app-state.json");
 
 const DEFAULT_SHORTCUTS = {
@@ -14,6 +14,7 @@ const DEFAULT_SHORTCUTS = {
 };
 
 const DEFAULT_THEME_FAVORITES = [
+  "sepia",
   "light",
   "dark",
   "cyberpunk",
@@ -41,9 +42,9 @@ const DEFAULT_APP_STATE = {
     notificationsEnabled: false,
     defaultBackupPath: "",
     defaultScriptPath: "",
-    theme: "dark",
+    theme: "sepia",
     favoriteThemes: [...DEFAULT_THEME_FAVORITES],
-    fontFamily: "Space Grotesk",
+    fontFamily: "JetBrains Mono",
     fontSize: 14,
     logLevel: "Normal",
     hiddenTabs: [],
@@ -57,15 +58,14 @@ const DEFAULT_APP_STATE = {
     sharedSelectedObjects: [],
     diffSourceProfileId: "",
     diffDestProfileId: "",
-    diffExportFormat: "md",
     backupProfileId: "",
     backupPath: "",
     deploySourceProfileId: "",
     deployDestProfileId: "",
+    deployEngine: "Legacy",
     deployMode: "ExecuteDirectly",
     deployScriptPath: "",
     continueOnError: false,
-    allowSameSource: false,
     formatter: {},
   },
 };
@@ -134,15 +134,14 @@ function sanitizeState(raw = {}) {
       sharedSelectedObjects: Array.isArray(merged.ui.sharedSelectedObjects) ? merged.ui.sharedSelectedObjects : [],
       diffSourceProfileId: String(merged.ui.diffSourceProfileId || ""),
       diffDestProfileId: String(merged.ui.diffDestProfileId || ""),
-      diffExportFormat: String(merged.ui.diffExportFormat || DEFAULT_APP_STATE.ui.diffExportFormat),
       backupProfileId: String(merged.ui.backupProfileId || ""),
       backupPath: String(merged.ui.backupPath || ""),
       deploySourceProfileId: String(merged.ui.deploySourceProfileId || ""),
       deployDestProfileId: String(merged.ui.deployDestProfileId || ""),
+      deployEngine: String(merged.ui.deployEngine || DEFAULT_APP_STATE.ui.deployEngine),
       deployMode: String(merged.ui.deployMode || DEFAULT_APP_STATE.ui.deployMode),
       deployScriptPath: String(merged.ui.deployScriptPath || ""),
       continueOnError: Boolean(merged.ui.continueOnError),
-      allowSameSource: Boolean(merged.ui.allowSameSource),
       formatter: merged.ui.formatter && typeof merged.ui.formatter === "object" && !Array.isArray(merged.ui.formatter)
         ? merged.ui.formatter
         : {},

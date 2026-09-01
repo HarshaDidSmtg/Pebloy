@@ -2,9 +2,11 @@ const fs = require("fs");
 const path = require("path");
 const { ensureDir } = require("./storage");
 
-const DATA_DIR = path.resolve(__dirname, "..", "..", "data");
+const ROOT_DIR = path.resolve(__dirname, "..", "..");
+const DATA_DIR = process.env.DATA_DIR || path.join(ROOT_DIR, "data");
+const ARTIFACT_DIR = process.env.ARTIFACTS_DIR || path.join(ROOT_DIR, "artifacts");
 const SETTINGS_PATH = path.join(DATA_DIR, "settings.json");
-const LEGACY_SETTINGS_PATH = path.resolve(__dirname, "..", "..", "artifacts", "settings.json");
+const LEGACY_SETTINGS_PATH = path.join(ARTIFACT_DIR, "settings.json");
 
 const DEFAULTS = {
   folderNames: {

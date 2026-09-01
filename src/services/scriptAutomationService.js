@@ -7,7 +7,7 @@ const { ensureDir } = require("./storage");
 
 const ROOT_DIR = path.resolve(__dirname, "..", "..");
 const TEMP_DIR = process.env.TEMP_DIR || path.resolve(ROOT_DIR, "artifacts", "temp");
-const VENDOR_MODULES_DIR = path.resolve(ROOT_DIR, "vendor", "ps-modules");
+const VENDOR_MODULES_DIR = process.env.PS_MODULES_DIR || path.resolve(ROOT_DIR, "vendor", "ps-modules");
 
 function resolvePowerShellScriptPath(envValue, scriptName) {
   if (envValue) {

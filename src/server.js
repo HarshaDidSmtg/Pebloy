@@ -1,6 +1,7 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const packageMetadata = require("../package.json");
 
 const {
   listProfiles,
@@ -151,7 +152,8 @@ function requireProfile(id) {
 
 const DEFAULT_PORT = 5089;
 const MAX_PORT_SCAN_ATTEMPTS = 50;
-const SERVER_INFO_FILE = path.resolve(__dirname, "..", "data", "server-info.json");
+const DATA_DIR = process.env.DATA_DIR || path.resolve(__dirname, "..", "data");
+const SERVER_INFO_FILE = path.join(DATA_DIR, "server-info.json");
 
 function parseDesiredPort(value) {
   const parsed = Number.parseInt(value, 10);
@@ -480,10 +482,9 @@ app.post("/api/deploy/run", async (req, res) => {
 
     if (
       sourceProfile.serverName === destinationProfile.serverName &&
-      sourceProfile.databaseName === destinationProfile.databaseName &&
-      !req.body.allowSameSourceDestination
+      sourceProfile.databaseName === destinationProfile.databaseName
     ) {
-      throw new Error("Source and destination are identical. Confirm override to proceed.");
+      throw new Error("Source and destination are identical. Use Backup > Format & Execute in Source when you need to format objects in the same database.");
     }
 
     task = createTaskLog("Deploy", {
@@ -714,7 +715,7 @@ app.post("/api/data-import", (req, res) => {
 app.get("/api/status", (req, res) => {
   res.json({
     app: "Pebloy",
-    version: "1.0.0",
+    version: packageMetadata.version,
     runningTasks: runningTasks.size,
     profiles: listProfiles().length,
     port: req.socket.localPort,
@@ -734,5 +735,6 @@ listenOnAvailablePort(app, desiredPort)
   })
   .catch((error) => {
     console.error(`Pebloy failed to start: ${error.message}`);
+    if (error.stack) console.error(error.stack);
     process.exit(1);
   });

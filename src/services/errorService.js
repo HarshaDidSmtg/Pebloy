@@ -61,7 +61,8 @@ function buildClientError(error, fallbackStatus = 400) {
     ];
   } else if (/source and destination are identical/.test(lower)) {
     resolutionSteps = [
-      "Choose different source and target profiles, or enable the explicit override if this is intentional.",
+      "Choose different source and target profiles for deployment.",
+      "Use Backup > Format & Execute in Source when you need to format objects in the same database.",
     ];
   } else if (/bulk script generation failed|dbobjectsbulkscriptgenerator/i.test(lower)) {
     resolutionSteps = [

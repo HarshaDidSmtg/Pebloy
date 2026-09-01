@@ -9,7 +9,7 @@ jest.mock("./storage", () => ({
   writeJsonAtomic: (_filePath, data) => { mockStore[_filePath] = JSON.parse(JSON.stringify(data)); },
 }));
 
-const { getAppState, saveAppState, DEFAULT_SHORTCUTS, DEFAULT_THEME_FAVORITES } = require("./appStateService");
+const { getAppState, saveAppState, DEFAULT_APP_STATE, DEFAULT_SHORTCUTS, DEFAULT_THEME_FAVORITES } = require("./appStateService");
 
 beforeEach(() => { mockStore = {}; });
 
@@ -18,6 +18,25 @@ describe("appStateService — shortcuts", () => {
     const state = getAppState();
     expect(state.preferences.shortcuts).toEqual(DEFAULT_SHORTCUTS);
     expect(state.preferences.hiddenTabs).toEqual([]);
+  });
+
+  it("uses Sepia, JetBrains Mono, and 14px as durable appearance defaults", () => {
+    const state = getAppState();
+    expect(state.preferences.theme).toBe("sepia");
+    expect(state.preferences.fontFamily).toBe("JetBrains Mono");
+    expect(state.preferences.fontSize).toBe(14);
+    expect(DEFAULT_APP_STATE.preferences).toEqual(expect.objectContaining({
+      theme: "sepia",
+      fontFamily: "JetBrains Mono",
+      fontSize: 14,
+    }));
+  });
+
+  it("uses Legacy deploy engine by default and drops retired same-source deploy override", () => {
+    saveAppState({ ui: { allowSameSource: true } });
+    const state = getAppState();
+    expect(state.ui.deployEngine).toBe("Legacy");
+    expect(state.ui.allowSameSource).toBeUndefined();
   });
 
   it("saves a custom shortcut and reads it back", () => {

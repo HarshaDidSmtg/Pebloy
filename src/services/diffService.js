@@ -130,11 +130,16 @@ function scriptsToMap(scripts) {
   const result = new Map();
   for (const script of scripts || []) {
     const key = buildObjectKey(script.objectType, script.schemaName, script.objectName);
+    const definitionText = script.definitionText !== undefined
+      ? String(script.definitionText || "")
+      : fs.existsSync(script.scriptPath)
+        ? fs.readFileSync(script.scriptPath, "utf8")
+        : "";
     result.set(key, {
       objectType: script.objectType,
       schemaName: script.schemaName,
       objectName: script.objectName,
-      definition: fs.existsSync(script.scriptPath) ? normalizeDdlKeywords(fs.readFileSync(script.scriptPath, "utf8").trim()) : "",
+      definition: normalizeDdlKeywords(definitionText.replace(/^\uFEFF/, "").trim()),
     });
   }
   return result;

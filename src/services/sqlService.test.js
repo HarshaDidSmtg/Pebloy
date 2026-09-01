@@ -93,7 +93,34 @@ describe("executeSqlScriptsIndividually", () => {
     expect(decodedQuery).toContain("inputSchemaName");
   });
 
-  it("builds recursive dependency-list queries from SQL metadata", async () => {
+  it("forces UTF-8 PowerShell output for SQL query wrappers", async () => {
+    execFile.mockImplementation((_command, _args, _options, callback) => {
+      const stdout = new EventEmitter();
+      const child = { stdout };
+
+      process.nextTick(() => {
+        callback(null, "[]", "");
+      });
+
+      return child;
+    });
+
+    await fetchObjectDefinitionMap(
+      {
+        serverName: "srcServer",
+        databaseName: "srcDb",
+        authenticationType: "Windows",
+      },
+      [{ objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcA" }]
+    );
+
+    const scriptText = fs.writeFileSync.mock.calls[0][1];
+
+    expect(scriptText).toContain("$OutputEncoding = [System.Text.UTF8Encoding]::new($false)");
+    expect(scriptText).toContain("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)");
+  });
+
+  it("builds first-hop dependency-list queries from selected root objects", async () => {
     execFile.mockImplementation((_command, _args, _options, callback) => {
       const stdout = new EventEmitter();
       const child = { stdout };
@@ -123,10 +150,14 @@ describe("executeSqlScriptsIndividually", () => {
     expect(decodedQuery).toContain("sys.foreign_keys");
     expect(decodedQuery).not.toContain("RecursiveDependencies");
     expect(decodedQuery).not.toContain("MAXRECURSION");
+    expect(decodedQuery).not.toContain("ObjectCatalog AS");
+    expect(decodedQuery).toContain("RootObjects AS");
+    expect(decodedQuery).toContain("DependencyObjects AS");
+    expect(decodedQuery).toContain("INNER JOIN sys.sql_expression_dependencies sed ON sed.referencing_id = root.objectId");
     expect(decodedQuery).toContain("INNER JOIN DependencyEdges edge ON edge.sourceKey = root.catalogKey");
     expect(decodedQuery).toContain("parentObjectType");
-    expect(decodedQuery).toContain("oc.modifiedDate >= CONVERT(datetime2");
-    expect(decodedQuery).toContain("oc.modifiedDate <= CONVERT(datetime2");
+    expect(decodedQuery).toContain("dep.modifiedDate >= CONVERT(datetime2");
+    expect(decodedQuery).toContain("dep.modifiedDate <= CONVERT(datetime2");
     expect(decodedQuery).toContain("AS sortOrder");
     expect(decodedQuery).toContain("ORDER BY sortOrder, schemaName, objectName");
   });
