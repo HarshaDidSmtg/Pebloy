@@ -21,13 +21,13 @@ function isDacFxEngine(value) {
 }
 
 function quoteConnectionValue(value) {
-  return String(value || "").replace(/;/g, ";;");
+  return `"${String(value || "").replace(/"/g, '""')}"`;
 }
 
 function buildConnectionString(profile) {
   const authType = String(profile.authenticationType || "Windows").trim().toLowerCase();
   const parts = [
-    `Data Source=tcp:${quoteConnectionValue(profile.serverName)}`,
+    `Data Source=${quoteConnectionValue(`tcp:${profile.serverName || ""}`)}`,
     `Initial Catalog=${quoteConnectionValue(profile.databaseName)}`,
     "TrustServerCertificate=True",
     "Encrypt=False",
@@ -47,7 +47,8 @@ function buildConnectionString(profile) {
 }
 
 function buildWorkerLaunch() {
-  const resourceBase = process.resourcesPath ? path.join(process.resourcesPath, DACFX_RESOURCE_DIR) : null;
+  const resourcesPath = process.env.PEBLOY_RESOURCES_PATH || process.resourcesPath;
+  const resourceBase = resourcesPath ? path.join(resourcesPath, DACFX_RESOURCE_DIR) : null;
   const packagedExe = resourceBase ? path.join(resourceBase, DACFX_EXE_NAME) : null;
   const packagedDll = resourceBase ? path.join(resourceBase, DACFX_DLL_NAME) : null;
   if (packagedExe && fs.existsSync(packagedExe)) {
@@ -56,6 +57,7 @@ function buildWorkerLaunch() {
   if (packagedDll && fs.existsSync(packagedDll)) {
     return { command: "dotnet", args: [packagedDll] };
   }
+  if (process.env.PEBLOY_RESOURCES_PATH) throw new Error("The packaged DacFx worker is missing. Repair the Pebloy installation.");
 
   const devExe = path.join(DACFX_DEV_PUBLISH_DIR, DACFX_EXE_NAME);
   const devDll = path.join(DACFX_DEV_PUBLISH_DIR, DACFX_DLL_NAME);
@@ -99,27 +101,49 @@ function runWorker(commandName, payload) {
 
   return new Promise((resolve, reject) => {
     const child = spawn(launch.command, [...launch.args], {
-      cwd: ROOT_DIR,
+      cwd: process.env.PEBLOY_RESOURCES_PATH || ROOT_DIR,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
 
     let stdout = "";
     let stderr = "";
+    let outputBytes = 0;
+    let failure = null;
+    const timeoutMs = commandName === "compare" ? 30000 : 120000;
+    const stop = (error) => {
+      if (failure) return;
+      failure = error;
+      child.kill();
+    };
+    const timeout = setTimeout(() => stop(new Error(`DacFx ${commandName} timed out after ${timeoutMs} ms.`)), timeoutMs);
+
+    const acceptChunk = (chunk) => {
+      if (failure) return false;
+      outputBytes += Buffer.byteLength(chunk);
+      if (outputBytes > 20 * 1024 * 1024) {
+        stop(new Error(`DacFx ${commandName} output exceeded 20 MB.`));
+        return false;
+      }
+      return true;
+    };
 
     child.stdout.on("data", (chunk) => {
-      stdout += String(chunk || "");
+      if (acceptChunk(chunk)) stdout += String(chunk || "");
     });
 
     child.stderr.on("data", (chunk) => {
-      stderr += String(chunk || "");
+      if (acceptChunk(chunk)) stderr += String(chunk || "");
     });
 
     child.on("error", (error) => {
+      clearTimeout(timeout);
       reject(new Error(`Failed to start DacFx worker: ${error.message}`));
     });
 
     child.on("close", (exitCode) => {
+      clearTimeout(timeout);
+      if (failure) { reject(failure); return; }
       let parsedBody = null;
       if (stdout.trim()) {
         try {
@@ -145,6 +169,7 @@ function runWorker(commandName, payload) {
       resolve(parsedBody.result);
     });
 
+    child.stdin.on("error", (error) => stop(new Error(`Cannot send request to DacFx worker: ${error.message}`)));
     child.stdin.write(requestBody);
     child.stdin.end();
   });
@@ -208,6 +233,7 @@ async function deployGeneratedArtifacts({ taskId, sourceScripts, destinationProf
 }
 
 module.exports = {
+  inspectScripts: (scripts) => runWorker("inspect", { scripts }),
   normalizeEngine,
   isDacFxEngine,
   buildConnectionString,

@@ -23,6 +23,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($env:PEBLOY_CREDENTIAL_STDIN -eq "1") {
+    $credentialInput = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())) | ConvertFrom-Json
+    $Password = [string]$credentialInput.Password
+    Remove-Variable credentialInput
+}
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 # Parse folder name overrides (if provided)
 $_folderOverrides = @{}
@@ -668,7 +676,7 @@ o.name AS ObjectName,
 o.type_desc AS TypeDesc,
 o.create_date AS CreateDate
 FROM sys.objects o WITH (NOLOCK)
-WHERE o.type IN ('U','FN','IF','TF','V','SN','SO','P')
+WHERE o.type IN ('U','FN','IF','TF','V','SN','SO','P','TR')
 AND o.name IN ($nameList)
 
 UNION ALL
@@ -785,6 +793,7 @@ WHERE ty.is_user_defined = 1
             "SEQUENCE_OBJECT"      { "Sequences" }
             "USER_TABLE_TYPE"      { "User Defined Types" }
             "USER_ALIAS_TYPE"      { "User Defined Types" }
+            "SQL_TRIGGER"          { "Triggers" }
             default                { "Functions" }
         }
 
@@ -813,7 +822,7 @@ WHERE ty.is_user_defined = 1
     }
 
         $text = ""
-        if ($typeKey -in @("Stored Procedures", "Views", "Functions")) {
+        if ($typeKey -in @("Stored Procedures", "Views", "Functions", "Triggers")) {
             # Prefer the database module definition so source exports preserve the authored formatting.
             $escapedSchema = $resolvedSchema.Replace("'", "''")
             $escapedName = $resolvedObjectName.Replace("'", "''")

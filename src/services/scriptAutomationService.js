@@ -1,4 +1,5 @@
 const fs = require("fs");
+const { replaceSqlCode } = require("./sqlBatchService");
 const os = require("os");
 const path = require("path");
 const { randomUUID } = require("crypto");
@@ -7,7 +8,8 @@ const { ensureDir } = require("./storage");
 
 const ROOT_DIR = path.resolve(__dirname, "..", "..");
 const TEMP_DIR = process.env.TEMP_DIR || path.resolve(ROOT_DIR, "artifacts", "temp");
-const VENDOR_MODULES_DIR = path.resolve(ROOT_DIR, "vendor", "ps-modules");
+const VENDOR_MODULES_DIR = process.env.PS_MODULES_DIR || path.resolve(ROOT_DIR, "vendor", "ps-modules");
+const SQL_SERVER_MODULE_VERSION = "22.4.5.1";
 
 function resolvePowerShellScriptPath(envValue, scriptName) {
   if (envValue) {
@@ -15,8 +17,9 @@ function resolvePowerShellScriptPath(envValue, scriptName) {
   }
 
   const candidates = [];
-  if (process.resourcesPath) {
-    candidates.push(path.resolve(process.resourcesPath, "scripts", "powershell", scriptName));
+  const resourcesPath = process.env.PEBLOY_RESOURCES_PATH || process.resourcesPath;
+  if (resourcesPath) {
+    candidates.push(path.resolve(resourcesPath, "scripts", "powershell", scriptName));
   }
   candidates.push(path.resolve(ROOT_DIR, "scripts", "powershell", scriptName));
 
@@ -111,17 +114,23 @@ function buildPsModulePath() {
 }
 
 let _sqlServerModulePromise = null;
+function getSqlServerModuleStatus() {
+  const modulePath = path.join(VENDOR_MODULES_DIR, "SqlServer", SQL_SERVER_MODULE_VERSION, "SqlServer.psd1");
+  return { version: SQL_SERVER_MODULE_VERSION, filesPresent: fs.existsSync(modulePath), modulePath, repairInstallation: Boolean(process.env.PEBLOY_RESOURCES_PATH) };
+}
+
 function ensureSqlServerModule() {
   if (_sqlServerModulePromise) return _sqlServerModulePromise;
 
-  const moduleDir = path.join(VENDOR_MODULES_DIR, "SqlServer");
-  if (fs.existsSync(moduleDir)) {
+  const moduleDir = path.join(VENDOR_MODULES_DIR, "SqlServer", SQL_SERVER_MODULE_VERSION);
+  if (fs.existsSync(path.join(moduleDir, "SqlServer.psd1"))) {
     _sqlServerModulePromise = Promise.resolve();
     return _sqlServerModulePromise;
   }
 
+  if (process.env.PEBLOY_RESOURCES_PATH) return Promise.reject(new Error("The packaged SqlServer module is missing. Repair the Pebloy installation."));
   fs.mkdirSync(VENDOR_MODULES_DIR, { recursive: true });
-  const installScript = `Save-Module -Name SqlServer -Path '${VENDOR_MODULES_DIR.replace(/'/g, "''")}' -Force -ErrorAction Stop`;
+  const installScript = `Save-Module -Name SqlServer -RequiredVersion '${SQL_SERVER_MODULE_VERSION}' -Repository PSGallery -Path '${VENDOR_MODULES_DIR.replace(/'/g, "''")}' -Force -ErrorAction Stop`;
 
   _sqlServerModulePromise = new Promise((resolve, reject) => {
     execFile(
@@ -165,9 +174,18 @@ function extractPsErrorContext(stderr, stdout) {
   return parts.length ? parts.join(" | ") : null;
 }
 
-function runPowerShellFile(scriptPath, args, timeoutMs = 0) {
+function runPowerShellFile(scriptPath, args, timeoutMs = 600000) {
   return new Promise((resolve, reject) => {
-    const fullArgs = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...args];
+    const credentials = {};
+    const safeArgs = [];
+    for (let index = 0; index < args.length; index += 1) {
+      if (["-Password", "-SourcePassword", "-TargetPassword"].includes(args[index])) {
+        credentials[args[index].slice(1)] = args[++index];
+      } else {
+        safeArgs.push(args[index]);
+      }
+    }
+    const fullArgs = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...safeArgs];
 
     const extraModulePaths = buildPsModulePath();
     const env = { ...process.env };
@@ -177,13 +195,14 @@ function runPowerShellFile(scriptPath, args, timeoutMs = 0) {
 
     env.NO_COLOR = "1";
     env.TERM = "dumb";
+    env.PEBLOY_CREDENTIAL_STDIN = Object.keys(credentials).length ? "1" : "0";
 
     const execOptions = { encoding: "utf8", maxBuffer: 1024 * 1024 * 50, env };
     if (timeoutMs > 0) {
       execOptions.timeout = timeoutMs;
     }
 
-    execFile("pwsh", fullArgs, execOptions, (error, stdout, stderr) => {
+    const child = execFile("pwsh", fullArgs, execOptions, (error, stdout, stderr) => {
       if (error) {
         const context = extractPsErrorContext(String(stderr || ""), String(stdout || ""));
         const base = stripAnsiCodes(String(stderr || stdout || error.message || "PowerShell script failed")).trim();
@@ -193,6 +212,10 @@ function runPowerShellFile(scriptPath, args, timeoutMs = 0) {
       }
       resolve({ stdout: String(stdout || ""), stderr: String(stderr || "") });
     });
+    if (Object.keys(credentials).length) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(Buffer.from(JSON.stringify(credentials), "utf8").toString("base64"));
+    }
   });
 }
 
@@ -449,14 +472,24 @@ async function generateTableDelta({
   try {
     const runResult = await runPowerShellFile(TABLE_DELTA_SCRIPT, args);
     let scriptText = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, "utf8").trim() : "";
+    if (!fs.existsSync(outputPath)) {
+      throw new Error("Table comparison did not produce an output file. No delta will be executed.");
+    }
+    const unresolved = scriptText.split(/\r?\n/).filter((line) => /^\s*--\s*(?:Manual review required:|Source table listed but not found:)/i.test(line));
+    if (/Table not found in source database:|Skipping invalid object list entry:/i.test(runResult.stdout)) {
+      throw new Error(`Table comparison could not resolve every selected table. No table delta was executed. Script: ${outputPath}`);
+    }
+    if (unresolved.length) {
+      throw new Error(`Table delta requires manual review; no table delta was executed. Script: ${outputPath}\n${unresolved.join("\n")}`);
+    }
 
     // Optional formatting (Settings → "Format Generated SQL"); best-effort —
     // the formatter keeps GO batches and falls back to original text on any
     // batch it cannot parse, so execution behavior is unchanged.
     try {
       if (scriptText && getSettings()?.formatting?.formatGeneratedSql) {
-        const { formatGeneratedSql } = require("./formatterService");
-        const formatted = formatGeneratedSql(scriptText);
+        const { formatGeneratedSqlAsync } = require("./formatterService");
+        const formatted = await formatGeneratedSqlAsync(scriptText);
         if (formatted !== scriptText) {
           writeSqlFileSync(outputPath, formatted);
           scriptText = formatted.trim();
@@ -478,8 +511,8 @@ async function generateTableDelta({
 }
 
 function normalizeDdlKeywords(text) {
-  text = text.replace(/\bCREATE\s*\n\s*OR\s*\n?\s*ALTER\b/gi, "CREATE OR ALTER");
-  text = text.replace(/\b(CREATE(?:\s+OR\s+ALTER)?|ALTER)\s*\n\s*(PROCEDURE|PROC|VIEW|FUNCTION|TRIGGER|TABLE|INDEX)\b/gi,
+  text = replaceSqlCode(text, /\bCREATE\s*\n\s*OR\s*\n?\s*ALTER\b/gi, "CREATE OR ALTER");
+  text = replaceSqlCode(text, /\b(CREATE(?:\s+OR\s+ALTER)?|ALTER)\s*\n\s*(PROCEDURE|PROC|VIEW|FUNCTION|TRIGGER|TABLE|INDEX)\b/gi,
     (_, verb, noun) => `${verb.replace(/\s+/g, " ")} ${noun}`
   );
   return text;
@@ -554,71 +587,30 @@ function wrapUserDefinedTypeDeploySql(sqlText, lookupName, qualifiedName) {
   const escapedLookupName = String(lookupName || "").replace(/'/g, "''");
   const escapedDropSql = `DROP TYPE ${qualifiedName};`.replace(/'/g, "''");
   return [
-    `DECLARE @PebloyTypeName nvarchar(776) = N'${escapedLookupName}';`,
-    `DECLARE @PebloyTypeDropSql nvarchar(max) = N'${escapedDropSql}';`,
-    "DECLARE @PebloyTypeId int = TYPE_ID(@PebloyTypeName);",
-    "DECLARE @PebloyDependentModules TABLE (",
-    "  schemaName sysname NOT NULL,",
-    "  objectName sysname NOT NULL,",
-    "  objectType char(2) NOT NULL,",
-    "  definition nvarchar(max) NOT NULL,",
-    "  PRIMARY KEY (schemaName, objectName, objectType)",
-    ");",
-    "",
-    "IF @PebloyTypeId IS NOT NULL",
-    "BEGIN",
-    "  INSERT INTO @PebloyDependentModules (schemaName, objectName, objectType, definition)",
-    "  SELECT DISTINCT s.name, o.name, o.type, m.definition",
-    "  FROM (",
-    "    SELECT p.object_id",
-    "    FROM sys.parameters p",
-    "    WHERE p.user_type_id = @PebloyTypeId",
-    "    UNION",
-    "    SELECT sed.referencing_id",
-    "    FROM sys.sql_expression_dependencies sed",
-    "    WHERE sed.referenced_class = 6 AND sed.referenced_id = @PebloyTypeId",
-    "  ) dep",
-    "  INNER JOIN sys.objects o ON o.object_id = dep.object_id",
-    "  INNER JOIN sys.schemas s ON s.schema_id = o.schema_id",
-    "  INNER JOIN sys.sql_modules m ON m.object_id = o.object_id",
-    "  WHERE o.type IN ('P', 'FN', 'IF', 'TF')",
-    "    AND m.definition IS NOT NULL;",
-    "",
-    "  DECLARE @PebloyDropSql nvarchar(max);",
-    "  DECLARE PebloyDropCursor CURSOR LOCAL FAST_FORWARD FOR",
-    "    SELECT CASE WHEN objectType = 'P' THEN N'DROP PROCEDURE ' ELSE N'DROP FUNCTION ' END +",
-    "           QUOTENAME(schemaName) + N'.' + QUOTENAME(objectName) + N';'",
-    "    FROM @PebloyDependentModules",
-    "    ORDER BY CASE WHEN objectType = 'P' THEN 1 ELSE 2 END;",
-    "  OPEN PebloyDropCursor;",
-    "  FETCH NEXT FROM PebloyDropCursor INTO @PebloyDropSql;",
-    "  WHILE @@FETCH_STATUS = 0",
-    "  BEGIN",
-    "    EXEC(@PebloyDropSql);",
-    "    FETCH NEXT FROM PebloyDropCursor INTO @PebloyDropSql;",
-    "  END",
-    "  CLOSE PebloyDropCursor;",
-    "  DEALLOCATE PebloyDropCursor;",
-    "",
-    "  EXEC(@PebloyTypeDropSql);",
-    "END",
-    "",
+    "IF EXISTS (",
+    `  SELECT 1 FROM sys.parameters WHERE user_type_id = TYPE_ID(N'${escapedLookupName}')`,
+    `  UNION ALL SELECT 1 FROM sys.columns WHERE user_type_id = TYPE_ID(N'${escapedLookupName}')`,
+    `  UNION ALL SELECT 1 FROM sys.sql_expression_dependencies WHERE referenced_class = 6 AND referenced_id = TYPE_ID(N'${escapedLookupName}')`,
+    ") THROW 51000, 'Type has dependencies. Use an explicitly reviewed dependency migration; Pebloy will not drop unselected objects.', 1;",
+    `IF TYPE_ID(N'${escapedLookupName}') IS NOT NULL EXEC(N'${escapedDropSql}');`,
     `EXEC(N'${escapedSql}');`,
-    "",
-    "DECLARE @PebloyCreateSql nvarchar(max);",
-    "DECLARE PebloyCreateCursor CURSOR LOCAL FAST_FORWARD FOR",
-    "  SELECT definition",
-    "  FROM @PebloyDependentModules",
-    "  ORDER BY CASE WHEN objectType IN ('FN', 'IF', 'TF') THEN 1 ELSE 2 END;",
-    "OPEN PebloyCreateCursor;",
-    "FETCH NEXT FROM PebloyCreateCursor INTO @PebloyCreateSql;",
-    "WHILE @@FETCH_STATUS = 0",
-    "BEGIN",
-    "  EXEC(@PebloyCreateSql);",
-    "  FETCH NEXT FROM PebloyCreateCursor INTO @PebloyCreateSql;",
-    "END",
-    "CLOSE PebloyCreateCursor;",
-    "DEALLOCATE PebloyCreateCursor;",
+  ].join("\n");
+}
+
+function guardDropMetadata(sqlText, objectType, lookupName) {
+  const isType = objectType === "USER_DEFINED_TYPE";
+  const identifier = `${isType ? "TYPE_ID" : "OBJECT_ID"}(N'${lookupName}')`;
+  const catalog = isType ? "sys.types" : "sys.objects";
+  const idColumn = isType ? "user_type_id" : "object_id";
+  return [
+    "IF ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION'), 0) <> 1",
+    "  THROW 51000, 'DROP/CREATE requires VIEW DEFINITION to inspect target permissions safely.', 1;",
+    `IF EXISTS (SELECT 1 FROM sys.database_permissions WHERE class = ${isType ? 6 : 1} AND major_id = ${identifier})`,
+    `   OR EXISTS (SELECT 1 FROM ${catalog} WHERE ${idColumn} = ${identifier} AND principal_id IS NOT NULL)`,
+    ...(isType ? [] : [`   OR EXISTS (SELECT 1 FROM sys.crypt_properties WHERE class = 1 AND major_id = ${identifier})`]),
+    "  THROW 51000, 'Target object has explicit permissions, ownership, or signatures. Use a reviewed migration that preserves them; no object was dropped.', 1;",
+    "GO",
+    sqlText,
   ].join("\n");
 }
 
@@ -631,12 +623,11 @@ function normalizeExecutableSql(sqlText, objectType, context = {}, options = {})
   const strategy = options.strategy || "createOrAlter";
 
   if (strategy === "createOrAlter" && ["PROCEDURE", "VIEW", "FUNCTION", "TRIGGER"].includes(type)) {
-    text = text
-      .replace(/\bCREATE\s+PROCEDURE\b/i, "CREATE OR ALTER PROCEDURE")
-      .replace(/\bCREATE\s+PROC\b/i, "CREATE OR ALTER PROCEDURE")
-      .replace(/\bCREATE\s+VIEW\b/i, "CREATE OR ALTER VIEW")
-      .replace(/\bCREATE\s+FUNCTION\b/i, "CREATE OR ALTER FUNCTION")
-      .replace(/\bCREATE\s+TRIGGER\b/i, "CREATE OR ALTER TRIGGER");
+    text = replaceSqlCode(text, /\b(?:CREATE(?:\s+OR\s+ALTER)?|ALTER)\s+(PROCEDURE|PROC|VIEW|FUNCTION|TRIGGER)\b/i,
+      (_match, noun) => `CREATE OR ALTER ${noun.toUpperCase() === "PROC" ? "PROCEDURE" : noun.toUpperCase()}`);
+  } else if (strategy === "dropCreate" && ["VIEW", "FUNCTION", "TRIGGER"].includes(type)) {
+    text = replaceSqlCode(text, /\b(?:CREATE(?:\s+OR\s+ALTER)?|ALTER)\s+(VIEW|FUNCTION|TRIGGER)\b/i,
+      (_match, noun) => `CREATE ${noun.toUpperCase()}`);
   }
 
   text = normalizeModuleBatchHeaders(text, type, options.moduleMetadata || null);
@@ -646,7 +637,19 @@ function normalizeExecutableSql(sqlText, objectType, context = {}, options = {})
     const escapedSchemaName = String(schemaName).replace(/]/g, "]]");
     const escapedObjectName = String(objectName).replace(/]/g, "]]");
     const q = `[${escapedSchemaName}].[${escapedObjectName}]`;
-    const lookupName = `${String(schemaName).replace(/'/g, "''")}.${String(objectName).replace(/'/g, "''")}`;
+    const rawLookupName = [schemaName, objectName].every((name) => /^[a-z_][a-z0-9_]*$/i.test(name))
+      ? `${schemaName}.${objectName}` : q;
+    const lookupName = rawLookupName.replace(/'/g, "''");
+
+    if (strategy === "createOrAlter" && supportsModuleBatchHeaders(type)) {
+      text = [
+        "IF ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION'), 0) <> 1",
+        "  THROW 51000, 'Module replacement requires VIEW DEFINITION to inspect signatures safely.', 1;",
+        `IF EXISTS (SELECT 1 FROM sys.crypt_properties WHERE class = 1 AND major_id = OBJECT_ID(N'${lookupName}'))`,
+        "  THROW 51000, 'Signed module requires a reviewed re-signing migration; the definition was not changed.', 1;",
+        "GO", text,
+      ].join("\n");
+    }
 
     if (strategy === "dropCreate") {
       if (type === "VIEW") {
@@ -660,9 +663,9 @@ function normalizeExecutableSql(sqlText, objectType, context = {}, options = {})
       } else if (type === "SEQUENCE") {
         text = `IF OBJECT_ID(N'${lookupName}', 'SO') IS NOT NULL DROP SEQUENCE ${q};\nGO\n${text}`;
       } else if (type === "USER_DEFINED_TYPE") {
-        text = wrapUserDefinedTypeDeploySql(text, lookupName, q);
+        text = wrapUserDefinedTypeDeploySql(text, rawLookupName, q);
       }
-      return text;
+      return guardDropMetadata(text, type, lookupName);
     }
 
     if (type === "SYNONYM") {
@@ -670,8 +673,9 @@ function normalizeExecutableSql(sqlText, objectType, context = {}, options = {})
     } else if (type === "SEQUENCE") {
       text = `IF OBJECT_ID(N'${lookupName}', 'SO') IS NOT NULL DROP SEQUENCE ${q};\nGO\n${text}`;
     } else if (type === "USER_DEFINED_TYPE") {
-      text = wrapUserDefinedTypeDeploySql(text, lookupName, q);
+      text = wrapUserDefinedTypeDeploySql(text, rawLookupName, q);
     }
+    if (["SYNONYM", "SEQUENCE", "USER_DEFINED_TYPE"].includes(type)) text = guardDropMetadata(text, type, lookupName);
   }
 
   return text;
@@ -688,4 +692,5 @@ module.exports = {
   normalizeExecutableSql,
   normalizeDdlKeywords,
   ensureSqlServerModule,
+  getSqlServerModuleStatus,
 };

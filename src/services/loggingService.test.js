@@ -29,12 +29,15 @@ describe("loggingService", () => {
   });
 
   afterEach(() => {
+    service.flushTaskLogs();
     delete process.env.ARTIFACTS_DIR;
     delete process.env.LOGS_DIR;
     delete process.env.LOG_ARCHIVE_DIR;
     delete process.env.SCRIPTS_DIR;
     delete process.env.REPORTS_DIR;
     delete process.env.MAX_ACTIVE_TASK_LOGS;
+    delete process.env.MAX_LOG_FILE_BYTES;
+    delete process.env.PEBLOY_RUNTIME_ID;
     fs.rmSync(dirs.root, { recursive: true, force: true });
   });
 
@@ -75,6 +78,95 @@ describe("loggingService", () => {
     expect(detail.status).toBe("Success");
     expect(detail.events).toHaveLength(1);
     expect(detail.summary.success).toBe(1);
+  });
+
+  it.each(["Backup", "Diff", "Deploy"])("includes a tab-separated object list in %s text logs", (taskType) => {
+    const selectedObjects = [
+      { objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcA", definition: "not-in-object-list" },
+      { objectType: "VIEW", schemaName: "Reporting", objectName: "MixedCaseView" },
+      { objectType: "TABLE", schemaName: "sales", objectName: "Order Items" },
+    ];
+    const task = service.createTaskLog(taskType, { selectedObjects, logLevel: "ErrorsOnly" });
+    const expected = "Selected Objects\nObject Type\tSchema.Object\nPROCEDURE\tdbo.ProcA\nVIEW\tReporting.MixedCaseView\nTABLE\tsales.Order Items\n";
+    expect(fs.readFileSync(task.textPath, "utf8")).toContain(expected);
+    service.appendTaskEvent(task, "ERROR", "One object failed");
+    service.finalizeTaskLog(task, "Failed", { failed: 1 });
+    const text = fs.readFileSync(task.textPath, "utf8");
+    expect(text).toContain(expected);
+    expect(text).not.toContain("not-in-object-list");
+    expect(text.indexOf("Selected Objects")).toBeLessThan(text.indexOf("One object failed"));
+    expect(service.getTaskLog(task.taskId).selectedObjects).toEqual(selectedObjects);
+  });
+
+  it("keeps tab-separated object rows intact for names containing control characters", () => {
+    const task = service.createTaskLog("Backup", {
+      selectedObjects: [{ objectType: "VIEW", schemaName: "report\ting", objectName: "Line\r\nBreak" }],
+    });
+    expect(fs.readFileSync(task.textPath, "utf8")).toContain("VIEW\treport ing.Line  Break\n");
+    service.finalizeTaskLog(task, "Success");
+  });
+
+  it("shows an empty object list when no selection was recorded", () => {
+    const task = service.createTaskLog("Backup");
+    expect(fs.readFileSync(task.textPath, "utf8")).toContain("Object Type\tSchema.Object\n(No objects recorded)\n");
+    service.finalizeTaskLog(task, "Success");
+  });
+
+  it("preserves the object list and latest events through repeated byte-bounded trimming", () => {
+    process.env.MAX_LOG_FILE_BYTES = "2048";
+    jest.resetModules();
+    service = require("./loggingService");
+    const task = service.createTaskLog("Backup", {
+      selectedObjects: [{ objectType: "VIEW", schemaName: "Reporting", objectName: "MixedCase" }],
+    });
+    for (let index = 0; index < 300; index += 1) {
+      service.appendTaskEvent(task, "INFO", `Event ${index}: ${"text ".repeat(50)}`);
+    }
+    const text = fs.readFileSync(task.textPath, "utf8");
+    expect(text).toContain(`TaskId=${task.taskId}`);
+    expect(text).toContain("Object Type\tSchema.Object\nVIEW\tReporting.MixedCase");
+    expect(text.match(/Selected Objects/g)).toHaveLength(1);
+    expect(text).toContain("Event 299:");
+    expect(text).not.toContain("Event 0:");
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(2048);
+    service.finalizeTaskLog(task, "Success");
+    expect(service.getTaskLog(task.taskId).events).toHaveLength(300);
+  });
+
+  it("checkpoints active events and protects running logs from deletion", () => {
+    const task = service.createTaskLog("Deploy");
+    service.appendTaskEvent(task, "WARN", "Review object permissions");
+    expect(() => service.clearAllLogs()).toThrow("while a task is running");
+    service.flushTaskLogs();
+    const saved = JSON.parse(fs.readFileSync(task.jsonPath, "utf8"));
+    expect(saved.events).toHaveLength(1);
+    expect(saved.processId).toBe(process.pid);
+    service.finalizeTaskLog(task, "Failed", { password: "not-for-logs" });
+    expect(service.getTaskLog(task.taskId).summary.password).toBe("[REDACTED]");
+  });
+
+  it("detects an abandoned runtime even when its process ID has been reused", () => {
+    process.env.PEBLOY_RUNTIME_ID = "old-owner";
+    const task = service.createTaskLog("Deploy");
+    expect(JSON.parse(fs.readFileSync(task.jsonPath, "utf8")).processId).toBe(process.pid);
+    jest.resetModules();
+    process.env.PEBLOY_RUNTIME_ID = "new-exclusive-owner";
+    service = require("./loggingService");
+    const [entry] = service.listLogFiles();
+    expect(entry.status).toBe("Interrupted");
+    expect(entry.summary.error).toContain("outcome is unknown");
+  });
+
+  it("marks tasks owned by a stopped process as interrupted without claiming rollback", () => {
+    const task = service.createTaskLog("Deploy");
+    const saved = JSON.parse(fs.readFileSync(task.jsonPath, "utf8"));
+    saved.processId = 2147483647;
+    fs.writeFileSync(task.jsonPath, JSON.stringify(saved));
+    jest.resetModules();
+    service = require("./loggingService");
+    const [entry] = service.listLogFiles();
+    expect(entry.status).toBe("Interrupted");
+    expect(entry.summary.error).toContain("outcome is unknown");
   });
 
   it("includes text path and readiness defaults in log summaries", () => {
@@ -157,6 +249,27 @@ describe("loggingService", () => {
     const [finalSummary] = service.listLogFiles();
     expect(finalSummary.eventCounts).toEqual({ INFO: 1, WARN: 1, ERROR: 1 });
     expect(finalSummary.highestLevel).toBe("ERROR");
+  });
+
+  it("requires an unchanged confirmed archive preview and leaves active or malformed logs alone", () => {
+    const archive = service.LOG_ARCHIVE_DIR;
+    fs.writeFileSync(path.join(archive, "old.json"), JSON.stringify({ status: "Success", completedAt: "2020-01-01T00:00:00Z" }));
+    fs.writeFileSync(path.join(archive, "old.log"), "old text");
+    fs.writeFileSync(path.join(archive, "running.json"), JSON.stringify({ status: "Running", completedAt: "2020-01-01T00:00:00Z" }));
+    fs.writeFileSync(path.join(archive, "bad.json"), "broken");
+    const task = service.createTaskLog("Backup");
+    const preview = service.previewArchiveCleanup(30);
+    expect(preview.files.map((file) => file.name)).toEqual(["old.json", "old.log"]);
+    expect(() => service.executeArchiveCleanup(preview.token, false)).toThrow("confirmation");
+    fs.appendFileSync(path.join(archive, "old.log"), "changed");
+    expect(() => service.executeArchiveCleanup(preview.token, true)).toThrow("Archive changed");
+    const fresh = service.previewArchiveCleanup(30);
+    expect(service.executeArchiveCleanup(fresh.token, true)).toEqual({ deleted: 2 });
+    expect(fs.existsSync(task.jsonPath)).toBe(true);
+    expect(fs.readdirSync(archive)).toEqual(["bad.json", "running.json"]);
+    expect(() => service.executeArchiveCleanup(fresh.token, true)).toThrow("expired");
+    expect(() => service.previewArchiveCleanup(0)).toThrow("Archive age");
+    service.finalizeTaskLog(task, "Success");
   });
 
   it("archives older completed logs once the active log limit is exceeded", () => {

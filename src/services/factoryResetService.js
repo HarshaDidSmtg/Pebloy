@@ -5,8 +5,8 @@ const { DEFAULTS: DEFAULT_SETTINGS, LEGACY_SETTINGS_PATH } = require("./settings
 const { DEFAULT_APP_STATE } = require("./appStateService");
 
 const ROOT_DIR = path.resolve(__dirname, "..", "..");
-const DATA_DIR = path.join(ROOT_DIR, "data");
-const ARTIFACT_DIR = path.join(ROOT_DIR, "artifacts");
+const DATA_DIR = process.env.DATA_DIR || path.join(ROOT_DIR, "data");
+const ARTIFACT_DIR = process.env.ARTIFACTS_DIR || path.join(ROOT_DIR, "artifacts");
 
 const RESET_FILES = [
   { path: path.join(DATA_DIR, "profiles.json"), value: [] },
@@ -71,6 +71,11 @@ function performFactoryReset() {
 
   for (const filePath of DELETE_FILES) {
     deletedFiles += deleteFile(filePath);
+  }
+  for (const name of fs.readdirSync(DATA_DIR)) {
+    if (/^(settings|app-state)\.json(?:\.last-good|\.[a-f0-9-]+\.corrupt)$/.test(name)) {
+      deletedFiles += deleteFile(path.join(DATA_DIR, name));
+    }
   }
 
   for (const dirPath of CLEAR_DIRS) {

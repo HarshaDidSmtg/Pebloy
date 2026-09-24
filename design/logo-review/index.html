@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pebloy | Logo Review</title>
+  <style>
+    :root { color-scheme: light; --paper: #f3f5f4; --ink: #202724; --muted: #626c66; --line: #d7ded9; --surface: #fff; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--ink); background: var(--paper); font: 15px/1.5 "Bahnschrift", "Trebuchet MS", sans-serif; letter-spacing: 0; }
+    button, input { font: inherit; }
+    main { max-width: 1440px; padding: 44px 48px 32px; margin: auto; }
+    header { display: flex; align-items: flex-end; justify-content: space-between; gap: 28px; padding-bottom: 28px; border-bottom: 1px solid var(--line); }
+    .eyebrow { margin: 0 0 6px; color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; }
+    h1 { font-size: 46px; line-height: 1.08; margin: 0; font-weight: 650; letter-spacing: 0; }
+    .subtitle { margin: 10px 0 0; color: var(--muted); max-width: 580px; }
+    .status { margin: 0; padding: 8px 0; border-top: 2px solid var(--ink); font-size: 12px; white-space: nowrap; }
+    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 24px 0; }
+    .toolbar p { margin: 0; font-size: 13px; color: var(--muted); }
+    fieldset { border: 1px solid #bcc8c0; margin: 0; padding: 3px; display: flex; border-radius: 6px; flex-shrink: 0; }
+    legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+    fieldset label { position: relative; display: block; }
+    fieldset input { position: absolute; opacity: 0; }
+    fieldset span { display: block; padding: 5px 14px; border-radius: 3px; font-size: 13px; cursor: pointer; }
+    fieldset input:checked + span { background: #243e30; color: #fff; }
+    fieldset input:focus-visible + span { outline: 3px solid #287a56; outline-offset: 2px; }
+    .concepts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 22px; }
+    article { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--surface); min-width: 0; }
+    .concept-heading { display: flex; align-items: center; gap: 12px; padding: 20px 22px; border-bottom: 1px solid var(--line); }
+    .number { font-weight: 650; font-size: 13px; background: #edf1ee; width: 27px; height: 27px; display: grid; place-items: center; border-radius: 50%; flex: 0 0 auto; }
+    h2 { font-size: 19px; margin: 0; font-weight: 600; }
+    .main-stage { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 264px; gap: 20px; background-color: #fafcfb; background-image: linear-gradient(#243e3005 1px, transparent 1px), linear-gradient(90deg, #243e3005 1px, transparent 1px); background-size: 20px 20px; transition: background-color 140ms; }
+    .main-stage > img { width: 120px; height: 120px; }
+    .wordmark { font-size: 33px; font-weight: 600; letter-spacing: 0; line-height: 1; }
+    .sample-area { border-top: 1px solid var(--line); padding: 17px 22px 20px; }
+    .sample-label { margin: 0 0 12px; font-size: 11px; color: var(--muted); text-transform: uppercase; font-weight: 600; }
+    .sizes { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; }
+    figure { margin: 0; text-align: center; flex-shrink: 0; }
+    .icon-space { height: 64px; display: flex; align-items: center; justify-content: center; }
+    figure img { display: block; }
+    figcaption { margin-top: 5px; font-size: 11px; color: var(--muted); }
+    .application-row { display: flex; align-items: center; gap: 10px; margin-top: 18px; padding-top: 15px; border-top: 1px solid var(--line); }
+    .application-row img { width: 30px; height: 30px; flex-shrink: 0; }
+    .application-row strong { display: block; font-weight: 600; font-size: 15px; line-height: 1.15; }
+    .application-row small { display: block; color: var(--muted); font-size: 11px; }
+    .description { border-top: 1px solid var(--line); padding: 18px 22px 20px; }
+    .description p { color: #536057; font-size: 13px; margin: 0; min-height: 60px; }
+    .swatches { display: flex; align-items: center; gap: 6px; margin: 14px 0; }
+    .swatch { width: 17px; height: 17px; background: var(--color); border-radius: 50%; border: 1px solid #00000012; }
+    .forest { --color: #12241e; }
+    .mint { --color: #60edb0; }
+    .cobalt { --color: #285cdd; }
+    .coral { --color: #ed573e; }
+    .ink { --color: #172539; }
+    .graphite { --color: #242528; }
+    .gold { --color: #f7ca52; }
+    .ivory { --color: #f6f5ef; }
+    .palette-name { font-size: 11px; color: var(--muted); margin-left: 4px; }
+    .asset-links { display: flex; gap: 16px; font-size: 12px; }
+    a { color: #256440; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    a:hover { color: #113d25; }
+    .recommendation { display: flex; gap: 16px; border-bottom: 1px solid var(--line); padding: 22px 0; margin: 0; font-size: 13px; }
+    .recommendation strong { flex-shrink: 0; font-weight: 600; }
+    .recommendation span { color: var(--muted); max-width: 850px; }
+    footer { display: flex; gap: 12px; justify-content: space-between; color: var(--muted); font-size: 11px; padding-top: 18px; }
+    body[data-surface="dark"] .main-stage { background-color: #1d2320; color: #f5f8f6; background-image: linear-gradient(#ffffff04 1px, transparent 1px), linear-gradient(90deg, #ffffff04 1px, transparent 1px); }
+    @media (max-width: 1000px) { main { padding: 30px 24px; } .concepts { gap: 14px; } .concept-heading, .sample-area, .description { padding-left: 16px; padding-right: 16px; } h2 { font-size: 17px; } .sizes { gap: 8px; } }
+    @media (max-width: 760px) { main { padding: 26px 18px; } header { align-items: flex-start; flex-direction: column; gap: 16px; padding-bottom: 22px; } h1 { font-size: 36px; } .status { white-space: normal; } .concepts { grid-template-columns: 1fr; gap: 22px; } .main-stage { height: 248px; } .toolbar { align-items: flex-start; } .toolbar p { max-width: 170px; } .description p { min-height: 0; } .recommendation { flex-direction: column; gap: 6px; } footer { flex-direction: column; gap: 5px; } }
+    @media (prefers-reduced-motion: reduce) { .main-stage { transition: none; } }
+  </style>
+</head>
+<body data-surface="light">
+<main>
+  <header>
+    <div><p class="eyebrow">Identity studies / September 2026</p><h1>Pebloy</h1><p class="subtitle">Three directions for the database deployment workspace.</p></div>
+    <p class="status">APPROVED &middot; A / FORWARD P</p>
+  </header>
+  <div class="toolbar"><p>App icons, wordmarks, and actual-size checks.</p><fieldset><legend>Preview surface</legend><label><input name="surface" type="radio" value="light" checked /><span>Light</span></label><label><input name="surface" type="radio" value="dark" /><span>Dark</span></label></fieldset></div>
+  <section class="concepts" aria-label="Logo options">
+    <article>
+      <div class="concept-heading"><span class="number">A</span><h2>Forward P</h2></div>
+      <div class="main-stage"><img src="forward-p.svg" alt="Mint P with a forward arrow cut into its counter, on a deep green tile" /><span class="wordmark">Pebloy</span></div>
+      <div class="sample-area"><p class="sample-label">Windows icon sizes</p><div class="sizes">
+        <figure><div class="icon-space"><img src="forward-p.svg" width="64" height="64" alt="Forward P at 64 pixels" /></div><figcaption>64 px</figcaption></figure>
+        <figure><div class="icon-space"><img src="forward-p.svg" width="48" height="48" alt="Forward P at 48 pixels" /></div><figcaption>48 px</figcaption></figure>
+        <figure><div class="icon-space"><img src="forward-p.svg" width="32" height="32" alt="Forward P at 32 pixels" /></div><figcaption>32 px</figcaption></figure>
+        <figure><div class="icon-space"><img src="forward-p.svg" width="16" height="16" alt="Forward P at 16 pixels" /></div><figcaption>16 px</figcaption></figure>
+      </div><div class="application-row"><img src="forward-p.svg" alt="" /><div><strong>Pebloy</strong><small>Database workspace</small></div></div></div>
+      <div class="description"><p>A compact P with a forward arrow in negative space. The clearest connection to Pebloy's name and deployment action.</p><div class="swatches"><span class="swatch forest" title="#12241E"></span><span class="swatch mint" title="#60EDB0"></span><span class="palette-name">Forest / Mint</span></div><div class="asset-links"><a href="forward-p.svg" target="_blank" rel="noopener">Vector</a><a href="forward-p.png" download>1024 px PNG</a></div></div>
+    </article>
+    <article>
+      <div class="concept-heading"><span class="number">B</span><h2>Schema Link</h2></div>
+      <div class="main-stage"><img src="schema-link.svg" alt="Blue and coral brackets connected by a charcoal bridge, on a pale tile" /><span class="wordmark">Pebloy</span></div>
+      <div class="sample-area"><p class="sample-label">Windows icon sizes</p><div class="sizes">
+        <figure><div class="icon-space"><img src="schema-link.svg" width="64" height="64" alt="Schema Link at 64 pixels" /></div><figcaption>64 px</figcaption></figure>
+        <figure><div class="icon-space"><img src="schema-link.svg" width="48" height="48" alt="Schema Link at 48 pixels" /></div><figcaption>48 px</figcaption></figure>
+        <figure><div class="icon-space"><img src="schema-link.svg" width="32" height="32" alt="Schema Link at 32 pixels" /></div><figcaption>32 px</figcaption></figure>
+        <figure><div class="icon-space"><img src="schema-link.svg" width="16" height="16" alt="Schema Link at 16 pixels" /></div><figcaption>16 px</figcaption></figure>
+      </div><div class="application-row"><img src="schema-link.svg" alt="" /><div><strong>Pebloy</strong><small>Database workspace</small></div></div></div>
+      <div class="description"><p>Two schema boundaries joined by one bridge. A more technical direction, with source and target given equal visual weight.</p><div class="swatches"><span class="swatch cobalt" title="#285CDD"></span><span class="swatch coral" title="#ED573E"></span><span class="swatch ink" title="#172539"></span><span class="palette-name">Cobalt / Coral</span></div><div class="asset-links"><a href="schema-link.svg" target="_blank" rel="noopener">Vector</a><a href="schema-link.png" download>1024 px PNG</a></div></div>
+    </article>
+    <article>
+      <div class="concept-heading"><span class="number">C</span><h2>Release Stack</h2></div>
+      <div class="main-stage"><img src="release-stack.svg" alt="Gold schema layer above a white supporting layer, on a graphite tile" /><span class="wordmark">Pebloy</span></div>
+      <div class="sample-area"><p class="sample-label">Windows icon sizes</p><div class="sizes">
+        <figure><div class="icon-space"><img src="release-stack.svg" width="64" height="64" alt="Release Stack at 64 pixels" /></div><figcaption>64 px</figcaption></figure>
+        <figure><div class="icon-space"><img src="release-stack.svg" width="48" height="48" alt="Release Stack at 48 pixels" /></div><figcaption>48 px</figcaption></figure>
+        <figure><div class="icon-space"><img src="release-stack.svg" width="32" height="32" alt="Release Stack at 32 pixels" /></div><figcaption>32 px</figcaption></figure>
+        <figure><div class="icon-space"><img src="release-stack.svg" width="16" height="16" alt="Release Stack at 16 pixels" /></div><figcaption>16 px</figcaption></figure>
+      </div><div class="application-row"><img src="release-stack.svg" alt="" /><div><strong>Pebloy</strong><small>Database workspace</small></div></div></div>
+      <div class="description"><p>A pair of schema layers with a distinct top marker. The most architectural direction, with strong contrast at small sizes.</p><div class="swatches"><span class="swatch graphite" title="#242528"></span><span class="swatch gold" title="#F7CA52"></span><span class="swatch ivory" title="#F6F5EF"></span><span class="palette-name">Graphite / Gold</span></div><div class="asset-links"><a href="release-stack.svg" target="_blank" rel="noopener">Vector</a><a href="release-stack.png" download>1024 px PNG</a></div></div>
+    </article>
+  </section>
+  <p class="recommendation"><strong>Selected direction: A</strong><span>The P identifies Pebloy directly; the arrow carries the action without adding a separate badge. B and C remain here as the original alternatives.</span></p>
+  <footer><span>Original vector concepts. Raster previews: 1024 &times; 1024.</span><span>Forward P is applied to the app and packaging assets.</span></footer>
+</main>
+<script>
+  document.querySelectorAll('input[name="surface"]').forEach((input) => {
+    input.addEventListener('change', () => { document.body.dataset.surface = input.value; });
+  });
+</script>
+</body>
+</html>

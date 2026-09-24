@@ -42,13 +42,7 @@
 
         window.MonacoEnvironment = {
           getWorkerUrl() {
-            const baseUrl = `${window.location.origin}/vendor/monaco/`;
-            const workerMainUrl = `${baseUrl}vs/base/worker/workerMain.js`;
-            const script = [
-              `self.MonacoEnvironment = { baseUrl: ${JSON.stringify(baseUrl)} };`,
-              `importScripts(${JSON.stringify(workerMainUrl)});`,
-            ].join(" ");
-            return `data:text/javascript;charset=utf-8,${encodeURIComponent(script)}`;
+            return "/monacoWorker.js";
           },
         };
 
@@ -84,11 +78,19 @@
     const muted = normalizeColor(styles.getPropertyValue("--muted"), "#6b6b6b");
     const border = normalizeColor(styles.getPropertyValue("--border"), "#3c3c3c");
     const selection = normalizeColor(styles.getPropertyValue("--accent-soft"), "#264f78");
+    const editorTheme = globalThis.PebloyThemes?.find((theme) => theme.id === document.body.dataset.theme)?.editor;
 
     monaco.editor.defineTheme("pebloy-manual-entry", {
       base: isLightTheme() ? "vs" : "vs-dark",
-      inherit: true,
-      rules: [],
+      inherit: editorTheme?.inherit ?? true,
+      rules: editorTheme?.rules || [
+        { token: "keyword.sql", foreground: accent.slice(1) },
+        { token: "number.sql", foreground: normalizeColor(styles.getPropertyValue("--warning-ink"), accent).slice(1) },
+        { token: "string.sql", foreground: normalizeColor(styles.getPropertyValue("--success-ink"), foreground).slice(1) },
+        { token: "comment.sql", foreground: muted.slice(1) },
+        { token: "operator.sql", foreground: foreground.slice(1) },
+        { token: "predefined.sql", foreground: normalizeColor(styles.getPropertyValue("--info-ink"), foreground).slice(1) },
+      ],
       colors: {
         "editor.background": background,
         "editor.foreground": foreground,
@@ -104,6 +106,7 @@
         "editorBracketMatch.border": accent,
         "editorWidget.background": surface2,
         "editorWidget.border": border,
+        ...editorTheme?.colors,
       },
     });
 

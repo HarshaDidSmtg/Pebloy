@@ -1,23 +1,63 @@
 let mockStore = {};
 
 jest.mock("./storage", () => ({
-  readJson: (_filePath, defaultValue) => {
+  readRecoverableJson: (_filePath, defaultValue) => {
     const raw = mockStore[_filePath];
     return raw === undefined ? defaultValue : JSON.parse(JSON.stringify(raw));
   },
   writeJson: (_filePath, data) => { mockStore[_filePath] = JSON.parse(JSON.stringify(data)); },
-  writeJsonAtomic: (_filePath, data) => { mockStore[_filePath] = JSON.parse(JSON.stringify(data)); },
+  writeRecoverableJson: (_filePath, data) => { mockStore[_filePath] = JSON.parse(JSON.stringify(data)); },
 }));
 
-const { getAppState, saveAppState, DEFAULT_SHORTCUTS, DEFAULT_THEME_FAVORITES } = require("./appStateService");
+const { getAppState, saveAppState, DEFAULT_APP_STATE, DEFAULT_SHORTCUTS, DEFAULT_THEME_FAVORITES } = require("./appStateService");
 
 beforeEach(() => { mockStore = {}; });
 
 describe("appStateService — shortcuts", () => {
+  it("never restores the source-writing deploy mode", () => {
+    saveAppState({ ui: { deployMode: "FormatAndExecuteSource", deployDestProfileId: "target-profile" } });
+    const state = getAppState();
+    expect(state.ui.deployMode).toBe("ExecuteDirectly");
+    expect(state.ui.deployDestProfileId).toBe("target-profile");
+  });
+
+  it("keeps other deploy modes", () => {
+    saveAppState({ ui: { deployMode: "DryRun" } });
+    expect(getAppState().ui.deployMode).toBe("DryRun");
+  });
+
+  it("remembers discovery filters and bounds their length", () => {
+    saveAppState({ ui: { objectsTypeFilter: "PROCEDURE", objectsSchemaFilter: "Reports", objectsNameFilter: "x".repeat(200) } });
+    const state = getAppState();
+    expect(state.ui.objectsTypeFilter).toBe("PROCEDURE");
+    expect(state.ui.objectsSchemaFilter).toBe("Reports");
+    expect(state.ui.objectsNameFilter).toHaveLength(128);
+    expect(getAppState().ui.objectsTypeFilter).toBe("PROCEDURE");
+  });
+
   it("returns default shortcuts when no file exists", () => {
     const state = getAppState();
     expect(state.preferences.shortcuts).toEqual(DEFAULT_SHORTCUTS);
     expect(state.preferences.hiddenTabs).toEqual([]);
+  });
+
+  it("uses Sepia, JetBrains Mono, and 14px as durable appearance defaults", () => {
+    const state = getAppState();
+    expect(state.preferences.theme).toBe("system");
+    expect(state.preferences.fontFamily).toBe("JetBrains Mono");
+    expect(state.preferences.fontSize).toBe(14);
+    expect(DEFAULT_APP_STATE.preferences).toEqual(expect.objectContaining({
+      theme: "system",
+      fontFamily: "JetBrains Mono",
+      fontSize: 14,
+    }));
+  });
+
+  it("uses Legacy deploy engine by default and drops retired same-source deploy override", () => {
+    saveAppState({ ui: { allowSameSource: true } });
+    const state = getAppState();
+    expect(state.ui.deployEngine).toBe("Legacy");
+    expect(state.ui.allowSameSource).toBeUndefined();
   });
 
   it("saves a custom shortcut and reads it back", () => {

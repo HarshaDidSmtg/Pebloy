@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">Pebloy concept C: Release Stack</title>
+  <rect width="256" height="256" rx="52" fill="#242528"/>
+  <path d="m128 42 92 49-92 49-92-49 92-49Z" fill="#f7ca52"/>
+  <path d="m36 124 92 49 92-49v39l-92 49-92-49v-39Z" fill="#f6f5ef"/>
+  <path d="m108 96 20 11 36-19-20-11-36 19Z" fill="#242528"/>
+</svg>

@@ -1,11 +1,15 @@
 const fs = require("fs");
+const path = require("path");
+const { Worker } = require("worker_threads");
 const { randomUUID } = require("crypto");
-const { createPatch, diffLines } = require("diff");
+const { createPatch, diffLines, diffWordsWithSpace } = require("diff");
 const { generateScriptsForProfile, getCodeDiffOutputPaths } = require("./scriptGenerationService");
 const { normalizeDdlKeywords } = require("./scriptAutomationService");
 const { compareGeneratedArtifacts, normalizeEngine, validateGeneratedArtifacts } = require("./dacfxService");
 const { getSettings } = require("./settingsService");
 const { writeReportArtifact } = require("./loggingService");
+const highlighter = require("highlight.js/lib/core");
+highlighter.registerLanguage("sql", require("highlight.js/lib/languages/sql"));
 
 const DACFX_COMPARE_TIMEOUT_MS = 30000;
 const DACFX_COMPARE_OBJECT_TYPES = new Set(["TABLE", "USER_DEFINED_TYPE"]);
@@ -32,6 +36,31 @@ function splitLinesPreserve(text) {
   return lines;
 }
 
+const MAX_INLINE_DIFF_CHARS = 4000;
+
+// Returns [start, end) character ranges that differ on each side of a modified line pair.
+function buildInlineChanges(leftText, rightText) {
+  if (leftText.length + rightText.length > MAX_INLINE_DIFF_CHARS) return null;
+  const left = [];
+  const right = [];
+  let leftOffset = 0;
+  let rightOffset = 0;
+  for (const part of diffWordsWithSpace(leftText, rightText)) {
+    const length = part.value.length;
+    if (part.removed) {
+      left.push([leftOffset, leftOffset + length]);
+      leftOffset += length;
+    } else if (part.added) {
+      right.push([rightOffset, rightOffset + length]);
+      rightOffset += length;
+    } else {
+      leftOffset += length;
+      rightOffset += length;
+    }
+  }
+  return { left, right };
+}
+
 function flushPendingDiffRows(rows, pendingRemoved, pendingAdded) {
   if (!pendingRemoved.length && !pendingAdded.length) {
     return;
@@ -41,13 +70,19 @@ function flushPendingDiffRows(rows, pendingRemoved, pendingAdded) {
   for (let index = 0; index < count; index += 1) {
     const left = pendingRemoved[index] || null;
     const right = pendingAdded[index] || null;
-    rows.push({
+    const row = {
       status: left && right ? "modified" : left ? "removed" : "added",
       leftLineNumber: left ? left.lineNumber : null,
       leftText: left ? left.text : "",
       rightLineNumber: right ? right.lineNumber : null,
       rightText: right ? right.text : "",
-    });
+    };
+    const inline = left && right ? buildInlineChanges(left.text, right.text) : null;
+    if (inline) {
+      row.leftChanges = inline.left;
+      row.rightChanges = inline.right;
+    }
+    rows.push(row);
   }
 
   pendingRemoved.length = 0;
@@ -99,22 +134,37 @@ function buildSideBySideLines(sourceDefinition, destinationDefinition) {
   return rows;
 }
 
-function renderLineDiffTable(lineDiff) {
+const REVIEW_STATUS = { added: "removed", removed: "added", modified: "modified", unchanged: "unchanged" };
+
+// Rows are stored source-left; reviews read target (current) -> source (incoming) like GitHub compare.
+function toReviewRow(row) {
+  return {
+    status: REVIEW_STATUS[row.status] || "modified",
+    baseLine: row.rightLineNumber,
+    baseText: row.rightText,
+    headLine: row.leftLineNumber,
+    headText: row.leftText,
+  };
+}
+
+function renderLineDiffTable(lineDiff, highlighted = false) {
+  const renderCode = (value) => highlighted ? highlighter.highlight(String(value || ""), { language: "sql", ignoreIllegals: true }).value : escapeHtml(value || "");
   const rows = (lineDiff || [])
-    .map((row) => {
-      const leftNumber = row.leftLineNumber == null ? "" : String(row.leftLineNumber);
-      const rightNumber = row.rightLineNumber == null ? "" : String(row.rightLineNumber);
-      return `<tr class="diff-row diff-${row.status}">
-<td class="ln">${leftNumber}</td>
-<td class="code">${escapeHtml(row.leftText || "")}</td>
-<td class="ln">${rightNumber}</td>
-<td class="code">${escapeHtml(row.rightText || "")}</td>
+    .map((original) => {
+      const row = toReviewRow(original);
+      const baseNumber = row.baseLine == null ? "" : String(row.baseLine);
+      const headNumber = row.headLine == null ? "" : String(row.headLine);
+      return `<tr class="diff-row diff-${escapeHtml(row.status)}">
+    <td class="ln">${escapeHtml(baseNumber)}</td>
+    <td class="code">${renderCode(row.baseText)}</td>
+    <td class="ln">${escapeHtml(headNumber)}</td>
+    <td class="code">${renderCode(row.headText)}</td>
 </tr>`;
     })
     .join("\n");
 
   return `<table class="diff-table">
-<thead><tr><th colspan="2">Source</th><th colspan="2">Destination</th></tr></thead>
+<thead><tr><th colspan="2">Target (current)</th><th colspan="2">Source (incoming)</th></tr></thead>
 <tbody>${rows || "<tr><td colspan=\"4\">No line-level changes</td></tr>"}</tbody>
 </table>`;
 }
@@ -122,7 +172,6 @@ function renderLineDiffTable(lineDiff) {
 function normalizeForCompare(text) {
   return String(text || "")
     .replace(/\r\n/g, "\n")
-    .replace(/[ \t]+/g, " ")
     .trim();
 }
 
@@ -130,11 +179,16 @@ function scriptsToMap(scripts) {
   const result = new Map();
   for (const script of scripts || []) {
     const key = buildObjectKey(script.objectType, script.schemaName, script.objectName);
+    const definitionText = script.definitionText !== undefined
+      ? String(script.definitionText || "")
+      : fs.existsSync(script.scriptPath)
+        ? fs.readFileSync(script.scriptPath, "utf8")
+        : "";
     result.set(key, {
       objectType: script.objectType,
       schemaName: script.schemaName,
       objectName: script.objectName,
-      definition: fs.existsSync(script.scriptPath) ? normalizeDdlKeywords(fs.readFileSync(script.scriptPath, "utf8").trim()) : "",
+      definition: normalizeDdlKeywords(definitionText.replace(/^\uFEFF/, "").trim()),
     });
   }
   return result;
@@ -193,7 +247,7 @@ function compareMapsWithSemantic(sourceMap, destinationMap, semanticChanges = []
       continue;
     }
 
-    if (semanticChange) {
+    if (semanticChange || normalizeForCompare(left.definition) !== normalizeForCompare(right.definition)) {
       summary.changed += 1;
       details.push({
         objectType: left.objectType,
@@ -210,7 +264,7 @@ function compareMapsWithSemantic(sourceMap, destinationMap, semanticChanges = []
         sourceDefinition: left.definition || "",
         destinationDefinition: right.definition || "",
         lineDiff: buildSideBySideLines(left.definition || "", right.definition || ""),
-        semanticOperation: semanticChange.operation,
+        semanticOperation: semanticChange?.operation || "TextChange",
       });
       continue;
     }
@@ -461,15 +515,15 @@ async function compareObjects(sourceProfile, destinationProfile, selectedObjects
       );
       semanticAlerts = semanticCompare.alerts || [];
       semanticWarnings = semanticCompare.warnings || [];
-      compared = compareMapsWithSemantic(filteredSourceMap, filteredDestMap, semanticCompare.changes || []);
+      compared = await compareInWorker(filteredSourceMap, filteredDestMap, semanticCompare.changes || []);
     } catch (error) {
       semanticWarnings = [
         `DacFx semantic compare failed; returning fresh-script textual diff instead: ${error.message}`,
       ];
-      compared = compareMaps(filteredSourceMap, filteredDestMap);
+      compared = await compareInWorker(filteredSourceMap, filteredDestMap);
     }
   } else {
-    compared = compareMaps(filteredSourceMap, filteredDestMap);
+    compared = await compareInWorker(filteredSourceMap, filteredDestMap);
   }
 
   onProgress({ taskType: "Diff", key: "diff", operation: "Preparing diff results...", percent: 95 });
@@ -486,6 +540,48 @@ async function compareObjects(sourceProfile, destinationProfile, selectedObjects
   };
 }
 
+function compareInWorker(sourceMap, destinationMap, semanticChanges = null) {
+  let bytes = 0;
+  for (const collection of [sourceMap, destinationMap]) {
+    for (const item of collection.values()) bytes += Buffer.byteLength(item.definition || "", "utf8");
+  }
+  if (bytes > 32 * 1024 * 1024) return Promise.reject(new Error("Diff input exceeds 32 MB. Compare a smaller selection."));
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(path.join(__dirname, "diffWorker.js"), {
+      workerData: { sourceMap, destinationMap, semanticChanges },
+      resourceLimits: { maxOldGenerationSizeMb: 256 },
+    });
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      worker.removeAllListeners();
+      worker.terminate().then(() => error ? reject(error) : resolve(result), reject);
+    };
+    const timeout = setTimeout(() => finish(new Error("Line comparison exceeded 30 seconds. Compare a smaller selection.")), 30000);
+    worker.once("message", (message) => finish(message.error ? new Error(message.error) : null, message.result));
+    worker.once("error", (error) => finish(error));
+    worker.once("exit", (code) => finish(new Error(`Diff worker exited before completing (code ${code}).`)));
+  });
+}
+
+function formatMarkdownReport(report) {
+  const cell = (value) => String(value || "").replace(/[|\r\n]/g, " ");
+  const lines = ["# Diff Report", "", `Added: ${Number(report.summary?.added) || 0} | Missing: ${Number(report.summary?.missing) || 0} | Changed: ${Number(report.summary?.changed) || 0} | Unchanged: ${Number(report.summary?.unchanged) || 0}`, "", "| Type | Schema | Name | Status |", "| --- | --- | --- | --- |"];
+  for (const item of report.details || []) lines.push(`| ${cell(item.objectType)} | ${cell(item.schemaName)} | ${cell(item.objectName)} | ${cell(item.status)} |`);
+  for (const item of report.details || []) {
+    if (item.status === "Unchanged") continue;
+    const changes = (item.lineDiff || []).map(toReviewRow).flatMap((row) => row.status === "unchanged" ? [] : [
+      ...(row.baseLine != null ? [`- ${row.baseText || ""}`] : []),
+      ...(row.headLine != null ? [`+ ${row.headText || ""}`] : []),
+    ]);
+    const fence = "`".repeat(Math.max(3, ...((changes.join("\n").match(/`+/g) || []).map((run) => run.length + 1))));
+    lines.push("", `## ${cell(item.objectType)} ${cell(item.schemaName)}.${cell(item.objectName)}`, "", `${fence}diff`, ...changes, fence);
+  }
+  return lines.join("\n");
+}
+
 function exportReport(format, report) {
   if (format === "json") {
     const path = writeReportArtifact("diff_report", "json", JSON.stringify(report, null, 2));
@@ -493,34 +589,16 @@ function exportReport(format, report) {
   }
 
   if (format === "md") {
-    const lines = [
-      "# Diff Report",
-      "",
-      `- Added: ${report.summary.added}`,
-      `- Missing: ${report.summary.missing}`,
-      `- Changed: ${report.summary.changed}`,
-      `- Unchanged: ${report.summary.unchanged}`,
-      "",
-      "## Object Details",
-      "",
-      "| Type | Schema | Name | Status |",
-      "| --- | --- | --- | --- |",
-    ];
-
-    report.details.forEach((item) => {
-      lines.push(`| ${item.objectType} | ${item.schemaName} | ${item.objectName} | ${item.status} |`);
-    });
-
-    const path = writeReportArtifact("diff_report", "md", lines.join("\n"));
+    const path = writeReportArtifact("diff_report", "md", formatMarkdownReport(report));
     return path;
   }
 
-  if (format === "html") {
+  if (format === "html" || format === "html-highlighted") {
     const rows = report.details
       .map(
         (item) => `<div class="block">
 <h3>${escapeHtml(item.objectType)} ${escapeHtml(item.schemaName)}.${escapeHtml(item.objectName)} - ${escapeHtml(item.status)}</h3>
-${renderLineDiffTable(item.lineDiff || [])}
+${renderLineDiffTable(item.lineDiff || [], format === "html-highlighted")}
 </div>`
       )
       .join("\n");
@@ -537,6 +615,10 @@ h1 { margin-bottom: 8px; }
 .diff-row.diff-added td { background: #e8fff0; }
 .diff-row.diff-removed td { background: #fff0f0; }
 .diff-row.diff-modified td { background: #fff9e6; }
+.hljs-keyword, .hljs-built_in { color: #145634; font-weight: 600; }
+.hljs-string { color: #a12635; }
+.hljs-number, .hljs-literal { color: #73451b; }
+.hljs-comment { color: #596573; font-style: italic; }
 </style>
 </head><body>
 <h1>Diff Report</h1>
@@ -553,10 +635,14 @@ ${rows || "<p>No object details available.</p>"}
     return path;
   }
 
-  throw new Error("Unsupported export format. Use md, html, or json.");
+  throw new Error("Unsupported export format. Use md, html, html-highlighted, or json.");
 }
 
 module.exports = {
+  compareMaps,
+  compareMapsWithSemantic,
+  compareInWorker,
   compareObjects,
   exportReport,
+  formatMarkdownReport,
 };

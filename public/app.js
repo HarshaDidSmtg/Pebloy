@@ -1,8 +1,8 @@
 let currentDiffReport = null;
-let currentDiffRows = [];
-let currentDiffIndex = 0;
+let currentDiffIndex = -1;
 let sharedSelectedObjects = [];
 let sharedDiscoveredObjects = [];
+const discoveredSelectedObjects = new Set();
 const progressTimers = {};
 let appState = null;
 let pendingAppStatePatch = null;
@@ -10,13 +10,18 @@ let appStateSaveTimer = null;
 let isApplyingAppState = false;
 const enhancedTextEditors = new Map();
 const DEFAULT_TAB = "credentials";
+const DEFAULT_APPEARANCE_THEME = "sepia";
+const DEFAULT_APPEARANCE_FONT_FAMILY = "JetBrains Mono";
+const DEFAULT_APPEARANCE_FONT_SIZE = 14;
 const _profileHealth = new Map(); // profileId → { status: 'ok'|'error'|'unknown', testedAt: ISO|null }
 let _lastDeployResults = []; // for retry failed
 let _profileSort = { col: "profileLabel", dir: "asc" };
 let _selectionSort  = { col: null, dir: "asc" };
 let _discoveredSort = { col: null, dir: "asc" };
 let _discoverPage = 1;
+let _selectionPage = 1;
 const DISCOVER_PAGE_SIZE = 50;
+const DEPENDENCY_REQUEST_TIMEOUT_MS = 45000;
 let _logSort = { col: "startedAt", dir: "desc" };
 let _deployResultSort = { col: null, dir: "asc" };
 const dependencyFetchCache = new Map();
@@ -429,13 +434,47 @@ function setButtonLoading(button, loadingText) {
   };
 }
 
+let sessionTokenPromise = null;
+
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
+  const { timeoutMs = 0, ...fetchOptions } = options;
+  const method = String(fetchOptions.method || "GET").toUpperCase();
+  const headers = { "Content-Type": "application/json", ...fetchOptions.headers };
+  if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+    if (!sessionTokenPromise) {
+      sessionTokenPromise = fetch("/api/session", { cache: "no-store" })
+        .then(async (response) => {
+          if (!response.ok) throw new Error("Unable to authorize this session. Reload Pebloy.");
+          return (await response.json()).token;
+        })
+        .catch((error) => { sessionTokenPromise = null; throw error; });
+    }
+    headers["X-Pebloy-Token"] = await sessionTokenPromise;
+  }
+  let timeoutId = null;
+  if (timeoutMs > 0) {
+    const controller = new AbortController();
+    fetchOptions.signal = controller.signal;
+    timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  }
+
+  let response;
+  try {
+    response = await fetch(path, {
+      ...fetchOptions,
+      headers,
+    });
+  } catch (error) {
+    if (timeoutMs > 0 && error?.name === "AbortError") {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)} seconds. Try again, refresh the dependency cache, or reduce the selected objects.`);
+    }
+    throw error;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
 
   if (!response.ok) {
+    if (response.status === 403) sessionTokenPromise = null;
     const body = await response.json().catch(() => ({}));
     const steps = Array.isArray(body.resolutionSteps) && body.resolutionSteps.length
       ? ` Next: ${body.resolutionSteps.join(" ")}`
@@ -532,9 +571,9 @@ function collectCurrentAppState() {
       notificationsEnabled: Boolean($("notificationsToggle")?.checked),
       defaultBackupPath: $("defaultBackupPath")?.value.trim() || "",
       defaultScriptPath: $("defaultScriptPath")?.value.trim() || "",
-      theme: document.body.dataset.theme || "azure",
-      fontFamily: $("fontSelector")?.value || "Segoe UI",
-      fontSize: Number($("fontSizeRange")?.value || 14),
+      theme: document.body.dataset.theme || DEFAULT_APPEARANCE_THEME,
+      fontFamily: $("fontSelector")?.value || DEFAULT_APPEARANCE_FONT_FAMILY,
+      fontSize: Number($("fontSizeRange")?.value || DEFAULT_APPEARANCE_FONT_SIZE),
       logLevel: $("logLevelSelect")?.value || "Normal",
       hiddenTabs: Array.from(document.querySelectorAll(".tab[data-tab].hidden")).map((b) => b.dataset.tab),
       shortcuts,
@@ -543,21 +582,30 @@ function collectCurrentAppState() {
       activeTab: getActiveTabName(),
       objectsProfileId: $("objectsProfile")?.value || "",
       objectsMode: $("objectsMode")?.value || "Specify",
+      folderSourcePath: $("folderSourcePath")?.value.trim() || "",
+      objectsTypeFilter: $("sharedTypeFilter")?.value || "",
+      objectsSchemaFilter: $("sharedSchemaFilter")?.value || "",
+      objectsNameFilter: $("sharedNameFilter")?.value.trim() || "",
+      discoverPageSize: Number($("discoverPageSize")?.value || 50),
+      archiveRetentionDays: Number($("archiveRetentionDays")?.value || 90),
       sharedObjectText: getSharedObjectTextValue(),
       sharedSelectedObjects: cloneJson(sharedSelectedObjects),
       diffSourceProfileId: $("diffSourceProfile")?.value || "",
       diffDestProfileId: $("diffDestProfile")?.value || "",
-      diffEngine: $("diffEngine")?.value || "DacFx",
-      diffExportFormat: $("diffExportFormat")?.value || "md",
+      diffEngine: $("diffEngine")?.value || "Legacy",
       backupProfileId: $("backupProfile")?.value || "",
       backupPath: $("backupPath")?.value.trim() || "",
       deploySourceProfileId: $("deploySourceProfile")?.value || "",
       deployDestProfileId: $("deployDestProfile")?.value || "",
-      deployEngine: $("deployEngine")?.value || "DacFx",
-      deployMode: $("deployMode")?.value || "ExecuteDirectly",
+      diffView: { ...diffViewPrefs },
+      deployTargetMode: $("deployTargetMode").value,
+      deployTargetIds: [...document.querySelectorAll("[data-batch-target]:checked")].map((input) => input.value),
+      continueTargetsOnError: $("continueTargetsOnError").checked,
+      deployEngine: $("deployEngine")?.value || "Legacy",
+      // Writing to the source is a deliberate one-off action, never a restored default.
+      deployMode: $("deployMode")?.value === "FormatAndExecuteSource" ? "ExecuteDirectly" : ($("deployMode")?.value || "ExecuteDirectly"),
       deployScriptPath: $("deployScriptPath")?.value.trim() || "",
       continueOnError: Boolean($("continueOnError")?.checked),
-      allowSameSource: Boolean($("allowSameSource")?.checked),
       formatter: cloneJson(getFormatterWorkbench()?.getPersistedState?.() || appState?.ui?.formatter || {}),
     },
   };
@@ -582,6 +630,9 @@ function applyPersistedUiState() {
 
     if ($("objectsProfile")) $("objectsProfile").value = ui.objectsProfileId || "";
     if ($("objectsMode")) $("objectsMode").value = ui.objectsMode || "Specify";
+    $("folderSourcePath").value = ui.folderSourcePath || "";
+    $("discoverPageSize").value = String([25, 50, 100].includes(ui.discoverPageSize) ? ui.discoverPageSize : 50);
+    $("archiveRetentionDays").value = String(ui.archiveRetentionDays || 90);
     applyObjectModeUI();
 
     setSharedObjectTextValue(ui.sharedObjectText || "");
@@ -590,8 +641,11 @@ function applyPersistedUiState() {
 
     if ($("diffSourceProfile")) $("diffSourceProfile").value = ui.diffSourceProfileId || "";
     if ($("diffDestProfile")) $("diffDestProfile").value = ui.diffDestProfileId || "";
-    if ($("diffEngine")) $("diffEngine").value = ui.diffEngine || "DacFx";
-    if ($("diffExportFormat")) $("diffExportFormat").value = ui.diffExportFormat || "md";
+    if ($("diffEngine")) $("diffEngine").value = ui.diffEngine || "Legacy";
+    const diffView = ui.diffView || {};
+    if (["split", "unified"].includes(diffView.mode)) diffViewPrefs.mode = diffView.mode;
+    if (["3", "10", "full"].includes(String(diffView.context))) diffViewPrefs.context = String(diffView.context);
+    if (typeof diffView.wrap === "boolean") diffViewPrefs.wrap = diffView.wrap;
 
     if ($("backupProfile")) $("backupProfile").value = ui.backupProfileId || "";
     if ($("backupPath")) {
@@ -600,8 +654,12 @@ function applyPersistedUiState() {
 
     if ($("deploySourceProfile")) $("deploySourceProfile").value = ui.deploySourceProfileId || "";
     if ($("deployDestProfile")) $("deployDestProfile").value = ui.deployDestProfileId || "";
+    $("deployTargetMode").value = ui.deployTargetMode === "multiple" ? "multiple" : "single";
+    $("deployTargetMode").dispatchEvent(new Event("change"));
+    $("continueTargetsOnError").checked = Boolean(ui.continueTargetsOnError);
+    document.querySelectorAll("[data-batch-target]").forEach((input) => { input.checked = (ui.deployTargetIds || []).includes(input.value); });
     if ($("deployEngine")) {
-      $("deployEngine").value = ui.deployEngine || "DacFx";
+      $("deployEngine").value = "Legacy";
       $("deployEngine").dispatchEvent(new Event("change"));
     }
     if ($("deployMode")) {
@@ -612,7 +670,6 @@ function applyPersistedUiState() {
       $("deployScriptPath").value = ui.deployScriptPath || prefs.defaultScriptPath || "";
     }
     if ($("continueOnError")) $("continueOnError").checked = Boolean(ui.continueOnError);
-    if ($("allowSameSource")) $("allowSameSource").checked = Boolean(ui.allowSameSource);
 
     getFormatterWorkbench()?.applyPersistedState?.(ui.formatter || {});
 
@@ -621,24 +678,29 @@ function applyPersistedUiState() {
   } finally {
     isApplyingAppState = false;
   }
+  populateDiscoverDropdowns();
 }
 
 function bindAppStatePersistence() {
-  const textIds = ["sharedObjectText", "backupPath", "deployScriptPath", "defaultBackupPath", "defaultScriptPath"];
+  const textIds = ["sharedObjectText", "sharedNameFilter", "folderSourcePath", "backupPath", "deployScriptPath", "defaultBackupPath", "defaultScriptPath"];
   const changeIds = [
     "objectsProfile",
     "objectsMode",
+    "sharedTypeFilter",
+    "sharedSchemaFilter",
+    "discoverPageSize",
+    "archiveRetentionDays",
     "diffSourceProfile",
     "diffDestProfile",
     "diffEngine",
-    "diffExportFormat",
     "backupProfile",
     "deploySourceProfile",
     "deployDestProfile",
+    "deployTargetMode",
+    "continueTargetsOnError",
     "deployEngine",
     "deployMode",
     "continueOnError",
-    "allowSameSource",
     "notificationsToggle",
     "fontSelector",
     "fontSizeRange",
@@ -731,6 +793,7 @@ function beginTaskProgress(key, label) {
   }
 
   bar.classList.add("is-indeterminate");
+  bar.removeAttribute("aria-valuenow");
   bar.style.width = "40%";
   bar.style.background = "linear-gradient(90deg, var(--accent), var(--accent-2))";
   text.textContent = label || "Running...";
@@ -741,11 +804,13 @@ function updateTaskProgress(key, label, percent = null) {
   const text = $(`${key}ProgressText`);
   if (!bar || !text) return;
 
-  if (percent === null || percent === undefined) {
+  if (!Number.isFinite(percent)) {
     bar.classList.add("is-indeterminate");
+    bar.removeAttribute("aria-valuenow");
     bar.style.width = "40%";
   } else {
     bar.classList.remove("is-indeterminate");
+    bar.setAttribute("aria-valuenow", String(Math.max(0, Math.min(100, percent))));
     bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
   }
   bar.style.background = "linear-gradient(90deg, var(--accent), var(--accent-2))";
@@ -763,6 +828,7 @@ function endTaskProgress(key, ok, label) {
   }
 
   bar.classList.remove("is-indeterminate");
+  bar.setAttribute("aria-valuenow", "100");
   bar.style.width = "100%";
   text.textContent = ok ? `${label} completed` : `${label} failed`;
   if (!ok) {
@@ -783,6 +849,7 @@ function resetTaskProgress(key) {
   }
 
   bar.classList.remove("is-indeterminate");
+  bar.setAttribute("aria-valuenow", "0");
   bar.style.width = "0%";
   bar.style.background = "var(--accent)";
   text.textContent = "Idle";
@@ -864,11 +931,14 @@ function padDatePart(value) {
 // Set from settings to render every timestamp in the configured timezone.
 let activeTimeZone = null;
 
-// One "Format Generated SQL" preference drives the Settings toggle and the
-// per-mode checkboxes on Deployment and Code Diff. Backup uses a three-state
-// dropdown instead: its off/format states mirror the shared preference, while
-// "Format & Execute in Source" is a per-run choice that never persists.
 const FORMAT_SQL_CONTROL_IDS = ["formatGeneratedSqlToggle", "formatSqlDeploy", "formatSqlDiff"];
+
+function applyFeatureSettings(features) {
+  const enabled = features?.schedules === true;
+  $("scheduleSection").classList.toggle("hidden", !enabled);
+  $("schedulesFeatureToggle").checked = enabled;
+  document.dispatchEvent(new CustomEvent("pebloy:schedules-feature", { detail: { enabled } }));
+}
 
 function applyFormattingSettings(formatting) {
   const enabled = Boolean(formatting?.formatGeneratedSql);
@@ -877,13 +947,20 @@ function applyFormattingSettings(formatting) {
     if (el) el.checked = enabled;
   }
   const backupMode = $("backupFormatMode");
-  if (backupMode && backupMode.value !== "formatExecute") {
+  if (backupMode) {
     backupMode.value = enabled ? "format" : "off";
   }
 }
 
 function isFormatGeneratedSqlEnabled() {
   return Boolean($("formatGeneratedSqlToggle")?.checked);
+}
+
+function applyExecutionSettings(execution) {
+  for (const key of ["queryTimeoutSeconds", "powershellTimeoutSeconds", "maxActiveTaskLogs"]) {
+    const field = $(key);
+    if (field && execution?.[key] != null) field.value = execution[key];
+  }
 }
 
 function setupFormatSqlCheckboxes() {
@@ -908,11 +985,12 @@ function setupFormatSqlCheckboxes() {
   const backupMode = $("backupFormatMode");
   if (backupMode) {
     backupMode.addEventListener("change", () => {
-      // "formatExecute" is a per-run backup choice; only the off/format
-      // states feed the shared Format Generated SQL preference.
-      if (backupMode.value !== "formatExecute") {
-        persistFormatting(backupMode.value === "format");
+      if (backupMode.value === "formatExecute") {
+        backupMode.value = isFormatGeneratedSqlEnabled() ? "format" : "off";
+        runSourceFormatAndExecute();
+        return;
       }
+      persistFormatting(backupMode.value === "format");
     });
   }
 }
@@ -1350,11 +1428,11 @@ function _timeAgo(iso) {
 }
 
 function renderProfilesTable(profiles, page = 1, pageSize = 20) {
-  const sortedProfiles = sortProfiles(profiles, _profileSort);
+  const sortedProfiles = sortProfiles(profiles, _profileSort).sort((left, right) => (left.groupName || "").localeCompare(right.groupName || ""));
   const { items, pages } = paginate(sortedProfiles, page, pageSize);
   const rows = items
     .map(
-      (p) => `<tr>
+      (p, index) => `${index === 0 || (p.groupName || "") !== (items[index - 1].groupName || "") ? `<tr class="profile-group"><th colspan="6" scope="rowgroup">${escapeHtml(p.groupName || "Ungrouped")}</th></tr>` : ""}<tr>
 <td>${healthDot(p.id)} ${escapeHtml(p.profileLabel)}</td>
 <td>${escapeHtml(p.serverName)}</td>
 <td>${escapeHtml(p.databaseName)}</td>
@@ -1476,6 +1554,7 @@ function beginEditProfile(id, profiles) {
       : "Enter password";
   }
   $("environmentTag").value = p.environmentTag || "";
+  $("profileGroup").value = p.groupName || "";
   updateAuthenticationFieldVisibility();
   showToast("Loaded connection details", false);
 }
@@ -1491,6 +1570,7 @@ function clearProfileForm() {
   const pwdField = $("password");
   if (pwdField) pwdField.placeholder = "Enter password";
   $("environmentTag").value = "";
+  $("profileGroup").value = "";
   updateAuthenticationFieldVisibility();
   showToast("Cleared connection form", false);
 }
@@ -1504,7 +1584,7 @@ function syncSharedObjectSummary() {
   $("deployObjectSummary").textContent = text;
 }
 
-function renderSharedSelectionTable() {
+function renderSharedSelectionTable(page = _selectionPage) {
   syncSharedObjectSummary();
 
   if (sharedSelectedObjects.length === 0) {
@@ -1513,11 +1593,15 @@ function renderSharedSelectionTable() {
   }
 
   const { filterText, filtered, sorted } = getSharedSelectionViewObjects();
+  const selectedIndices = new Map(sharedSelectedObjects.map((object, index) => [object, index]));
+  const pages = Math.max(1, Math.ceil(sorted.length / DISCOVER_PAGE_SIZE));
+  _selectionPage = Math.min(Math.max(1, page), pages);
+  const visible = sorted.slice((_selectionPage - 1) * DISCOVER_PAGE_SIZE, _selectionPage * DISCOVER_PAGE_SIZE);
 
-  const rows = sorted
+  const rows = visible
     .map(
       (o) => {
-        const realIdx = sharedSelectedObjects.indexOf(o);
+        const realIdx = selectedIndices.get(o);
         const fullName = escapeHtml(`${o.schemaName}.${o.objectName}`);
         return `<tr>
 <td>${escapeHtml(o.objectType)}</td>
@@ -1539,6 +1623,7 @@ function renderSharedSelectionTable() {
   const thClass = (col) => `style="cursor:pointer;user-select:none"`;
 
   $("sharedSelectionTable").innerHTML = `${countNote}
+<div class="table-viewport">
 <table class='table'>
 <thead><tr>
   <th data-sort-sel="type" ${thClass("type")}>Type${sortArrow("type")}</th>
@@ -1549,9 +1634,19 @@ function renderSharedSelectionTable() {
   <th></th>
 </tr></thead>
 <tbody>${rows || "<tr><td colspan='6' class='muted' style='text-align:center;padding:1rem'>No objects match filter.</td></tr>"}</tbody>
-</table>`;
+</table></div>
+${pages > 1 ? `<div class="selection-paging">
+<button type="button" id="selectionPrev" ${_selectionPage === 1 ? "disabled" : ""}>Prev</button>
+<span>Page ${_selectionPage} of ${pages} (${sorted.length} objects)</span>
+<button type="button" id="selectionNext" ${_selectionPage === pages ? "disabled" : ""}>Next</button>
+</div>` : ""}`;
+  if ($("selectionPrev")) $("selectionPrev").onclick = () => renderSharedSelectionTable(_selectionPage - 1);
+  if ($("selectionNext")) $("selectionNext").onclick = () => renderSharedSelectionTable(_selectionPage + 1);
 
   document.querySelectorAll("[data-sort-sel]").forEach((th) => {
+    th.tabIndex = 0;
+    th.setAttribute("aria-sort", _selectionSort.col === th.dataset.sortSel ? (_selectionSort.dir === "asc" ? "ascending" : "descending") : "none");
+    th.onkeydown = (event) => { if (["Enter", " "].includes(event.key)) { event.preventDefault(); th.click(); } };
     th.onclick = () => {
       const col = th.dataset.sortSel;
       if (_selectionSort.col === col) {
@@ -1559,7 +1654,8 @@ function renderSharedSelectionTable() {
       } else {
         _selectionSort = { col, dir: "asc" };
       }
-      renderSharedSelectionTable();
+      renderSharedSelectionTable(1);
+      $("sharedSelectionTable").querySelector(`[data-sort-sel="${col}"]`)?.focus();
     };
   });
 
@@ -1596,22 +1692,24 @@ function addToSharedSelection(items) {
 }
 
 function renderSharedObjectPicker(page) {
+  const pageSize = Number($("discoverPageSize").value) || DISCOVER_PAGE_SIZE;
   const sortedDiscovered = sortObjects(sharedDiscoveredObjects, _discoveredSort);
+  const discoveredIndices = new Map(sharedDiscoveredObjects.map((object, index) => [object, index]));
   const sortArrow = (col) => _discoveredSort.col === col ? (_discoveredSort.dir === "asc" ? " ↑" : " ↓") : "";
 
   const total = sortedDiscovered.length;
-  const usePagination = total > DISCOVER_PAGE_SIZE;
-  const pages = usePagination ? Math.ceil(total / DISCOVER_PAGE_SIZE) : 1;
+  const usePagination = total > pageSize;
+  const pages = usePagination ? Math.ceil(total / pageSize) : 1;
   _discoverPage = Math.min(Math.max(1, page ?? _discoverPage), pages);
   const pageItems = usePagination
-    ? sortedDiscovered.slice((_discoverPage - 1) * DISCOVER_PAGE_SIZE, _discoverPage * DISCOVER_PAGE_SIZE)
+    ? sortedDiscovered.slice((_discoverPage - 1) * pageSize, _discoverPage * pageSize)
     : sortedDiscovered;
 
   const rows = pageItems
     .map((o) => {
-      const origIdx = sharedDiscoveredObjects.indexOf(o);
+      const origIdx = discoveredIndices.get(o);
       return `<tr>
-<td><input type='checkbox' data-discovered='${origIdx}' checked /></td>
+    <td><input type='checkbox' data-discovered='${origIdx}' aria-label='Select ${escapeHtml(`${o.schemaName}.${o.objectName}`)}' ${discoveredSelectedObjects.has(o) ? "checked" : ""} /></td>
 <td>${escapeHtml(o.objectType)}</td>
 <td class="obj-name-cell"><span class="obj-schema">${escapeHtml(o.schemaName)}</span><span class="obj-dot">.</span><span class="obj-name">${escapeHtml(o.objectName)}</span></td>
 <td>${formatDateTime(o.createdDate)}</td><td>${formatDateTime(o.modifiedDate)}</td>
@@ -1623,8 +1721,8 @@ function renderSharedObjectPicker(page) {
   if (usePagination) {
     const prevDisabled = _discoverPage === 1 ? " disabled" : "";
     const nextDisabled = _discoverPage === pages ? " disabled" : "";
-    const start = (_discoverPage - 1) * DISCOVER_PAGE_SIZE + 1;
-    const end = Math.min(_discoverPage * DISCOVER_PAGE_SIZE, total);
+    const start = (_discoverPage - 1) * pageSize + 1;
+    const end = Math.min(_discoverPage * pageSize, total);
     paginationHtml = `
 <div class="pagination" style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap;margin-top:0.4rem">
   <button class="page-btn" id="discoverPrev"${prevDisabled}>&#8249; Prev</button>
@@ -1639,19 +1737,32 @@ function renderSharedObjectPicker(page) {
   }
 
   $("sharedObjectPicker").innerHTML = `
+<div class="discovery-actions">
+  <button type="button" id="discoverSelectVisible">Select All Visible</button>
+  <button type="button" id="discoverUnselectVisible">Unselect All Visible</button>
+  <span id="discoveredSelectionCount" class="muted"></span>
+</div>
+<div class="table-viewport">
 <table class='table'>
 <thead><tr>
-  <th><input type='checkbox' id='selectAllDiscoveredCb' title='Select or clear all' checked /></th>
+  <th><input type='checkbox' id='selectAllDiscoveredCb' title='Select or clear visible objects' aria-label='Select or clear visible objects' /></th>
   <th data-sort-disc="type" style="cursor:pointer;user-select:none">Type${sortArrow("type")}</th>
   <th data-sort-disc="object" style="cursor:pointer;user-select:none">Object${sortArrow("object")}</th>
   <th data-sort-disc="created" style="cursor:pointer;user-select:none">Created${sortArrow("created")}</th>
   <th data-sort-disc="modified" style="cursor:pointer;user-select:none">Modified${sortArrow("modified")}</th>
 </tr></thead>
 <tbody>${rows}</tbody>
-</table>
+</table></div>
 ${paginationHtml}`;
 
+  $("discoverSelectVisible").onclick = () => setVisibleDiscoveredSelection(true);
+  $("discoverUnselectVisible").onclick = () => setVisibleDiscoveredSelection(false);
+  syncDiscoveredSelectionHeader();
+
   document.querySelectorAll("[data-sort-disc]").forEach((th) => {
+    th.tabIndex = 0;
+    th.setAttribute("aria-sort", _discoveredSort.col === th.dataset.sortDisc ? (_discoveredSort.dir === "asc" ? "ascending" : "descending") : "none");
+    th.onkeydown = (event) => { if (["Enter", " "].includes(event.key)) { event.preventDefault(); th.click(); } };
     th.onclick = () => {
       const col = th.dataset.sortDisc;
       if (_discoveredSort.col === col) {
@@ -1661,6 +1772,7 @@ ${paginationHtml}`;
       }
       _discoverPage = 1;
       renderSharedObjectPicker(1);
+      $("sharedObjectPicker").querySelector(`[data-sort-disc="${col}"]`)?.focus();
     };
   });
 
@@ -1679,9 +1791,35 @@ ${paginationHtml}`;
   }
 }
 
+function syncDiscoveredSelectionHeader() {
+  const checkboxes = [...$("sharedObjectPicker").querySelectorAll("input[data-discovered]")];
+  const selectedCount = checkboxes.filter((checkbox) => checkbox.checked).length;
+  const header = $("selectAllDiscoveredCb");
+  if (header) {
+    header.checked = checkboxes.length > 0 && selectedCount === checkboxes.length;
+    header.indeterminate = selectedCount > 0 && selectedCount < checkboxes.length;
+  }
+  const count = $("discoveredSelectionCount");
+  if (count) count.textContent = `${discoveredSelectedObjects.size} selected`;
+}
+
+function setVisibleDiscoveredSelection(selected) {
+  $("sharedObjectPicker").querySelectorAll("input[data-discovered]").forEach((checkbox) => {
+    const object = sharedDiscoveredObjects[Number(checkbox.dataset.discovered)];
+    if (!object) return;
+    if (selected) discoveredSelectedObjects.add(object);
+    else discoveredSelectedObjects.delete(object);
+    checkbox.checked = selected;
+  });
+  syncDiscoveredSelectionHeader();
+}
+
 async function refreshProfiles() {
   const profiles = await api("/api/profiles");
   renderProfilesTable(profiles);
+  const existingTargets = document.querySelectorAll("[data-batch-target]");
+  const selectedTargets = new Set(existingTargets.length ? [...existingTargets].filter((input) => input.checked).map((input) => input.value) : appState?.ui?.deployTargetIds || []);
+  $("deployBatchTargets").innerHTML = profiles.map((profile) => `<label class="flag-label"><input type="checkbox" data-batch-target value="${escapeHtml(profile.id)}" ${selectedTargets.has(profile.id) ? "checked" : ""} /> ${escapeHtml(profile.groupName ? `${profile.groupName} / ${profile.profileLabel}` : profile.profileLabel)} (${escapeHtml(profile.databaseName)})</label>`).join("");
 
   [
     "objectsProfile",
@@ -1694,13 +1832,20 @@ async function refreshProfiles() {
     const select = $(id);
     if (!select) return;
     const current = select.value;
-    select.innerHTML = `<option value=''>Select connection</option>${profiles
-      .map((p) => {
+    select.replaceChildren(new Option("Select connection", ""));
+    const groups = new Map();
+    profiles.forEach((p) => {
+        const groupName = p.groupName || "Ungrouped";
+        if (!groups.has(groupName)) {
+          const group = document.createElement("optgroup");
+          group.label = groupName;
+          groups.set(groupName, group);
+        }
         const h = _profileHealth.get(p.id);
         const healthNote = !h ? " [never tested]" : h.status === "ok" ? ` [OK ${_timeAgo(h.testedAt)}]` : ` [FAIL]`;
-        return `<option value='${p.id}'>${escapeHtml(p.profileLabel)} (${escapeHtml(p.serverName)}/${escapeHtml(p.databaseName)})${healthNote}</option>`;
-      })
-      .join("")}`;
+        groups.get(groupName).append(new Option(`${p.profileLabel} (${p.serverName}/${p.databaseName})${healthNote}`, p.id));
+    });
+    [...groups.entries()].sort(([left], [right]) => left.localeCompare(right)).forEach(([, group]) => select.append(group));
     if (profiles.some((p) => p.id === current)) {
       select.value = current;
     }
@@ -1730,6 +1875,7 @@ function setupProfileForm() {
       username: $("username").value,
       password: $("password").value,
       environmentTag: $("environmentTag").value,
+      groupName: $("profileGroup").value,
     };
 
     try {
@@ -1772,10 +1918,24 @@ function updateAuthenticationFieldVisibility() {
   if (password) password.disabled = !isSql;
 }
 
+function sourceRequestFields(profileId) {
+  return $("objectsMode").value === "Folder" ? { sourceFolder: $("folderSourcePath").value.trim() } : { sourceProfileId: profileId };
+}
+
 function applyObjectModeUI() {
   const mode = $("objectsMode").value;
   $("objectsSpecifySection").classList.toggle("hidden", mode !== "Specify");
   $("objectsDiscoverSection").classList.toggle("hidden", mode !== "Discover");
+  const folder = mode === "Folder";
+  $("objectsFolderSection").classList.toggle("hidden", !folder);
+  $("specifyWrap").classList.toggle("hidden", folder);
+  ["objectsProfile", "diffSourceProfile", "backupProfile", "deploySourceProfile", "refreshSelectedObjects", "fetchObjectDependencies"].forEach((id) => { $(id).disabled = folder; });
+  document.querySelectorAll(".folder-source-label").forEach((element) => {
+    element.classList.toggle("hidden", !folder);
+    element.textContent = `Folder source: ${$("folderSourcePath").value || "(not selected)"}`;
+  });
+  $("backupFormatMode").querySelector('[value="formatExecute"]').disabled = folder;
+  if (folder && $("backupFormatMode").value === "formatExecute") $("backupFormatMode").value = "off";
 }
 
 async function discoverSharedObjects() {
@@ -1796,6 +1956,8 @@ async function discoverSharedObjects() {
   beginTaskProgress("objects", "Loading database objects...");
   showToast("Loading database objects...", false);
   sharedDiscoveredObjects = dedupeObjects(await api(`/api/objects?${params.toString()}`));
+  discoveredSelectedObjects.clear();
+  sharedDiscoveredObjects.forEach((object) => discoveredSelectedObjects.add(object));
   _discoverPage = 1;
   updateTaskProgress("objects", `Rendering ${sharedDiscoveredObjects.length} discovered objects...`, 85);
   renderSharedObjectPicker(1);
@@ -1803,17 +1965,54 @@ async function discoverSharedObjects() {
   showToast(`Discovered ${sharedDiscoveredObjects.length} objects`);
 }
 
+let discoverDropdownRequest = 0;
+let discoverDropdownProfileId = null;
+
+function updateDiscoverFilter(select, values, label, selectedValue = "") {
+  const options = [{ value: "", label }, ...values.map((value) => ({ value, label: value }))];
+  if (select.options.length !== options.length || options.some((option, index) =>
+    select.options[index]?.value !== option.value || select.options[index]?.textContent !== option.label)) {
+    select.replaceChildren(...options.map((option) => new Option(option.label, option.value)));
+  }
+  select.value = values.includes(selectedValue) ? selectedValue : "";
+}
+
 async function populateDiscoverDropdowns() {
+  const request = ++discoverDropdownRequest;
   const profileId = $("objectsProfile").value;
-  if (!profileId) return;
+  const typeSel = $("sharedTypeFilter");
+  const schemaSel = $("sharedSchemaFilter");
+  const isCurrent = () => request === discoverDropdownRequest && $("objectsProfile").value === profileId && $("objectsMode").value === "Discover";
+  if (!profileId) {
+    updateDiscoverFilter(typeSel, [], "(All Types)");
+    updateDiscoverFilter(schemaSel, [], "(All Schemas)");
+    typeSel.disabled = schemaSel.disabled = true;
+    discoverDropdownProfileId = null;
+    return;
+  }
+  if ($("objectsMode").value !== "Discover") return;
+  const sameProfile = discoverDropdownProfileId === profileId;
+  const remembered = discoverDropdownProfileId === null && appState?.ui?.objectsProfileId === profileId ? appState.ui : {};
+  if (!sameProfile) {
+    updateDiscoverFilter(typeSel, [], "(Loading types...)");
+    updateDiscoverFilter(schemaSel, [], "(Loading schemas...)");
+    typeSel.disabled = schemaSel.disabled = true;
+  }
   try {
     const params = new URLSearchParams({ profileId });
     const { types: typeOptions, schemas: schemaOptions } = await api(`/api/objects/filters?${params.toString()}`);
-    const typeSel = $("sharedTypeFilter");
-    const schemaSel = $("sharedSchemaFilter");
-    typeSel.innerHTML = '<option value="">(All Types)</option>' + typeOptions.map(t => `<option value="${t}">${t}</option>`).join("");
-    schemaSel.innerHTML = '<option value="">(All Schemas)</option>' + schemaOptions.map(s => `<option value="${s}">${s}</option>`).join("");
+    if (!isCurrent()) return;
+    updateDiscoverFilter(typeSel, typeOptions, "(All Types)", sameProfile ? typeSel.value : remembered.objectsTypeFilter);
+    updateDiscoverFilter(schemaSel, schemaOptions, "(All Schemas)", sameProfile ? schemaSel.value : remembered.objectsSchemaFilter);
+    if (discoverDropdownProfileId === null && !$("sharedNameFilter").value) $("sharedNameFilter").value = remembered.objectsNameFilter || "";
+    discoverDropdownProfileId = profileId;
+    typeSel.disabled = schemaSel.disabled = false;
   } catch (error) {
+    if (!isCurrent()) return;
+    if (!sameProfile) {
+      updateDiscoverFilter(typeSel, [], "(Types unavailable)");
+      updateDiscoverFilter(schemaSel, [], "(Schemas unavailable)");
+    }
     showToast(`Could not load discover dropdowns: ${error.message}`, true);
   }
 }
@@ -1974,6 +2173,7 @@ async function loadDependencyPickerCandidates({ profileId, sourceObjects, timeWi
     updateTaskProgress("objects", `Fetching dependencies for ${rootsToFetch.length} new object${rootsToFetch.length === 1 ? "" : "s"}...`, 35);
     const result = await api("/api/objects/dependencies", {
       method: "POST",
+      timeoutMs: DEPENDENCY_REQUEST_TIMEOUT_MS,
       body: JSON.stringify({
         profileId,
         objects: rootsToFetch,
@@ -2009,6 +2209,7 @@ async function exportDependencyQuery({ profileId, sourceObjects, timeWindow, sco
   const activeScope = scope === "allDependencies" ? "allDependencies" : "windowDependencies";
   const result = await api("/api/objects/dependencies/query", {
     method: "POST",
+    timeoutMs: DEPENDENCY_REQUEST_TIMEOUT_MS,
     body: JSON.stringify({
       profileId,
       objects: dedupeObjects(sourceObjects),
@@ -2079,13 +2280,14 @@ function showDependencyPickerModal({ dependencies = [], requestedCount, timeWind
 
     selectVisibleDefaults();
 
+    const dialogId = ++modalDialogSequence;
     const overlay = document.createElement("div");
     overlay.className = "confirm-modal-overlay dependency-modal-overlay";
     overlay.innerHTML = `
-      <div class="confirm-modal dependency-modal" role="dialog" aria-modal="true" aria-labelledby="dependencyModalTitle">
+      <div class="confirm-modal dependency-modal" role="dialog" aria-modal="true" aria-labelledby="dependencyModalTitle-${dialogId}">
         <div class="dependency-modal-header">
           <div>
-            <h4 id="dependencyModalTitle">Fetch Dependencies</h4>
+            <h4 id="dependencyModalTitle-${dialogId}">Fetch Dependencies</h4>
             <p class="dependency-modal-summary"></p>
           </div>
           <button type="button" class="btn-ghost dependency-modal-close" title="Close">Close</button>
@@ -2099,7 +2301,7 @@ function showDependencyPickerModal({ dependencies = [], requestedCount, timeWind
           <label class="flag-label"><input type="radio" name="dependencyScope" value="allDependencies" /> <span data-dependency-label="allDependencies"></span></label>
         </div>
         <div class="dependency-modal-search-row">
-          <input id="dependencySearchInput" class="dependency-search-input" placeholder="Search by type, schema, object, or parent..." />
+          <input id="dependencySearchInput" class="dependency-search-input" aria-label="Search dependencies" placeholder="Search by type, schema, object, or parent..." />
           <button type="button" class="btn-ghost btn-sm" data-dependency-select="all">Select All</button>
           <button type="button" class="btn-ghost btn-sm" data-dependency-select="none">Deselect All</button>
           <button type="button" class="btn-ghost btn-sm" data-dependency-export-query>Export Query</button>
@@ -2113,9 +2315,12 @@ function showDependencyPickerModal({ dependencies = [], requestedCount, timeWind
         </div>
       </div>`;
 
+    let releaseFocus = () => {};
     const close = (value) => {
+      if (closed) return;
       closed = true;
       overlay.remove();
+      releaseFocus();
       resolve(value);
     };
 
@@ -2239,8 +2444,10 @@ function showDependencyPickerModal({ dependencies = [], requestedCount, timeWind
     });
 
     document.body.appendChild(overlay);
+    releaseFocus = trapModalFocus(overlay);
     render();
-    overlay.querySelector("[data-dependency-action='import']").focus();
+    const importButton = overlay.querySelector("[data-dependency-action='import']");
+    (importButton.disabled ? overlay.querySelector(".dependency-modal-close") : importButton).focus();
 
     function loadScope(nextScope) {
       const generation = ++loadGeneration;
@@ -2482,16 +2689,31 @@ function setupEnhancedEditorShortcuts() {
 }
 
 async function setupObjectsTab() {
+  $("folderSourcePath").addEventListener("input", applyObjectModeUI);
+  $("folderSourceBrowse").onclick = async () => {
+    try { await chooseFolderForInput("folderSourcePath", "Choose source SQL folder"); applyObjectModeUI(); }
+    catch (error) { showToast(error.message, true); }
+  };
+  $("loadFolderSource").onclick = async function () {
+    const restore = setButtonLoading(this, "Reading SQL...");
+    try {
+      const result = await api("/api/sources/folder", { method: "POST", body: JSON.stringify({ folderPath: $("folderSourcePath").value }) });
+      $("folderSourcePath").value = result.folderPath;
+      sharedSelectedObjects = dedupeObjects(result.objects);
+      renderSharedSelectionTable();
+      applyObjectModeUI();
+      persistCurrentAppState({ delay: 0 });
+      showToast(`Loaded ${sharedSelectedObjects.length} folder objects`);
+    } catch (error) { showToast(error.message, true); }
+    finally { restore(); }
+  };
+  $("discoverPageSize").onchange = () => renderSharedObjectPicker(1);
   $("objectsProfile").onchange = () => {
-    if ($("objectsMode").value === "Discover") {
-      populateDiscoverDropdowns();
-    }
+    populateDiscoverDropdowns();
   };
   $("objectsMode").onchange = () => {
     applyObjectModeUI();
-    if ($("objectsMode").value === "Discover") {
-      populateDiscoverDropdowns();
-    }
+    populateDiscoverDropdowns();
   };
 
   const sharedObjectFileName = $("sharedObjectFileName");
@@ -2543,22 +2765,14 @@ async function setupObjectsTab() {
     }
   };
 
-  // Allow pressing Enter in any discover filter field to trigger search.
-  ["sharedNameFilter", "sharedTypeFilter", "sharedSchemaFilter"].forEach((id) => {
-    const el = $(id);
-    if (!el) return;
-    el.addEventListener("keydown", async (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        try { await discoverSharedObjects(); } catch (err) { showToast(err.message, true); }
-      }
-    });
+  $("sharedNameFilter").addEventListener("keydown", async (e) => {
+    if (e.key !== "Enter" || e.isComposing || e.defaultPrevented) return;
+    e.preventDefault();
+    try { await discoverSharedObjects(); } catch (err) { showToast(err.message, true); }
   });
 
   $("addDiscoveredObjects").onclick = () => {
-    const chosen = Array.from(document.querySelectorAll("input[data-discovered]:checked"))
-      .map((el) => sharedDiscoveredObjects[Number(el.dataset.discovered)])
-      .filter(Boolean);
+    const chosen = sharedDiscoveredObjects.filter((object) => discoveredSelectedObjects.has(object));
 
     if (chosen.length === 0) {
       showToast("Select one or more discovered objects", true);
@@ -2575,12 +2789,12 @@ async function setupObjectsTab() {
     const hdrCb = document.getElementById("selectAllDiscoveredCb");
     if (!hdrCb) return;
     if (e.target.id === "selectAllDiscoveredCb") {
-      document.querySelectorAll("input[data-discovered]").forEach((cb) => { cb.checked = e.target.checked; });
+      setVisibleDiscoveredSelection(e.target.checked);
     } else if (e.target.matches("input[data-discovered]")) {
-      const all = [...document.querySelectorAll("input[data-discovered]")];
-      const checked = all.filter((cb) => cb.checked);
-      hdrCb.indeterminate = checked.length > 0 && checked.length < all.length;
-      hdrCb.checked = checked.length === all.length;
+      const object = sharedDiscoveredObjects[Number(e.target.dataset.discovered)];
+      if (object && e.target.checked) discoveredSelectedObjects.add(object);
+      else discoveredSelectedObjects.delete(object);
+      syncDiscoveredSelectionHeader();
     }
   });
 
@@ -2591,6 +2805,7 @@ async function setupObjectsTab() {
     sharedSelectedObjects = [];
     if (resetState.clearDiscovered) {
       sharedDiscoveredObjects = [];
+      discoveredSelectedObjects.clear();
       $("sharedObjectPicker").innerHTML = "";
     }
     if (sharedObjectFileInput) sharedObjectFileInput.value = "";
@@ -2610,7 +2825,7 @@ async function setupObjectsTab() {
 
   const filterInput = $("objectsFilterInput");
   if (filterInput) {
-    filterInput.addEventListener("input", () => renderSharedSelectionTable());
+    filterInput.addEventListener("input", () => renderSharedSelectionTable(1));
   }
 
   const saveListBtn = $("saveObjectList");
@@ -2736,6 +2951,39 @@ function filterDiffBySharedObjects(report) {
 
 function setupDiff() {
   $("goToObjectsFromDiff").onclick = () => setActiveTab("objects");
+  $("exportDiff").onclick = async function () {
+    if (!currentDiffReport) return;
+    const restore = setButtonLoading(this, "Exporting...");
+    try {
+      const result = await api("/api/diff/export", { method: "POST", body: JSON.stringify({ format: $("diffExportFormat").value, report: currentDiffReport }) });
+      $("diffExportResult").classList.remove("hidden");
+      $("diffExportResult").textContent = result.filePath;
+      showToast("Diff exported");
+    } catch (error) { showToast(error.message, true); }
+    finally { restore(); }
+  };
+  $("copyDiff").onclick = async () => {
+    if (!currentDiffReport) return;
+    try {
+      const result = await api("/api/diff/clipboard", { method: "POST", body: JSON.stringify({ report: currentDiffReport }) });
+      await navigator.clipboard.writeText(result.text);
+      showToast("Diff Markdown copied");
+    } catch (error) { showToast(`Could not copy diff: ${error.message}`, true); }
+  };
+  document.addEventListener("keydown", (event) => {
+    if (getActiveTabName() !== "diff" || !event.ctrlKey || !event.shiftKey || event.key.toLowerCase() !== "c" || event.target.closest("input, textarea, [contenteditable], .monaco-editor")) return;
+    event.preventDefault();
+    $("copyDiff").click();
+  });
+  // Alt+Up/Down matches the WinMerge/Beyond Compare next-difference convention.
+  document.addEventListener("keydown", (event) => {
+    if (getActiveTabName() !== "diff" || !event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key) || event.target.closest("input, textarea, select, [contenteditable], .monaco-editor")) return;
+    event.preventDefault();
+    moveDiffChange(event.key === "ArrowDown" ? 1 : -1);
+  });
+  narrowDiffQuery.addEventListener("change", () => {
+    if (currentDiffReport && $("diffViewer")) renderDiffViewer(currentDiffReport);
+  });
 
   function updateDiffEngineHint() {
     const engine = $("diffEngine")?.value || "Legacy";
@@ -2760,17 +3008,17 @@ function setupDiff() {
         method: "POST",
         body: JSON.stringify({
           logLevel: $("logLevelSelect")?.value || "Normal",
-          sourceProfileId,
+          ...sourceRequestFields(sourceProfileId),
           destinationProfileId,
-          engine: $("diffEngine")?.value || "DacFx",
+          engine: $("diffEngine")?.value || "Legacy",
           selectedObjects: sharedSelectedObjects,
         }),
       });
 
       const filteredReport = filterDiffBySharedObjects(result.report);
       currentDiffReport = filteredReport;
-      currentDiffRows = filteredReport.details.filter((x) => x.status !== "Unchanged");
-      currentDiffIndex = 0;
+      currentDiffIndex = -1;
+      diffExpandedGaps = new Map();
       renderDiff(filteredReport);
       renderGenerationWarnings(result.report?.generationWarnings, "diffSummary");
       endTaskProgress("diff", true, "Diff");
@@ -2783,220 +3031,498 @@ function setupDiff() {
     }
   };
 
-  $("exportDiff").onclick = async () => {
-    if (!currentDiffReport) {
-      showToast("Run a comparison first", true);
-      return;
-    }
+}
 
-    try {
-      const format = $("diffExportFormat").value;
-      showToast("Exporting diff report...", false);
-      const result = await api("/api/diff/export", {
-        method: "POST",
-        body: JSON.stringify({ format, report: currentDiffReport }),
-      });
-      showToast(`Comparison report exported: ${result.filePath}`);
-    } catch (error) {
-      showToast(error.message, true);
-    }
-  };
+const DIFF_FILTER_LABELS = { all: "All", changed: "Changed", added: "Added", missing: "Missing" };
+const DIFF_STATUS_GLYPHS = { changed: ["~", "Different in source and target"], added: ["+", "Only in source"], missing: ["\u2212", "Only in target"] };
+const DIFF_ROW_STATUSES = new Set(["unchanged", "modified", "added", "removed"]);
+const diffViewPrefs = { mode: "split", context: "3", wrap: true };
+const diffListFilter = { status: "all", query: "" };
+let diffExpandedGaps = new Map();
+let diffActiveChange = 0;
+const diffTokenCache = new WeakMap();
+const diffReviewRowCache = new WeakMap();
+const DIFF_REVIEW_STATUS = { added: "removed", removed: "added", modified: "modified", unchanged: "unchanged" };
+const narrowDiffQuery = window.matchMedia("(max-width: 760px)");
+
+// Reports store source on the left; review shows target (current) -> source (incoming), as deployment would apply it.
+function getReviewRows(detail) {
+  let rows = diffReviewRowCache.get(detail);
+  if (!rows) {
+    rows = (detail?.lineDiff || []).map((row) => ({
+      status: DIFF_REVIEW_STATUS[row.status] || "modified",
+      leftLineNumber: row.rightLineNumber,
+      leftText: row.rightText,
+      leftChanges: row.rightChanges,
+      rightLineNumber: row.leftLineNumber,
+      rightText: row.leftText,
+      rightChanges: row.leftChanges,
+    }));
+    diffReviewRowCache.set(detail, rows);
+  }
+  return rows;
 }
 
 function renderDiff(report) {
+  $("exportDiff").disabled = $("copyDiff").disabled = !report;
   $("diffSummary").innerHTML = `
 <div class='card'><strong>Added</strong><div>${report.summary.added}</div></div>
 <div class='card'><strong>Missing</strong><div>${report.summary.missing}</div></div>
 <div class='card'><strong>Changed</strong><div>${report.summary.changed}</div></div>
 <div class='card'><strong>Unchanged</strong><div>${report.summary.unchanged}</div></div>`;
 
-  const changedRows = report.details.filter((x) => x.status !== "Unchanged");
-  if (changedRows.length === 0) {
-    $("diffList").innerHTML = "<p>No differences found for the selected object list.</p>";
+  const changed = report.details.map((detail, index) => ({ detail, index })).filter(({ detail }) => detail.status !== "Unchanged");
+  if (!changed.length) {
+    $("diffList").innerHTML = "<p class='diff-empty'>No differences found for the selected object list.</p>";
     return;
   }
+  if (!changed.some(({ index }) => index === currentDiffIndex)) {
+    currentDiffIndex = changed[0].index;
+    diffActiveChange = 0;
+  }
+  const counts = { all: changed.length, changed: 0, added: 0, missing: 0 };
+  for (const { detail } of changed) {
+    const status = String(detail.status).toLowerCase();
+    if (status in counts) counts[status] += 1;
+  }
+  if (!counts[diffListFilter.status]) diffListFilter.status = "all";
 
-  const listHtml = changedRows
-    .map(
-      (d, idx) => `<button class='diff-object-item ${idx === currentDiffIndex ? "active" : ""}' data-diff-index='${idx}'>
-  <span class='diff-object-main'>
-    <span class='diff-object-type'>${d.objectType}</span>
-    <span class='diff-object-name'>${d.schemaName}.${d.objectName}</span>
-  </span>
-  <span class='diff-object-status diff-object-status-${String(d.status || "").toLowerCase()}'>${d.status}</span>
-</button>`
-    )
-    .join("");
-
-  const selected = changedRows[currentDiffIndex] || changedRows[0];
-  const sourceLabel = getSelectedConnectionLabel("diffSourceProfile", "Source");
-  const targetLabel = getSelectedConnectionLabel("diffDestProfile", "Target");
-  const overview = buildDiffOverview(selected);
-
-  $("diffList").innerHTML = `<div class='diff-layout'>
-<aside class='diff-object-list'>
-  <div class='diff-object-list-header'>
-    <div class='diff-object-list-title'>Changed Objects</div>
-    <div class='diff-object-list-meta'>${changedRows.length} item${changedRows.length === 1 ? "" : "s"}</div>
+  $("diffList").innerHTML = `<div class="diff-layout">
+<aside class="diff-object-list" aria-label="Changed objects">
+  <div class="diff-object-list-header">
+    <span class="diff-object-list-title">Changed objects</span>
+    <span class="diff-count-badge">${changed.length}</span>
   </div>
-  ${listHtml}
+  <input id="diffObjectSearch" class="diff-object-search" type="search" placeholder="Filter by name or type" aria-label="Filter changed objects" value="${escapeHtml(diffListFilter.query)}" />
+  <div class="diff-filter-chips" role="group" aria-label="Filter by status">
+    ${Object.keys(DIFF_FILTER_LABELS).map((key) => `<button type="button" class="diff-chip" data-diff-filter="${key}" aria-pressed="${diffListFilter.status === key}"${counts[key] ? "" : " disabled"}>${DIFF_FILTER_LABELS[key]}<span class="diff-chip-count">${counts[key]}</span></button>`).join("")}
+  </div>
+  <div id="diffObjectItems" class="diff-object-items"></div>
 </aside>
-<section class='diff-view'>
-  <div class='diff-block diff-ado-shell'>
-    <div class='diff-head diff-head-detail'>
-      <div class='diff-head-main'>
-        <div class='diff-head-title'>${selected.objectType} ${selected.schemaName}.${selected.objectName}</div>
-        <div class='diff-head-subtitle'>${escapeHtml(sourceLabel)} vs ${escapeHtml(targetLabel)}</div>
-      </div>
-      <span class='diff-status-pill diff-status-${String(selected.status || "").toLowerCase()}'>${selected.status}</span>
-    </div>
-    <div class='diff-overview-bar'>
-      <div class='diff-overview-card'>
-        <span class='diff-overview-label'>Source Lines</span>
-        <strong class='diff-overview-value'>${overview.sourceLines}</strong>
-        <span class='diff-overview-note'>${escapeHtml(sourceLabel)}</span>
-      </div>
-      <div class='diff-overview-card'>
-        <span class='diff-overview-label'>Target Lines</span>
-        <strong class='diff-overview-value'>${overview.targetLines}</strong>
-        <span class='diff-overview-note'>${escapeHtml(targetLabel)}</span>
-      </div>
-      <div class='diff-overview-card'>
-        <span class='diff-overview-label'>Modified Rows</span>
-        <strong class='diff-overview-value'>${overview.modifiedRows}</strong>
-        <span class='diff-overview-note'>Changed on both sides</span>
-      </div>
-      <div class='diff-overview-card'>
-        <span class='diff-overview-label'>Added / Removed</span>
-        <strong class='diff-overview-value'>+${overview.addedRows} / -${overview.removedRows}</strong>
-        <span class='diff-overview-note'>Target / Source only</span>
-      </div>
-    </div>
-    ${renderDiffSideBySide(selected, { sourceLabel, targetLabel })}
-  </div>
-</section>
+<section id="diffViewer" class="diff-view"></section>
 </div>`;
 
-  document.querySelectorAll("button[data-diff-index]").forEach((btn) => {
-    btn.onclick = () => {
-      currentDiffIndex = Number(btn.dataset.diffIndex);
-      renderDiff(currentDiffReport || report);
+  $("diffObjectSearch").addEventListener("input", (event) => {
+    diffListFilter.query = event.target.value;
+    renderDiffObjectItems(report);
+  });
+  $("diffList").querySelectorAll("[data-diff-filter]").forEach((chip) => {
+    chip.onclick = () => {
+      diffListFilter.status = chip.dataset.diffFilter;
+      $("diffList").querySelectorAll("[data-diff-filter]").forEach((other) => other.setAttribute("aria-pressed", String(other === chip)));
+      renderDiffObjectItems(report);
     };
   });
+  renderDiffObjectItems(report);
+  renderDiffViewer(report);
+}
+
+function diffLineStats(detail) {
+  let added = 0;
+  let removed = 0;
+  for (const row of getReviewRows(detail)) {
+    if (row.status === "added" || row.status === "modified") added += 1;
+    if (row.status === "removed" || row.status === "modified") removed += 1;
+  }
+  return { added, removed };
+}
+
+function renderDiffObjectItems(report) {
+  const container = $("diffObjectItems");
+  if (!container) return;
+  const query = diffListFilter.query.trim().toLowerCase();
+  const items = report.details.map((detail, index) => ({ detail, index })).filter(({ detail }) => {
+    const status = String(detail.status).toLowerCase();
+    if (status === "unchanged" || (diffListFilter.status !== "all" && status !== diffListFilter.status)) return false;
+    return !query || `${detail.objectType} ${detail.schemaName}.${detail.objectName}`.toLowerCase().includes(query);
+  });
+  container.innerHTML = items.length ? items.map(({ detail, index }) => {
+    const status = String(detail.status).toLowerCase();
+    const [glyph, title] = DIFF_STATUS_GLYPHS[status] || ["?", String(detail.status)];
+    const stats = diffLineStats(detail);
+    const name = `${detail.schemaName}.${detail.objectName}`;
+    return `<button type="button" class="diff-object-item" data-diff-index="${index}"${index === currentDiffIndex ? ' aria-current="true"' : ""} title="${escapeHtml(`${detail.objectType} ${name} \u2014 ${title}`)}">
+  <span class="diff-object-glyph diff-glyph-${status}" aria-hidden="true">${glyph}</span>
+  <span class="diff-object-main"><span class="diff-object-name">${escapeHtml(name)}</span><span class="diff-object-type">${escapeHtml(detail.objectType)}</span></span>
+  <span class="diff-object-counts" title="${stats.added} lines added and ${stats.removed} removed if the source is applied to the target"><span class="diff-stat-add">+${stats.added}</span><span class="diff-stat-del">\u2212${stats.removed}</span></span>
+</button>`;
+  }).join("") : "<p class='diff-empty'>No objects match this filter.</p>";
+  container.querySelectorAll("[data-diff-index]").forEach((button) => {
+    button.onclick = () => {
+      currentDiffIndex = Number(button.dataset.diffIndex);
+      diffActiveChange = 0;
+      renderDiffObjectItems(report);
+      renderDiffViewer(report);
+    };
+  });
+}
+
+const SQL_KEYWORDS = new Set(("ADD AFTER ALL ALTER AND ANSI_NULLS ANY APPLY AS ASC AUTHORIZATION BEGIN BETWEEN BREAK BY CASCADE CASE CAST CATCH CHECK " +
+  "CLOSE CLUSTERED COALESCE COLLATE COLUMN COMMIT CONSTRAINT CONTINUE CONVERT CREATE CROSS CURSOR DATABASE DEALLOCATE DECLARE DEFAULT DELETE DESC " +
+  "DISTINCT DROP ELSE END ESCAPE EXCEPT EXEC EXECUTE EXISTS FETCH FOR FOREIGN FROM FULL FUNCTION GO GOTO GRANT GROUP HAVING IDENTITY IF IN INDEX INNER " +
+  "INSERT INSTEAD INTERSECT INTO IS JOIN KEY LEFT LIKE MATCHED MERGE NOCHECK NOCOUNT NONCLUSTERED NOT NULL NULLIF OF OFF ON OPEN OPTION OR ORDER OUT " +
+  "OUTER OUTPUT OVER PARTITION PERCENT PIVOT PRIMARY PRINT PROC PROCEDURE QUOTED_IDENTIFIER RAISERROR READONLY REFERENCES RETURN RETURNS REVOKE " +
+  "RIGHT ROLLBACK ROWCOUNT SCHEMA SCHEMABINDING SELECT SEQUENCE SET SOME SYNONYM TABLE THEN THROW TOP TRAN TRANSACTION TRIGGER TRUNCATE TRY TYPE " +
+  "UNION UNIQUE UNPIVOT UPDATE USE USING VALUES VIEW WHEN WHERE WHILE WITH").split(" "));
+const SQL_TYPES = new Set(("BIGINT BINARY BIT CHAR DATE DATETIME DATETIME2 DATETIMEOFFSET DECIMAL FLOAT GEOGRAPHY HIERARCHYID INT MAX MONEY NCHAR " +
+  "NUMERIC NVARCHAR REAL ROWVERSION SMALLDATETIME SMALLINT SMALLMONEY SQL_VARIANT SYSNAME TIME TINYINT UNIQUEIDENTIFIER VARBINARY VARCHAR XML").split(" "));
+const SQL_WORD = /[A-Za-z_@#][\w@#$]*/y;
+const SQL_NUMBER = /\d+(?:\.\d+)?/y;
+
+// State carries block comments and quoted text across lines of one side of the diff.
+function tokenizeSqlLine(text, state) {
+  const tokens = [];
+  let position = 0;
+  const push = (type, end) => {
+    if (end <= position) return;
+    const value = text.slice(position, end);
+    const last = tokens[tokens.length - 1];
+    if (last && last.type === type) last.text += value;
+    else tokens.push({ type, text: value });
+    position = end;
+  };
+  while (position < text.length) {
+    if (state.comment > 0) {
+      let end = position;
+      while (end < text.length && state.comment > 0) {
+        if (text.startsWith("/*", end)) { state.comment += 1; end += 2; }
+        else if (text.startsWith("*/", end)) { state.comment -= 1; end += 2; }
+        else end += 1;
+      }
+      push("com", end);
+      continue;
+    }
+    if (state.quote) {
+      const close = state.quote === "[" ? "]" : state.quote;
+      let end = position;
+      while (end < text.length) {
+        if (text[end] !== close) { end += 1; continue; }
+        if (text[end + 1] === close) { end += 2; continue; }
+        end += 1;
+        state.quote = null;
+        break;
+      }
+      push(close === "'" ? "str" : "ident", end);
+      continue;
+    }
+    const char = text[position];
+    if (text.startsWith("--", position)) { push("com", text.length); continue; }
+    if (text.startsWith("/*", position)) { state.comment = 1; push("com", position + 2); continue; }
+    if (char === "'" || ((char === "N" || char === "n") && text[position + 1] === "'")) {
+      state.quote = "'";
+      push("str", position + (char === "'" ? 1 : 2));
+      continue;
+    }
+    if (char === "[" || char === "\"") { state.quote = char; push("ident", position + 1); continue; }
+    SQL_NUMBER.lastIndex = position;
+    const number = /\w/.test(text[position - 1] || "") ? null : SQL_NUMBER.exec(text);
+    if (number) { push("num", position + number[0].length); continue; }
+    SQL_WORD.lastIndex = position;
+    const word = SQL_WORD.exec(text);
+    if (word) {
+      const upper = word[0].toUpperCase();
+      push(word[0][0] === "@" ? "var" : SQL_KEYWORDS.has(upper) ? "kw" : SQL_TYPES.has(upper) ? "type" : "", position + word[0].length);
+      continue;
+    }
+    push("", position + 1);
+  }
+  return tokens;
+}
+
+function getDiffTokens(detail) {
+  let cached = diffTokenCache.get(detail);
+  if (cached) return cached;
+  const left = { comment: 0, quote: null };
+  const right = { comment: 0, quote: null };
+  cached = getReviewRows(detail).map((row) => ({
+    left: row.leftLineNumber == null ? null : tokenizeSqlLine(String(row.leftText || ""), left),
+    right: row.rightLineNumber == null ? null : tokenizeSqlLine(String(row.rightText || ""), right),
+  }));
+  diffTokenCache.set(detail, cached);
+  return cached;
+}
+
+// Splits syntax tokens at word-change boundaries so both highlights can apply to one character run.
+function renderSqlTokens(tokens, changes, changeClass) {
+  let html = "";
+  let offset = 0;
+  let changeIndex = 0;
+  for (const token of tokens) {
+    let position = 0;
+    while (position < token.text.length) {
+      const absolute = offset + position;
+      while (changeIndex < changes.length && changes[changeIndex][1] <= absolute) changeIndex += 1;
+      const change = changes[changeIndex];
+      const inChange = Boolean(change && change[0] <= absolute);
+      const limit = inChange ? change[1] : change ? change[0] : Infinity;
+      const end = Math.min(token.text.length, limit - offset);
+      const classes = [token.type && `tk-${token.type}`, inChange && changeClass].filter(Boolean).join(" ");
+      const piece = escapeHtml(token.text.slice(position, end));
+      html += classes ? `<span class="${classes}">${piece}</span>` : piece;
+      position = end;
+    }
+    offset += token.text.length;
+  }
+  return html;
+}
+
+function collectDiffChanges(rows) {
+  const changes = [];
+  rows.forEach((row, index) => {
+    if (row.status === "unchanged") return;
+    if (index && rows[index - 1].status !== "unchanged") changes[changes.length - 1].end = index;
+    else changes.push({ start: index, end: index });
+  });
+  return changes;
+}
+
+function mapDiffChanges(rows, changes) {
+  const changeOf = new Int32Array(rows.length).fill(-1);
+  changes.forEach((change, index) => changeOf.fill(index, change.start, change.end + 1));
+  return changeOf;
+}
+
+function buildDiffSegments(rows, context, expanded) {
+  const visible = new Uint8Array(rows.length).fill(context === "full" ? 1 : 0);
+  if (context !== "full") {
+    const radius = Number(context) || 3;
+    rows.forEach((row, index) => {
+      if (row.status !== "unchanged") visible.fill(1, Math.max(0, index - radius), Math.min(rows.length, index + radius + 1));
+    });
+  }
+  const items = [];
+  for (let index = 0; index < rows.length;) {
+    if (visible[index]) { items.push({ row: index }); index += 1; continue; }
+    let end = index;
+    while (end < rows.length && !visible[end]) end += 1;
+    if (expanded.has(index)) for (let row = index; row < end; row += 1) items.push({ row });
+    else items.push({ gapStart: index, gapEnd: end });
+    index = end;
+  }
+  return items;
+}
+
+function describeDiffHunk(rows, items, position) {
+  let leftStart = null;
+  let rightStart = null;
+  let leftCount = 0;
+  let rightCount = 0;
+  for (let next = position + 1; next < items.length && items[next].row !== undefined; next += 1) {
+    const row = rows[items[next].row];
+    if (row.leftLineNumber != null) { leftStart ??= row.leftLineNumber; leftCount += 1; }
+    if (row.rightLineNumber != null) { rightStart ??= row.rightLineNumber; rightCount += 1; }
+  }
+  return leftCount || rightCount ? `@@ -${leftStart ?? 0},${leftCount} +${rightStart ?? 0},${rightCount} @@` : "";
+}
+
+function renderDiffGapRow(rows, items, position, columns) {
+  const { gapStart, gapEnd } = items[position];
+  const count = gapEnd - gapStart;
+  return `<tr class="diff-gap"><td colspan="${columns}"><button type="button" class="diff-expand" data-gap="${gapStart}"><span aria-hidden="true">\u2195</span> Show ${count} unchanged line${count === 1 ? "" : "s"}</button><span class="diff-hunk-header">${escapeHtml(describeDiffHunk(rows, items, position))}</span></td></tr>`;
+}
+
+function renderDiffNumber(number, kind) {
+  return `<td class="diff-num diff-num-${kind}"${Number.isInteger(number) ? ` data-line="${number}"` : ""}></td>`;
+}
+
+function renderDiffCodeCell(tokens, changes, kind) {
+  if (kind === "empty" || !tokens) return "<td class='diff-code diff-code-empty'></td>";
+  const marker = kind === "del" ? "-" : kind === "ins" ? "+" : " ";
+  return `<td class="diff-code diff-code-${kind}" data-marker="${marker}">${renderSqlTokens(tokens, Array.isArray(changes) ? changes : [], `diff-word-${kind}`)}</td>`;
+}
+
+function renderSplitDiffRows(rows, items, tokens, changes) {
+  const changeOf = mapDiffChanges(rows, changes);
+  return items.map((item, position) => {
+    if (item.row === undefined) return renderDiffGapRow(rows, items, position, 4);
+    const row = rows[item.row];
+    const status = DIFF_ROW_STATUSES.has(row.status) ? row.status : "modified";
+    const unchanged = status === "unchanged";
+    const leftKind = unchanged ? "ctx" : row.leftLineNumber == null ? "empty" : "del";
+    const rightKind = unchanged ? "ctx" : row.rightLineNumber == null ? "empty" : "ins";
+    return `<tr class="diff-row diff-row-${status}"${unchanged ? "" : ` data-change="${changeOf[item.row]}"`}>${renderDiffNumber(row.leftLineNumber, leftKind)}${renderDiffCodeCell(tokens[item.row].left, row.leftChanges, leftKind)}${renderDiffNumber(row.rightLineNumber, rightKind)}${renderDiffCodeCell(tokens[item.row].right, row.rightChanges, rightKind)}</tr>`;
+  }).join("");
+}
+
+// Unified view lists each change block's removed lines before its added lines, as git does.
+function renderUnifiedDiffRows(rows, items, tokens, changes) {
+  const changeOf = mapDiffChanges(rows, changes);
+  const html = [];
+  for (let position = 0; position < items.length; position += 1) {
+    const item = items[position];
+    if (item.row === undefined) { html.push(renderDiffGapRow(rows, items, position, 3)); continue; }
+    const row = rows[item.row];
+    if (row.status === "unchanged") {
+      html.push(`<tr class="diff-row diff-row-unchanged">${renderDiffNumber(row.leftLineNumber, "ctx")}${renderDiffNumber(row.rightLineNumber, "ctx")}${renderDiffCodeCell(tokens[item.row].left, null, "ctx")}</tr>`);
+      continue;
+    }
+    let last = position;
+    while (last + 1 < items.length && items[last + 1].row !== undefined && rows[items[last + 1].row].status !== "unchanged") last += 1;
+    const block = items.slice(position, last + 1).map((entry) => entry.row);
+    for (const index of block) {
+      if (rows[index].leftLineNumber == null) continue;
+      html.push(`<tr class="diff-row diff-row-removed" data-change="${changeOf[index]}">${renderDiffNumber(rows[index].leftLineNumber, "del")}${renderDiffNumber(null, "del")}${renderDiffCodeCell(tokens[index].left, rows[index].leftChanges, "del")}</tr>`);
+    }
+    for (const index of block) {
+      if (rows[index].rightLineNumber == null) continue;
+      html.push(`<tr class="diff-row diff-row-added" data-change="${changeOf[index]}">${renderDiffNumber(null, "ins")}${renderDiffNumber(rows[index].rightLineNumber, "ins")}${renderDiffCodeCell(tokens[index].right, rows[index].rightChanges, "ins")}</tr>`);
+    }
+    position = last;
+  }
+  return html.join("");
+}
+
+function renderDiffMinimap(rows, changes) {
+  const total = Math.max(rows.length, 1);
+  return changes.map((change, index) => {
+    const block = rows.slice(change.start, change.end + 1);
+    const kind = block.every((row) => row.status === "added") ? "ins" : block.every((row) => row.status === "removed") ? "del" : "mod";
+    const top = ((change.start / total) * 100).toFixed(3);
+    const height = (((change.end - change.start + 1) / total) * 100).toFixed(3);
+    return `<span class="diff-mark diff-mark-${kind}" data-change="${index}" style="top:${top}%;height:${height}%"></span>`;
+  }).join("");
+}
+
+function renderDiffStatBar({ added, removed }) {
+  const total = added + removed;
+  const adds = total ? Math.round((added / total) * 5) : 0;
+  const dels = total ? 5 - adds : 0;
+  return `<span class="diff-stat-bar" aria-hidden="true">${"<i class='add'></i>".repeat(adds)}${"<i class='del'></i>".repeat(dels)}${"<i></i>".repeat(5 - adds - dels)}</span>`;
+}
+
+function renderDiffViewer(report) {
+  const viewer = $("diffViewer");
+  const detail = report?.details?.[currentDiffIndex];
+  if (!viewer || !detail) return;
+  const sameObject = viewer.dataset.index === String(currentDiffIndex);
+  const previousScroll = sameObject ? viewer.querySelector(".diff-scroll")?.scrollTop || 0 : 0;
+  const rows = getReviewRows(detail);
+  const status = String(detail.status).toLowerCase();
+  const stats = diffLineStats(detail);
+  const narrow = narrowDiffQuery.matches;
+  const mode = diffViewPrefs.mode === "split" && !narrow ? "split" : "unified";
+  const sourceLabel = getSelectedConnectionLabel("diffSourceProfile", "Source");
+  const targetLabel = getSelectedConnectionLabel("diffDestProfile", "Target");
+  const changes = collectDiffChanges(rows);
+  const expanded = diffExpandedGaps.get(currentDiffIndex) || new Set();
+  const items = buildDiffSegments(rows, diffViewPrefs.context, expanded);
+  const tokens = getDiffTokens(detail);
+  const [glyph, glyphTitle] = DIFF_STATUS_GLYPHS[status] || ["", String(detail.status)];
+  const body = mode === "split" ? renderSplitDiffRows(rows, items, tokens, changes) : renderUnifiedDiffRows(rows, items, tokens, changes);
+  const columns = mode === "split"
+    ? "<col class='diff-col-num' /><col /><col class='diff-col-num' /><col />"
+    : "<col class='diff-col-num' /><col class='diff-col-num' /><col />";
+  const heads = mode === "split"
+    ? `<tr><th colspan="2" scope="colgroup"><span class="diff-side-label">Target (current)</span>${escapeHtml(targetLabel)}</th><th colspan="2" scope="colgroup"><span class="diff-side-label">Source (incoming)</span>${escapeHtml(sourceLabel)}</th></tr>`
+    : `<tr><th colspan="3" scope="colgroup"><span class="diff-side-label">Target (current)</span>${escapeHtml(targetLabel)} <span aria-hidden="true">\u2192</span> <span class="diff-side-label">Source (incoming)</span>${escapeHtml(sourceLabel)}</th></tr>`;
+  const emptyMessage = status === "changed"
+    ? "Only structural differences were reported for this object; there are no line-level text changes."
+    : "This object has no script text to compare.";
+
+  viewer.innerHTML = `<article class="diff-file">
+<header class="diff-file-header">
+  <div class="diff-file-title">
+    <span class="diff-object-glyph diff-glyph-${status}" title="${escapeHtml(glyphTitle)}" aria-hidden="true">${glyph}</span>
+    <span class="diff-type-badge">${escapeHtml(detail.objectType)}</span>
+    <h3 class="diff-file-name">${escapeHtml(`${detail.schemaName}.${detail.objectName}`)}</h3>
+    <span class="diff-status-pill diff-status-${status}" title="${escapeHtml(glyphTitle)}">${escapeHtml(detail.status)}</span>
+  </div>
+  <div class="diff-file-stats" title="Changes if the source is applied to the target" aria-label="${stats.added} lines added, ${stats.removed} lines removed">
+    <span class="diff-stat-add">+${stats.added}</span><span class="diff-stat-del">\u2212${stats.removed}</span>${renderDiffStatBar(stats)}
+  </div>
+</header>
+<div class="diff-toolbar" role="toolbar" aria-label="Diff view options">
+  <div class="diff-segmented" role="group" aria-label="Layout">
+    <button type="button" data-diff-mode="split" aria-pressed="${mode === "split"}"${narrow ? " disabled title='Split view needs a wider window'" : ""}>Split</button>
+    <button type="button" data-diff-mode="unified" aria-pressed="${mode === "unified"}">Unified</button>
+  </div>
+  <label class="diff-toolbar-field">Context
+    <select id="diffContext"><option value="3">3 lines</option><option value="10">10 lines</option><option value="full">Full object</option></select>
+  </label>
+  <label class="flag-label"><input type="checkbox" id="diffWrap"${diffViewPrefs.wrap ? " checked" : ""} /> Wrap lines</label>
+  <div class="diff-nav" role="group" aria-label="Change navigation">
+    <button type="button" id="diffPrevChange" class="btn-ghost" title="Previous change (Alt+Up)" aria-label="Previous change">\u2191</button>
+    <span id="diffChangePosition" class="diff-change-position" aria-live="polite"></span>
+    <button type="button" id="diffNextChange" class="btn-ghost" title="Next change (Alt+Down)" aria-label="Next change">\u2193</button>
+  </div>
+</div>
+${rows.length ? `<div class="diff-body">
+  <div class="diff-scroll" tabindex="0" aria-label="Line differences">
+    <table class="diff-grid diff-grid-${mode}${diffViewPrefs.wrap ? "" : " diff-nowrap"}"><colgroup>${columns}</colgroup><thead>${heads}</thead><tbody>${body}</tbody></table>
+  </div>
+  <div class="diff-minimap" title="Change overview. Select a marker to jump to it.">${renderDiffMinimap(rows, changes)}</div>
+</div>` : `<p class="diff-empty">${emptyMessage}</p>`}
+</article>`;
+  viewer.dataset.index = String(currentDiffIndex);
+
+  viewer.querySelectorAll("[data-diff-mode]").forEach((button) => {
+    button.onclick = () => {
+      diffViewPrefs.mode = button.dataset.diffMode;
+      persistCurrentAppState({ delay: 0 });
+      renderDiffViewer(report);
+    };
+  });
+  $("diffContext").value = diffViewPrefs.context;
+  $("diffContext").onchange = (event) => {
+    diffViewPrefs.context = event.target.value;
+    persistCurrentAppState({ delay: 0 });
+    renderDiffViewer(report);
+  };
+  $("diffWrap").onchange = (event) => {
+    diffViewPrefs.wrap = event.target.checked;
+    persistCurrentAppState({ delay: 0 });
+    renderDiffViewer(report);
+  };
+  $("diffPrevChange").onclick = () => moveDiffChange(-1);
+  $("diffNextChange").onclick = () => moveDiffChange(1);
+  viewer.querySelectorAll("[data-gap]").forEach((button) => {
+    button.onclick = () => {
+      expanded.add(Number(button.dataset.gap));
+      diffExpandedGaps.set(currentDiffIndex, expanded);
+      renderDiffViewer(report);
+    };
+  });
+  viewer.querySelector(".diff-minimap")?.addEventListener("click", (event) => {
+    const mark = event.target.closest("[data-change]");
+    if (mark) focusDiffChange(Number(mark.dataset.change), true);
+  });
+  const scroll = viewer.querySelector(".diff-scroll");
+  if (scroll) scroll.scrollTop = previousScroll;
+  focusDiffChange(diffActiveChange, !sameObject && diffViewPrefs.context === "full");
+}
+
+function focusDiffChange(index, scrollIntoView) {
+  const viewer = $("diffViewer");
+  const position = $("diffChangePosition");
+  if (!viewer || !position) return;
+  const marks = viewer.querySelectorAll(".diff-minimap [data-change]");
+  if (!marks.length) {
+    position.textContent = "No line changes";
+    $("diffPrevChange").disabled = $("diffNextChange").disabled = true;
+    return;
+  }
+  diffActiveChange = Math.min(Math.max(index, 0), marks.length - 1);
+  viewer.querySelectorAll(".diff-row-current, .diff-mark-current").forEach((element) => element.classList.remove("diff-row-current", "diff-mark-current"));
+  const rows = viewer.querySelectorAll(`tr[data-change="${diffActiveChange}"]`);
+  rows.forEach((row) => row.classList.add("diff-row-current"));
+  marks[diffActiveChange].classList.add("diff-mark-current");
+  position.textContent = `Change ${diffActiveChange + 1} of ${marks.length}`;
+  $("diffPrevChange").disabled = diffActiveChange === 0;
+  $("diffNextChange").disabled = diffActiveChange === marks.length - 1;
+  const scroll = viewer.querySelector(".diff-scroll");
+  if (scrollIntoView && rows[0] && scroll) {
+    scroll.scrollTop += rows[0].getBoundingClientRect().top - scroll.getBoundingClientRect().top - scroll.clientHeight / 3;
+  }
+}
+
+function moveDiffChange(delta) {
+  focusDiffChange(diffActiveChange + delta, true);
 }
 
 function getSelectedConnectionLabel(selectId, fallback) {
   const select = $(selectId);
   const option = select?.selectedOptions?.[0];
   return option?.textContent?.trim() || fallback;
-}
-
-function splitLinesPreserve(text) {
-  const value = String(text || "").replace(/\r\n/g, "\n");
-  const lines = value.split("\n");
-  if (lines.length > 0 && lines[lines.length - 1] === "") {
-    lines.pop();
-  }
-  return lines;
-}
-
-function countDefinitionLines(text) {
-  return splitLinesPreserve(String(text || "")).length;
-}
-
-function buildDiffOverview(detail) {
-  const overview = {
-    sourceLines: countDefinitionLines(detail?.sourceDefinition),
-    targetLines: countDefinitionLines(detail?.destinationDefinition),
-    modifiedRows: 0,
-    addedRows: 0,
-    removedRows: 0,
-  };
-
-  for (const row of detail?.lineDiff || []) {
-    const status = String(row.status || "").toLowerCase();
-    if (status === "modified") overview.modifiedRows += 1;
-    if (status === "added") overview.addedRows += 1;
-    if (status === "removed") overview.removedRows += 1;
-  }
-
-  return overview;
-}
-
-function renderDiffSideBySide(detail, labels = {}) {
-  const lineDiff = detail?.lineDiff || [];
-  if (!lineDiff.length) {
-    return "<div class='diff-empty muted'>No line changes.</div>";
-  }
-
-  const CONTEXT = 3;
-
-  const all = lineDiff.map((row) => ({
-    ...row,
-    normalizedStatus: String(row.status || "").toLowerCase(),
-  }));
-
-  const changed = new Set();
-  all.forEach((row, index) => {
-    if (row.normalizedStatus !== "unchanged") changed.add(index);
-  });
-  const visible = new Set();
-  for (const idx of changed) {
-    for (let d = -CONTEXT; d <= CONTEXT; d++) {
-      const n = idx + d;
-      if (n >= 0 && n < all.length) visible.add(n);
-    }
-  }
-
-  if (visible.size === 0) {
-    return "<div class='diff-empty muted'>Objects are identical.</div>";
-  }
-
-  let html = "";
-  let lastIdx = -1;
-
-  for (let i = 0; i < all.length; i++) {
-    if (!visible.has(i)) continue;
-
-    if (lastIdx !== -1 && i > lastIdx + 1) {
-      const skipped = i - lastIdx - 1;
-      html += `<tr class="diff-hunk"><td colspan="4">@@ ${skipped} unchanged line${skipped !== 1 ? "s" : ""} @@</td></tr>`;
-    }
-
-    const row = all[i];
-    const status = row.normalizedStatus;
-    const leftType = status === "added" ? "ghost" : status === "modified" ? "del" : status === "removed" ? "del" : "ctx";
-    const rightType = status === "removed" ? "ghost" : status === "modified" ? "ins" : status === "added" ? "ins" : "ctx";
-    const leftLine = row.leftLineNumber == null ? "" : String(row.leftLineNumber);
-    const rightLine = row.rightLineNumber == null ? "" : String(row.rightLineNumber);
-    html += `<tr class="diff-ado-row diff-status-${status}">
-<td class="diff-ado-cell diff-ado-cell-${leftType}">
-  <span class="diff-ado-ln">${leftLine}</span>
-  <span class="diff-ado-code mono">${escapeHtml(row.leftText || "")}</span>
-</td>
-<td class="diff-ado-cell diff-ado-cell-${rightType}">
-  <span class="diff-ado-ln">${rightLine}</span>
-  <span class="diff-ado-code mono">${escapeHtml(row.rightText || "")}</span>
-</td>
-</tr>`;
-    lastIdx = i;
-  }
-
-  return `<div class="diff-unified-wrap diff-ado-wrap">
-  <div class="diff-ado-headers">
-    <div class="diff-ado-header-pane">
-      <span class="diff-ado-header-label">Left</span>
-      <strong>${escapeHtml(labels.sourceLabel || "Source")}</strong>
-    </div>
-    <div class="diff-ado-header-pane">
-      <span class="diff-ado-header-label">Right</span>
-      <strong>${escapeHtml(labels.targetLabel || "Target")}</strong>
-    </div>
-  </div>
-  <table class="diff-ado-table">
-    <tbody>${html}</tbody>
-  </table>
-</div>`;
 }
 
 function escapeHtml(text) {
@@ -3020,13 +3546,6 @@ function setupBackup() {
   };
 
   $("runBackup").onclick = async function () {
-    const formatAndExecute = $("backupFormatMode")?.value === "formatExecute";
-    if (formatAndExecute) {
-      const profileLabel = $("backupProfile").selectedOptions?.[0]?.textContent || "the source connection";
-      if (!confirm(
-        `Format & Execute in Source is on.\n\nAfter generating scripts, every procedure, view, function, and trigger will be re-applied to ${profileLabel} with its formatted definition (CREATE OR ALTER).\n\nContinue?`
-      )) return;
-    }
     const restoreBtn = setButtonLoading(this, "Running…");
     try {
       beginTaskProgress("backup", "Generating scripts...");
@@ -3040,11 +3559,10 @@ function setupBackup() {
         method: "POST",
         body: JSON.stringify({
           logLevel: $("logLevelSelect")?.value || "Normal",
-          sourceProfileId: $("backupProfile").value,
+          ...sourceRequestFields($("backupProfile").value),
           selectedObjects: sharedSelectedObjects,
           options: {
             destinationPath: $("backupPath").value,
-            formatAndExecute,
           },
         }),
       });
@@ -3086,7 +3604,230 @@ function setupBackup() {
   };
 }
 
+function renderDeploymentPlanTable(plan) {
+  const hasTargets = plan.some((item) => item.targetLabel);
+  const actionLabels = {
+    AlterDelta: "Table delta (combined)",
+    ExecuteCombinedProcedures: "CREATE OR ALTER (combined procedures)",
+    DropAndCreate: "Guarded DROP + CREATE",
+    NoStoredModuleText: "Skip: no stored module text",
+  };
+  let step = 0;
+  let previousGroup = null;
+  const rows = plan.map((item) => {
+    const group = ["TABLE", "PROCEDURE"].includes(item.objectType) ? `${item.targetLabel || ""}|${item.objectType}` : item;
+    if (group !== previousGroup) step += 1;
+    previousGroup = group;
+    return `<tr><td>${step}</td>${hasTargets ? `<td>${escapeHtml(item.targetLabel || "")}</td>` : ""}<td>${escapeHtml(item.objectType)}</td>
+      <td>${escapeHtml(item.schemaName)}.${escapeHtml(item.objectName)}</td>
+      <td>${escapeHtml(actionLabels[item.action] || item.action)}</td></tr>`;
+  }).join("");
+  return `<div class="deployment-plan-scroll" tabindex="0" role="region" aria-label="Ordered deployment actions">
+    <table class="table"><thead><tr><th>Step</th>${hasTargets ? "<th>Target</th>" : ""}<th>Type</th><th>Object</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function collectDeploymentRequest() {
+  return { ...sourceRequestFields($("deploySourceProfile").value), destinationProfileId: $("deployDestProfile").value,
+    targetProfileIds: $("deployTargetMode").value === "multiple" ? [...document.querySelectorAll("[data-batch-target]:checked")].map((input) => input.value) : [$("deployDestProfile").value].filter(Boolean),
+    mode: $("deployMode").value, engine: "Legacy", continueOnError: $("continueOnError").checked,
+    continueTargetsOnError: $("continueTargetsOnError").checked, selectedObjects: structuredClone(sharedSelectedObjects),
+    logLevel: $("logLevelSelect").value, options: { scriptOutputPath: $("deployScriptPath").value } };
+}
+
+async function reviewBatchDeploymentRequest(request, { title = "Confirm Multi-Target Deployment", confirmLabel = "Confirm & Run Targets", extraMessage = "" } = {}) {
+  const payload = structuredClone(request);
+  if (!payload.selectedObjects.length || !payload.targetProfileIds.length) throw new Error("Select objects and target connections first.");
+  const reviewed = await api("/api/deploy/batch/plan", { method: "POST", body: JSON.stringify(payload) });
+  if (payload.sourceFolder ? reviewed.sourceConnection?.kind !== "Folder" : reviewed.sourceConnection?.id !== payload.sourceProfileId) throw new Error("The reviewed source does not match the requested source.");
+  if (!/^[a-f0-9]{64}$/.test(reviewed.fingerprint || "") || !Array.isArray(reviewed.plans) || reviewed.plans.length !== payload.targetProfileIds.length || reviewed.plans.some((item, index) => item.targetConnection?.id !== payload.targetProfileIds[index] || !item.plan?.length)) throw new Error("A valid target batch plan was not returned.");
+  const plan = reviewed.plans.flatMap((item) => item.plan.map((object) => ({ ...object, targetLabel: item.targetConnection.profileLabel })));
+  const message = [extraMessage, `Source: ${reviewed.sourceConnection.profileLabel} (${reviewed.sourceConnection.serverName}/${reviewed.sourceConnection.databaseName})`, `Mode: ${payload.mode}`,
+    payload.sourceFolder ? "Folder SQL uses ANSI_NULLS and QUOTED_IDENTIFIER ON unless the files specify otherwise. Confirmation is bound to the inspected folder content." : "",
+    ...reviewed.plans.map((item) => `${item.targetConnection.profileLabel}: ${item.targetConnection.serverName}/${item.targetConnection.databaseName}${/prod/i.test(item.targetConnection.environmentTag || "") ? " [PRODUCTION]" : ""}`),
+    `Continue within a target on error: ${payload.continueOnError ? "Yes" : "No"}`,
+    `Continue to later targets after failure: ${payload.continueTargetsOnError ? "Yes" : "No"}`,
+    payload.mode === "DryRun" ? "Scripts only; nothing executes." : "Targets execute sequentially. Earlier successful targets remain committed. Rollback does not cover external effects.",
+  ].filter(Boolean).join("\n");
+  const answer = await showConfirmModal({ title, message, plan, buttons: [confirmLabel, "Cancel"], defaultButton: 1 });
+  if (answer !== confirmLabel) return null;
+  payload.options.confirmedBatchFingerprint = reviewed.fingerprint;
+  return payload;
+}
+
+function renderBatchResult(result) {
+  $("deployResult").innerHTML = `<h3>Target Results</h3><div class="table-viewport"><table class="table"><thead><tr><th>Target</th><th>Status</th><th>Objects</th><th>Log</th></tr></thead><tbody>${result.targets.map((target) => `<tr><td>${escapeHtml(target.targetConnection.profileLabel)}</td><td>${escapeHtml(target.status)}${target.error ? `<br>${escapeHtml(target.error)}` : ""}</td><td>${target.summary?.total || 0}</td><td>${escapeHtml(target.logFilePath || "")}</td></tr>`).join("")}</tbody></table></div>${result.targets.map((target) => `<details><summary>${escapeHtml(target.targetConnection.profileLabel)}: ${escapeHtml(target.status)}</summary><pre>${escapeHtml((target.itemResults || []).map((item) => `${item.objectType}\t${item.schemaName}.${item.objectName}\t${item.status}${item.errorMessage ? `: ${item.errorMessage}` : ""}`).join("\n"))}</pre></details>`).join("")}`;
+}
+
+async function reviewDeploymentRequest(request) {
+  const payload = structuredClone(request);
+  if (!payload.selectedObjects.length) throw new Error("No objects selected. Use the Object Selection tab first.");
+  if ((!payload.sourceProfileId && !payload.sourceFolder) || !payload.destinationProfileId) throw new Error("Choose a source and target connection before planning deployment.");
+  const sourceExecution = payload.mode === "FormatAndExecuteSource";
+  const { plan, fingerprint, sourceConnection: source, targetConnection: target } = await api("/api/deploy/plan", { method: "POST", body: JSON.stringify(payload) });
+  if (!Array.isArray(plan) || !plan.length || !/^[a-f0-9]{64}$/.test(fingerprint || "") ||
+      (payload.sourceFolder ? source?.kind !== "Folder" : source?.id !== payload.sourceProfileId) || target?.id !== payload.destinationProfileId ||
+      !source?.serverName || !source?.databaseName || !target?.serverName || !target?.databaseName) {
+    throw new Error("A valid deployment plan was not returned. Nothing was executed.");
+  }
+  const modes = {
+    ExecuteDirectly: "Apply Changes",
+    Rollback: "Validate Only (Rollback)",
+    DryRun: "Dry Run (generate scripts only)",
+    FormatAndExecuteSource: "Format & Execute in Source",
+  };
+  const warnings = payload.mode === "DryRun"
+    ? "Scripts only. No SQL will be executed."
+    : payload.mode === "Rollback"
+      ? "SQL will execute inside a transaction that rolls back. External and non-transactional effects are not covered."
+      : "Earlier successful objects or combined groups remain committed if a later step fails. Protected objects may require manual review.";
+  const message = [
+    `Source: ${source.profileLabel} | ${source.serverName}/${source.databaseName}`,
+    `Target: ${target.profileLabel} | ${target.serverName}/${target.databaseName}`,
+    `Mode: ${modes[payload.mode]} | ${plan.length} objects`,
+    `Continue on error: ${payload.continueOnError ? "Yes" : "No"}`,
+    /prod/i.test(target.environmentTag || "") ? `PRODUCTION TARGET: ${target.environmentTag}` : "",
+    sourceExecution ? "This modifies SOURCE procedures, views, functions, and triggers. Other object types are skipped." : "",
+    payload.sourceFolder ? `Folder: ${source.folderPath}. Module settings default to ANSI_NULLS ON and QUOTED_IDENTIFIER ON unless supplied in each SQL file. File contents are bound to this confirmation.` : "",
+    warnings,
+    "Order is based on current source metadata. Dynamic SQL and external dependencies may require manual review. Unchanged objects may be skipped after comparison.",
+  ].filter(Boolean).join("\n");
+  const confirmLabel = payload.mode === "DryRun" ? "Confirm & Generate Scripts" : sourceExecution ? "Confirm & Execute in Source" : "Confirm & Run";
+  const answer = await showConfirmModal({
+    title: sourceExecution ? "Confirm Source Execution" : "Confirm Deployment Plan",
+    message, plan, buttons: [confirmLabel, "Cancel"], defaultButton: 1,
+  });
+  if (answer !== confirmLabel) return null;
+  payload.options = { ...payload.options, confirmedPlanFingerprint: fingerprint,
+    ...(sourceExecution ? { confirmedSourceDatabase: source.databaseName } : {}),
+  };
+  return payload;
+}
+
+async function runSourceFormatAndExecute() {
+  const button = $("runBackup");
+  if (button.disabled) return;
+  const restore = setButtonLoading(button, "Loading plan...");
+  $("backupFormatMode").disabled = true;
+  let started = false;
+  try {
+    const payload = await reviewDeploymentRequest({
+      logLevel: $("logLevelSelect")?.value || "Normal", engine: "Legacy", mode: "FormatAndExecuteSource",
+      sourceProfileId: $("backupProfile").value, destinationProfileId: $("backupProfile").value,
+      selectedObjects: sharedSelectedObjects, continueOnError: false,
+      options: { scriptOutputPath: $("backupPath").value },
+    });
+    if (!payload) return;
+    started = true;
+    beginTaskProgress("backup", "Formatting and executing source modules...");
+    button.textContent = "Executing in Source...";
+    const result = await api("/api/deploy/run", { method: "POST", body: JSON.stringify(payload) });
+    const failed = (result.summary?.failed || 0) + (result.summary?.reviewRequired || 0);
+    endTaskProgress("backup", !failed, "Source execution");
+    $("backupResult").textContent = ["Format & Execute in Source", `Task ID: ${result.taskId}`,
+      ...(result.itemResults || []).map((item) => `${item.objectType} ${item.schemaName}.${item.objectName}: ${item.status}${item.errorMessage ? ` - ${item.errorMessage}` : ""}`),
+      `Log: ${result.logFilePath || "See Task Logs"}`,
+    ].join("\n");
+    showToast(`Source execution: ${result.summary?.success || 0} succeeded, ${failed} failed or require review`, Boolean(failed));
+    await refreshLogs();
+  } catch (error) {
+    if (started) endTaskProgress("backup", false, "Source execution");
+    showToast(error.message, true);
+  } finally {
+    $("backupFormatMode").disabled = false;
+    restore();
+    $("backupFormatMode").focus();
+  }
+}
+
+function setupSchedules() {
+  let entries = [];
+  let editing = null;
+  async function refresh() {
+    const result = await api("/api/schedules");
+    entries = result.items;
+    $("scheduleWake").disabled = !result.capabilities.wakeApplication;
+    $("scheduleRuntime").textContent = `${result.timeZone} | ${result.capabilities.wakeApplication ? "Windows wake-up available (signed-in user)" : "App-open scheduling"}`;
+    $("scheduleList").innerHTML = entries.length ? `<table class="table"><thead><tr><th>Name / Mode</th><th>Next Run</th><th>Status</th><th>Last Result</th><th>Actions</th></tr></thead><tbody>${entries.map((entry) => `<tr><td>${escapeHtml(entry.name)}<br>${escapeHtml(entry.request.mode)} / ${entry.request.targetProfileIds.length} target(s)</td><td>${escapeHtml(entry.nextRunAt ? new Date(entry.nextRunAt).toLocaleString("en-GB", { hour12: false }) : "-")}<br>${escapeHtml(entry.repeat)}</td><td>${entry.enabled ? "Enabled" : "Paused"}<br>${escapeHtml(entry.lastStatus)}</td><td>${escapeHtml(entry.lastError || entry.lastResult?.logFilePath || "-")}</td><td><button type="button" data-schedule-action="edit" data-id="${escapeHtml(entry.id)}">Edit Timing</button> <button type="button" data-schedule-action="run" data-id="${escapeHtml(entry.id)}">Run Once</button> <button type="button" data-schedule-action="pause" data-id="${escapeHtml(entry.id)}" ${entry.enabled ? "" : "disabled"}>Pause</button> <button type="button" data-schedule-action="delete" data-id="${escapeHtml(entry.id)}">Delete</button></td></tr>`).join("")}</tbody></table>` : '<p class="muted">No schedules.</p>';
+  }
+  function reset() {
+    editing = null;
+    $("scheduleName").value = "";
+    $("scheduleTime").value = "";
+    $("saveSchedule").textContent = "Review & Save Schedule";
+  }
+  $("newSchedule").onclick = reset;
+  $("refreshSchedules").onclick = () => refresh().catch((error) => showToast(error.message, true));
+  $("saveSchedule").onclick = async function () {
+    const restore = setButtonLoading(this, "Loading plan...");
+    try {
+      const date = new Date($("scheduleTime").value);
+      if (!$("scheduleName").value.trim() || !Number.isFinite(date.getTime()) || date.getTime() <= Date.now()) throw new Error("Enter a schedule name and a future first-run time.");
+      const schedule = { name: $("scheduleName").value.trim(), repeat: $("scheduleRepeat").value, nextRunAt: date.toISOString(), wakeApplication: $("scheduleWake").checked, confirmed: true };
+      const request = await reviewBatchDeploymentRequest(editing ? editing.request : collectDeploymentRequest(), {
+        title: "Confirm Scheduled Deployment", confirmLabel: "Confirm & Save Schedule",
+        extraMessage: `Schedule: ${schedule.name}\nFirst run: ${date.toLocaleString("en-GB")}\nRepeat: ${schedule.repeat}\n${schedule.wakeApplication ? "Windows will launch Pebloy while this user is signed in." : "Pebloy must be running."}\nIf a run is missed, one run occurs on the next startup; missed intervals are not replayed. Failures, interruptions, or changed plans require reapproval.`,
+      });
+      if (!request) return;
+      await api(editing ? `/api/schedules/${encodeURIComponent(editing.id)}` : "/api/schedules", { method: editing ? "PUT" : "POST", body: JSON.stringify({ ...schedule, request }) });
+      reset();
+      await refresh();
+      showToast("Schedule saved.");
+    } catch (error) { showToast(error.message, true); }
+    finally { restore(); }
+  };
+  $("scheduleList").onclick = async (event) => {
+    const button = event.target.closest("[data-schedule-action]");
+    if (!button) return;
+    const record = entries.find((entry) => entry.id === button.dataset.id);
+    if (!record) return;
+    const restore = setButtonLoading(button, "Working...");
+    try {
+      const action = button.dataset.scheduleAction;
+      if (action === "edit") {
+        editing = structuredClone(record);
+        $("scheduleName").value = record.name;
+        $("scheduleRepeat").value = record.repeat;
+        $("scheduleWake").checked = record.wakeApplication;
+        const date = new Date(record.nextRunAt || Date.now() + 3600000);
+        date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
+        $("scheduleTime").value = date.toISOString().slice(0, 16);
+        $("saveSchedule").textContent = "Review & Update Schedule";
+        $("scheduleTime").focus();
+      } else if (action === "run") {
+        const request = await reviewBatchDeploymentRequest(record.request);
+        if (request) {
+          beginTaskProgress("deploy", "Running scheduled selection...");
+          const result = await api("/api/deploy/batch/run", { method: "POST", body: JSON.stringify(request) });
+          renderBatchResult(result);
+          endTaskProgress("deploy", !(result.summary.failed || result.summary.reviewRequired), "Scheduled selection");
+          await refreshLogs();
+        }
+      } else if (action === "pause") {
+        await api(`/api/schedules/${encodeURIComponent(record.id)}/pause`, { method: "POST", body: "{}" });
+      } else if (action === "delete") {
+        const answer = await showConfirmModal({ title: "Delete Schedule", message: `Delete ${record.name} and its Windows wake-up task? Existing logs and scripts are retained.`, buttons: ["Delete", "Cancel"], defaultButton: 1 });
+        if (answer !== "Delete") return;
+        await api(`/api/schedules/${encodeURIComponent(record.id)}`, { method: "DELETE", body: JSON.stringify({ confirmed: true }) });
+        if (editing?.id === record.id) reset();
+      }
+      await refresh();
+    } catch (error) { endTaskProgress("deploy", false, "Schedule action"); showToast(error.message, true); }
+    finally { restore(); }
+  };
+  document.addEventListener("pebloy:schedules-feature", (event) => {
+    if (event.detail.enabled) void refresh().catch((error) => showToast(error.message, true));
+  });
+}
+
 function setupDeployment() {
+  setupSchedules();
+  $("deployTargetMode").onchange = () => {
+    const multiple = $("deployTargetMode").value === "multiple";
+    $("deployBatchSection").classList.toggle("hidden", !multiple);
+    $("deployDestProfile").disabled = multiple;
+    $("previewDeployPlan").disabled = multiple;
+  };
+  $("deployBatchTargets").addEventListener("change", () => persistCurrentAppState({ delay: 0 }));
   $("goToObjects").onclick = () => setActiveTab("objects");
   const progressEl = $("deployObjectProgress");
   const retryRow = $("deployRetryRow");
@@ -3097,7 +3838,8 @@ function setupDeployment() {
 
   const deployModeHints = {
     ExecuteDirectly: "",
-    Rollback: "Validate Only: scripts run in a transaction that is always rolled back, so no database changes are committed.",
+    Rollback: "Validation executes SQL and rolls back its transaction. External and non-transactional effects are not covered.",
+    DryRun: "Dry Run generates every deployment script, including the table delta, and writes them for review. No SQL is executed.",
   };
 
   function syncPreviewButtonLabel() {
@@ -3113,6 +3855,7 @@ function setupDeployment() {
   }
 
   async function refreshDeploymentPlanPreview(forceOpen = false) {
+    if ($("deployTargetMode").value === "multiple") { hideDeployPlanPreview(); return; }
     if (!previewEl || !previewBtn) return;
     if (!forceOpen && previewEl.classList.contains("hidden")) return;
 
@@ -3132,35 +3875,17 @@ function setupDeployment() {
       const { plan } = await api("/api/deploy/plan", {
         method: "POST",
         body: JSON.stringify({
-          sourceProfileId: $("deploySourceProfile")?.value || "",
+          ...sourceRequestFields($("deploySourceProfile")?.value || ""),
+          destinationProfileId: $("deployDestProfile")?.value || "",
+          mode: $("deployMode").value,
           selectedObjects: sharedSelectedObjects,
-          engine: $("deployEngine")?.value || "DacFx",
+          engine: $("deployEngine")?.value || "Legacy",
         }),
       });
 
       if (requestToken !== previewRequestToken) return;
 
-      const actionLabels = {
-        AlterDelta: "Generate and apply table delta",
-        ExecuteIndividually: "Execute object script individually",
-        ExecuteCombinedProcedures: "Execute combined stored procedure script",
-        CreateOrAlterIndividually: "Create or alter object script individually",
-        DropAndCreate: "Drop and recreate object",
-        DacFxDeploy: "Preview and deploy through DacFx",
-        DacFxCreate: "Create through DacFx",
-        DacFxAlter: "Alter through DacFx",
-        DacFxDrop: "Drop through DacFx",
-        NoChange: "No semantic change",
-      };
-      const rows = plan.map((item, i) => `<tr>
-<td class="muted">${i + 1}</td>
-<td>${escapeHtml(item.objectType)}</td>
-<td>${escapeHtml(item.schemaName)}.${escapeHtml(item.objectName)}</td>
-<td class="muted">${escapeHtml(actionLabels[item.action] || item.action)}</td>
-</tr>`).join("");
-      previewEl.innerHTML = `<h4 style="margin:0 0 0.4rem">Execution Plan (${plan.length} objects)</h4>
-<table class="table"><thead><tr><th>#</th><th>Type</th><th>Object</th><th>Action</th></tr></thead>
-<tbody>${rows}</tbody></table>`;
+      previewEl.innerHTML = `<h4>Execution Plan (${plan.length} objects)</h4>${renderDeploymentPlanTable(plan)}`;
       previewEl.classList.remove("hidden");
     } catch (error) {
       if (requestToken !== previewRequestToken) return;
@@ -3191,24 +3916,22 @@ function setupDeployment() {
   }
 
   function updateDeployModeHint() {
-    const engine = $("deployEngine")?.value || "DacFx";
+    $("deployDestProfile").disabled = $("deployTargetMode").value === "multiple";
     const baseHint = deployModeHints[$("deployMode").value] || "";
-    const engineHint = engine === "DacFx"
-      ? "DacFx mode uses semantic schema compare and a generated deployment script."
-      : "Legacy mode uses the existing per-type execution flow and table delta PowerShell path.";
+    const engineHint = "Legacy mode uses the existing per-type execution flow and table delta PowerShell path.";
     const hint = [engineHint, baseHint].filter(Boolean).join(" ");
     const hintEl = $("deployModeHint");
     if (hintEl) hintEl.textContent = hint;
   }
 
-  $("deployMode").addEventListener("change", updateDeployModeHint);
+  $("deployMode").addEventListener("change", () => { updateDeployModeHint(); refreshDeploymentPlanPreview(); });
   $("deployEngine").addEventListener("change", () => {
     updateDeployModeHint();
     refreshDeploymentPlanPreview();
   });
   updateDeployModeHint();
 
-  $("deploySourceProfile")?.addEventListener("change", () => refreshDeploymentPlanPreview());
+  $("deploySourceProfile")?.addEventListener("change", () => { updateDeployModeHint(); refreshDeploymentPlanPreview(); });
   $("deployDestProfile")?.addEventListener("change", () => refreshDeploymentPlanPreview());
   document.addEventListener("pebloy:selection-changed", () => refreshDeploymentPlanPreview());
 
@@ -3232,60 +3955,43 @@ function setupDeployment() {
   syncPreviewButtonLabel();
 
   $("runDeployment").onclick = async function () {
-    const restoreBtn = setButtonLoading(this, "Running…");
-    resetDeployRunArtifacts();
+    const restoreBtn = setButtonLoading(this, "Loading plan...");
+    let started = false;
 
     try {
-      beginTaskProgress("deploy", "Preparing deployment...");
-      showToast("Processing deployment...", false);
-      if (sharedSelectedObjects.length === 0) {
-        endTaskProgress("deploy", false, "Deployment");
-        if (progressEl) progressEl.classList.add("hidden");
-        showToast("No objects selected. Use the Object Selection tab first.", true);
+      if ($("deployTargetMode").value === "multiple") {
+        const payload = await reviewBatchDeploymentRequest(collectDeploymentRequest());
+        if (!payload) return;
+        started = true;
+        resetDeployRunArtifacts();
+        beginTaskProgress("deploy", "Preparing target batch...");
+        const result = await api("/api/deploy/batch/run", { method: "POST", body: JSON.stringify(payload) });
+        renderBatchResult(result);
+        endTaskProgress("deploy", !(result.summary.failed || result.summary.reviewRequired), "Deployment batch");
+        await refreshLogs();
         return;
       }
-
-      if (progressEl) {
-        progressEl.classList.remove("hidden");
-      }
-
-      // Environment guardrail
-      const destProfileId = $("deployDestProfile").value;
-      const srcProfileId = $("deploySourceProfile").value;
-      const allProfiles = await api("/api/profiles");
-      const destProfile = allProfiles.find((p) => p.id === destProfileId);
-      const srcProfile = allProfiles.find((p) => p.id === srcProfileId);
-      if (destProfile?.environmentTag && /prod/i.test(destProfile.environmentTag)) {
-        const srcTag = srcProfile?.environmentTag || "";
-        const warning = srcTag
-          ? `You are deploying FROM ${srcTag} TO ${destProfile.environmentTag} (PRODUCTION).\n\nAre you sure you want to apply changes to the production database?`
-          : `Target connection "${destProfile.profileLabel}" is tagged as PRODUCTION.\n\nAre you sure you want to apply changes to the production database?`;
-        if (!confirm(warning)) {
-          resetTaskProgress("deploy");
-          progressEl.classList.add("hidden");
-          showToast("Deployment canceled");
-          return;
-        }
-      }
-
-      const result = await api("/api/deploy/run", {
-        method: "POST",
-        body: JSON.stringify({
+      const payload = await reviewDeploymentRequest({
           logLevel: $("logLevelSelect")?.value || "Normal",
-          sourceProfileId: srcProfileId,
-          destinationProfileId: destProfileId,
-          engine: $("deployEngine")?.value || "DacFx",
+          ...sourceRequestFields($("deploySourceProfile").value),
+          destinationProfileId: $("deployDestProfile").value,
+          engine: $("deployEngine")?.value || "Legacy",
           mode: $("deployMode").value,
           continueOnError: $("continueOnError").checked,
-          allowSameSourceDestination: $("allowSameSource").checked,
           selectedObjects: sharedSelectedObjects,
           options: {
             scriptOutputPath: $("deployScriptPath").value,
           },
-        }),
       });
+      if (!payload) return;
+      started = true;
+      resetDeployRunArtifacts();
+      beginTaskProgress("deploy", "Preparing deployment...");
+      this.textContent = "Running...";
+      progressEl?.classList.remove("hidden");
+      const result = await api("/api/deploy/run", { method: "POST", body: JSON.stringify(payload) });
 
-      endTaskProgress("deploy", true, "Deployment");
+      endTaskProgress("deploy", (result.summary?.failed || 0) + (result.summary?.reviewRequired || 0) === 0, "Deployment");
       _lastDeployResults = result.itemResults || [];
       renderDeployResult(result);
       if (progressEl) progressEl.classList.add("hidden");
@@ -3294,23 +4000,25 @@ function setupDeployment() {
       if ((result.summary?.failed ?? 0) > 0) {
         if (retryRow) retryRow.classList.remove("hidden");
       }
+      renderMigrationPrepAction(result);
 
       if (result.rollbackApplied) {
         const validated = result.summary.rolledBack ?? 0;
         const failed = result.summary.failed ?? 0;
         showToast(failed > 0
-          ? `Test Run complete. ${failed} error(s) found. No DB changes made.`
-          : `Test Run complete. ${validated} object(s) validated. No DB changes made.`);
+          ? `Validation finished with ${failed} error(s). Inspect the target and logs.`
+          : `Transaction rolled back for ${validated} object(s). External effects are not covered.`);
       } else {
-        showToast(`Deployment done. Success=${result.summary.success}, Failed=${result.summary.failed}`);
+        showToast(`Deployment done. Success=${result.summary.success}, Failed=${result.summary.failed}, Review Required=${result.summary.reviewRequired || 0}`, Boolean(result.summary.failed || result.summary.reviewRequired));
       }
       await refreshLogs();
     } catch (error) {
-      endTaskProgress("deploy", false, "Deployment");
+      if (started) endTaskProgress("deploy", false, "Deployment");
       if (progressEl) progressEl.classList.add("hidden");
       showToast(error.message, true);
     } finally {
       restoreBtn();
+      this.focus();
     }
   };
 
@@ -3327,20 +4035,54 @@ function setupDeployment() {
         schemaName: r.schemaName,
         objectName: r.objectName,
       }));
-      sharedSelectedObjects = dedupeObjects([...sharedSelectedObjects, ...items]);
+      sharedSelectedObjects = dedupeObjects(items);
       renderSharedSelectionTable();
       persistCurrentAppState({ delay: 0 });
       $("deployRetryRow").classList.add("hidden");
       setActiveTab("objects");
-      showToast(`${failed.length} failed object(s) added back to selection`);
+      showToast(`Selection replaced with ${failed.length} failed object(s)`);
     };
   }
 }
 
-function renderDeployResult(result) {
-  const s = result.summary || {};
+function renderMigrationPrepAction(result) {
+  const row = $("deployRetryRow");
+  if (!row) return;
+  document.getElementById("generateMigrationPrep")?.remove();
+  const needsReview = (result.itemResults || []).filter((item) => item.status === "ReviewRequired");
+  if (!needsReview.length) return;
+
+  row.classList.remove("hidden");
+  const button = document.createElement("button");
+  button.id = "generateMigrationPrep";
+  button.type = "button";
+  button.className = "btn-ghost";
+  button.textContent = `Generate migration script (${needsReview.length})`;
+  button.title = "Captures the permissions, ownership, signatures, and dependents that blocked these objects. Nothing is executed.";
+  button.onclick = async () => {
+    const restore = setButtonLoading(button, "Generating…");
+    try {
+      const prep = await api("/api/deploy/migration-prep", {
+        method: "POST",
+        body: JSON.stringify({
+          destinationProfileId: $("deployDestProfile").value,
+          taskId: result.taskId,
+          selectedObjects: needsReview.map(({ objectType, schemaName, objectName }) => ({ objectType, schemaName, objectName })),
+        }),
+      });
+      showToast(`Migration script written for review: ${prep.outputPath}`);
+    } catch (error) {
+      showToast(error.message, true);
+    } finally {
+      restore();
+    }
+  };
+  row.appendChild(button);
+}
+
+function renderDeployResult(result) {  const s = result.summary || {};
   const isRollback = result.rollbackApplied === true;
-  const statusClass = { Success: "deploy-status-success", Failed: "deploy-status-failed", RolledBack: "deploy-status-accent", Skipped: "deploy-status-skipped", PendingDelta: "deploy-status-warning" };
+  const statusClass = { Success: "deploy-status-success", Failed: "deploy-status-failed", ReviewRequired: "deploy-status-warning", RolledBack: "deploy-status-accent", Skipped: "deploy-status-skipped", PendingDelta: "deploy-status-warning" };
   const validationSummary = result.dacfxValidation?.enabled
     ? `Enabled (${result.dacfxValidation.objectCount || 0} objects)`
     : "Disabled";
@@ -3353,7 +4095,7 @@ function renderDeployResult(result) {
       const cls = statusClass[item.status] || "";
       const name = `${item.schemaName}.${item.objectName}`;
       const err = item.errorMessage ? escapeHtml(item.errorMessage) : "";
-      const statusLabel = item.status === "RolledBack" ? "Validated (not applied)" : item.status;
+      const statusLabel = item.status === "RolledBack" ? "Validated (not applied)" : item.status === "ReviewRequired" ? "Review Required" : item.status;
       return `<tr>
 <td>${escapeHtml(item.objectType)}</td>
 <td>${escapeHtml(name)} <button class="btn-copy-inline" data-copy="${escapeHtml(name)}" title="Copy">&#x2398;</button></td>
@@ -3365,7 +4107,7 @@ function renderDeployResult(result) {
     .join("");
 
   const rollbackNote = isRollback
-    ? `<p class="muted" style="margin:0 0 0.5rem;font-size:0.82rem">Rollback (Test Run) — no changes were committed to the database.</p>`
+    ? `<p class="muted" style="margin:0 0 0.5rem;font-size:0.82rem">Validation transaction rolled back. External and non-transactional effects are not covered.</p>`
     : "";
 
   const rolledBackCount = s.rolledBack ?? 0;
@@ -3387,6 +4129,7 @@ ${metadataBlock}
   <div class="card"><strong>Total</strong><div>${s.total ?? 0}</div></div>
   ${isRollback ? rolledBackCard : `<div class="card"><strong class="text-success">Success</strong><div>${s.success ?? 0}</div></div>`}
   <div class="card"><strong class="text-danger">Failed</strong><div>${s.failed ?? 0}</div></div>
+  ${(s.reviewRequired || 0) > 0 ? `<div class="card"><strong>Review Required</strong><div>${s.reviewRequired}</div></div>` : ""}
   <div class="card"><strong class="text-muted">Skipped</strong><div>${s.skipped ?? 0}</div></div>
 </div>
 <div style="overflow:auto;max-height:18rem">
@@ -3418,6 +4161,7 @@ ${metadataBlock}
 
 let _logAutoRefreshTimer = null;
 const _runningTasksMap = new Map(); // taskId → { taskType, objectCount, startedAt }
+let _activeDeployTaskId = null;
 
 function startLogAutoRefresh() {
   if (_logAutoRefreshTimer) return;
@@ -3434,9 +4178,44 @@ function connectSSE() {
     Deploy: "deploy",
   };
 
+  es.addEventListener("snapshot", (event) => {
+    const { tasks = [] } = JSON.parse(event.data);
+    const activeIds = new Set(tasks.map((task) => task.taskId));
+    for (const [taskId, task] of _runningTasksMap) {
+      if (!activeIds.has(taskId)) endTaskProgress(taskTypeToProgressKey[task.taskType], false, "Task ended while disconnected; inspect Logs");
+    }
+    _runningTasksMap.clear();
+    _activeDeployTaskId = null;
+    for (const task of tasks) {
+      _runningTasksMap.set(task.taskId, task);
+      const key = taskTypeToProgressKey[task.taskType];
+      if (key) {
+        beginTaskProgress(key, task.progressLabel || `${task.taskType} running...`);
+        updateTaskProgress(key, task.progressLabel || `${task.taskType} running...`, task.percent ?? 0);
+      }
+      if (task.taskType === "Deploy") {
+        _activeDeployTaskId = task.taskId;
+        const container = $("deployObjectProgress");
+        if (container) { container.innerHTML = ""; container.classList.remove("hidden"); }
+        for (const progress of task.objectProgress || []) es.dispatchEvent(new MessageEvent("deployProgress", { data: JSON.stringify(progress) }));
+      }
+    }
+    renderTaskbar();
+    renderParallelTasksPanel();
+    $("parallelTasksPanel")?.classList.toggle("hidden", tasks.length === 0);
+    if (tasks.length) startLogAutoRefresh();
+    else if (_logAutoRefreshTimer) { clearInterval(_logAutoRefreshTimer); _logAutoRefreshTimer = null; }
+    refreshLogs();
+  });
+
   es.addEventListener("taskStart", (e) => {
     const data = JSON.parse(e.data);
     _runningTasksMap.set(data.taskId, { ...data, percent: 0, progressLabel: "Starting…" });
+    if (data.taskType === "Deploy") {
+      _activeDeployTaskId = data.taskId;
+      const container = $("deployObjectProgress");
+      if (container) { container.innerHTML = ""; container.classList.remove("hidden"); }
+    }
     renderTaskbar();
     renderParallelTasksPanel();
     const panel = $("parallelTasksPanel");
@@ -3447,6 +4226,9 @@ function connectSSE() {
   es.addEventListener("taskEnd", (e) => {
     const data = JSON.parse(e.data);
     _runningTasksMap.delete(data.taskId);
+    if (_activeDeployTaskId === data.taskId) _activeDeployTaskId = null;
+    const progressKey = taskTypeToProgressKey[data.taskType];
+    if (progressKey) endTaskProgress(progressKey, data.status === "Success", data.taskType);
     renderTaskbar();
     renderParallelTasksPanel();
     if (_runningTasksMap.size === 0) {
@@ -3463,6 +4245,7 @@ function connectSSE() {
 
   es.addEventListener("deployProgress", (e) => {
     const data = JSON.parse(e.data);
+    if (data.taskId !== _activeDeployTaskId) return;
     const el = $("deployObjectProgress");
     if (!el || el.classList.contains("hidden")) return;
     const pct = data.total > 0 ? Math.round((data.done / data.total) * 100) : 0;
@@ -3473,7 +4256,7 @@ function connectSSE() {
       : `${data.objectType} ${data.objectName || ""}`;
 
     // Find or create row for this object
-    let row = el.querySelector(`[data-dp-key="${data.objectType}|${data.schemaName}|${data.objectName}"]`);
+    let row = el.querySelector(`[data-dp-key="${CSS.escape(`${data.objectType}|${data.schemaName}|${data.objectName}`)}"]`);
     if (!row) {
       row = document.createElement("div");
       row.className = "deploy-progress-row";
@@ -3483,14 +4266,12 @@ function connectSSE() {
     row.innerHTML = `<span class="dp-icon ${statusCls}">${statusIcon}</span><span class="dp-name">${escapeHtml(name)}</span>${data.error ? `<span class="dp-error muted">${escapeHtml(data.error.slice(0, 80))}</span>` : ""}`;
 
     // Update bar in deploy progress
-    const bar = $("deployProgressBar");
-    const txt = $("deployProgressText");
-    if (bar) bar.style.width = pct + "%";
-    if (txt) txt.textContent = `Deploying objects ${data.done}/${data.total} · ${name}`;
+    updateTaskProgress("deploy", `Deploying objects ${data.done}/${data.total} · ${name}`, pct);
   });
 
   es.addEventListener("taskProgress", (e) => {
     const data = JSON.parse(e.data);
+    if (!_runningTasksMap.has(data.taskId)) return;
     const key = data.key || taskTypeToProgressKey[data.taskType];
     if (key) updateTaskProgress(key, data.operation || `${data.taskType} running...`, data.percent);
     const task = data.taskId ? _runningTasksMap.get(data.taskId) : null;
@@ -3662,6 +4443,7 @@ async function refreshLogs(page = 1, pageSize = 20) {
 <td style="white-space:nowrap">
   <button class="btn-ghost" style="padding:0.2rem 0.5rem;font-size:0.76rem" data-log-view='${escapeHtml(l.taskId)}'>Detail</button>
   <button class="btn-ghost" style="padding:0.2rem 0.5rem;font-size:0.76rem" data-log-open='${escapeHtml(l.taskId)}'>Open With…</button>
+  ${["Interrupted", "Failed", "ReviewRequired"].includes(l.status) ? `<button class="btn-ghost" style="padding:0.2rem 0.5rem;font-size:0.76rem" data-log-verify='${escapeHtml(l.taskId)}' title="Read-only: compare the target's current state against the source">Verify Target</button>` : ""}
 </td>
 </tr>`;
   }).join("");
@@ -3720,6 +4502,40 @@ ${paginationHtml}`;
   });
 
   // Wire up pagination — use specific class to avoid conflict with profiles pagination
+  document.querySelectorAll("button[data-log-verify]").forEach((btn) => {
+    btn.onclick = async () => {
+      const restore = setButtonLoading(btn, "Checking…");
+      try {
+        const report = await api(`/api/tasks/${btn.dataset.logVerify}/reconcile`, {
+          method: "POST",
+          body: JSON.stringify({
+            sourceProfileId: $("deploySourceProfile")?.value || $("diffSourceProfile")?.value || "",
+            destinationProfileId: $("deployDestProfile")?.value || $("diffDestProfile")?.value || "",
+          }),
+        });
+        const pre = $("logDetail");
+        pre.classList.remove("hidden");
+        pre.textContent = [
+          `Target verification — task ${report.taskId} (${report.taskStatus})`,
+          `Checked at        : ${formatDateTime(report.checkedAt)}`,
+          `Matches source    : ${report.summary.MatchesSource}`,
+          `Differs from src  : ${report.summary.DiffersFromSource}`,
+          `Missing in target : ${report.summary.MissingInTarget}`,
+          `Not comparable    : ${report.summary.NotComparable}`,
+          "",
+          report.limitation,
+          "",
+          ...report.details.map((d) => `${d.state.padEnd(18)} ${d.objectType} ${d.schemaName}.${d.objectName}${d.note ? ` — ${d.note}` : ""}`),
+        ].join("\n");
+        pre.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      } catch (error) {
+        showToast(error.message, true);
+      } finally {
+        restore();
+      }
+    };
+  });
+
   document.querySelectorAll("button[data-logpage]").forEach((btn) => {
     btn.onclick = () => refreshLogs(Number(btn.dataset.logpage), pageSize);
   });
@@ -3739,6 +4555,9 @@ ${paginationHtml}`;
 
 function formatLogDetail(detail) {
   const levelFilter = $("logFilterLevel")?.value || "";
+  const selectedObjects = Array.isArray(detail.selectedObjects) ? detail.selectedObjects.filter(Boolean) : [];
+  const objectRows = selectedObjects.map((item) => [item.objectType || "", [item.schemaName, item.objectName].filter(Boolean).join(".")]
+    .map((value) => String(value).replace(/[\t\r\n]/g, " ")).join("\t"));
   const shouldShowLevel = (level) => {
     if (!levelFilter) return true;
     const normalizedLevel = String(level || "").toUpperCase();
@@ -3760,6 +4579,10 @@ function formatLogDetail(detail) {
     `Ordering  : ${detail.selectionReadiness?.ordering || "Ready"}`,
     `Filtering : ${detail.selectionReadiness?.filtering || "Ready"}`,
     `Log Level : ${detail.logLevel || "Normal"}`,
+    "",
+    "Selected Objects",
+    "Object Type\tSchema.Object",
+    ...(objectRows.length ? objectRows : ["(No objects recorded)"]),
     "",
     "── Events ──────────────────────────────────────",
   ];
@@ -3829,10 +4652,13 @@ function setupUpdater() {
       if (!info.hasUpdate) {
         setStatus(`You're up to date (v${info.current}).`, "ok");
       } else {
-        setStatus(`v${info.latest} is available${info.releaseName ? ` — ${info.releaseName}` : ""}.`, "available");
         pendingDownloadUrl = info.downloadUrl;
         if (info.downloadUrl) {
+          const assetName = info.installerAssetName ? ` (${info.installerAssetName})` : "";
+          setStatus(`v${info.latest} is available${info.releaseName ? ` — ${info.releaseName}` : ""}${assetName}.`, "available");
           installBtn.hidden = false;
+        } else {
+          setStatus(`v${info.latest} is available, but the GitHub release has no installable Setup .exe asset.`, "error");
         }
         if (info.releaseUrl) {
           releaseLink.href = info.releaseUrl;
@@ -3877,14 +4703,34 @@ function setupUpdater() {
 }
 
 function setupTheme() {
+  const systemScheme = window.matchMedia("(prefers-color-scheme: dark)");
+  $("checkSqlModule").onclick = async function () {
+    const restore = setButtonLoading(this, "Checking...");
+    try {
+      const status = await api("/api/prerequisites/sqlserver");
+      $("sqlModuleStatus").textContent = `SqlServer ${status.version}: ${status.filesPresent ? "module files present" : "missing"}\n${status.modulePath}${!status.filesPresent && status.repairInstallation ? "\nRepair the Pebloy installation." : ""}`;
+      $("installSqlModule").disabled = status.filesPresent || status.repairInstallation;
+    } catch (error) { showToast(error.message, true); }
+    finally { restore(); }
+  };
+  $("installSqlModule").onclick = async function () {
+    const restore = setButtonLoading(this, "Installing...");
+    try {
+      await api("/api/prerequisites/sqlserver/install", { method: "POST", body: "{}" });
+      await $("checkSqlModule").onclick();
+    } catch (error) { showToast(error.message, true); }
+    finally { restore(); }
+  };
   const themes = Array.isArray(globalThis.PebloyThemes) && globalThis.PebloyThemes.length
     ? globalThis.PebloyThemes
     : [];
   const themeMap = new Map(themes.map((t) => [t.id, t]));
-  const fallbackThemeId = themeMap.has("azure") ? "azure" : themes[0]?.id;
+  const fallbackThemeId = themeMap.has(DEFAULT_APPEARANCE_THEME) ? DEFAULT_APPEARANCE_THEME : themes[0]?.id;
   const validThemes = themes.map((t) => t.id);
-  const savedTheme = appState?.preferences?.theme || readAppPreference("theme", "azure");
-  const saved = validThemes.includes(savedTheme) ? savedTheme : fallbackThemeId;
+  const savedTheme = appState?.preferences?.theme || readAppPreference("theme", "system");
+  const legacyThemes = new Map([["light", "pebloy-light"], ["dark", "pebloy-dark"], ["azure", "pebloy-dark"], ["batman", "graphite"]]);
+  const resolvedTheme = legacyThemes.get(savedTheme) || savedTheme;
+  const saved = resolvedTheme === "system" || validThemes.includes(resolvedTheme) ? resolvedTheme : fallbackThemeId;
 
   const themeSelect = $("themeSelect");
 
@@ -3902,7 +4748,8 @@ function setupTheme() {
   const allThemeTokens = new Set(themes.flatMap((t) => Object.keys(t.tokens || {})));
 
   function applyTheme(themeId, persist = true) {
-    const theme = themeMap.get(themeId) || themeMap.get(fallbackThemeId);
+    const followsSystem = themeId === "system";
+    const theme = themeMap.get(followsSystem ? systemScheme.matches ? "pebloy-dark" : "pebloy-light" : themeId) || themeMap.get(fallbackThemeId);
     if (!theme) return;
 
     document.body.setAttribute("data-theme", theme.id);
@@ -3916,10 +4763,13 @@ function setupTheme() {
       }
     }
     if (themeSelect) themeSelect.value = theme.id;
+    $("followSystemTheme").checked = followsSystem;
 
-    if (persist) scheduleAppStateSave({ preferences: { theme: theme.id } }, { delay: 0 });
+    if (persist) scheduleAppStateSave({ preferences: { theme: followsSystem ? "system" : theme.id } }, { delay: 0 });
   }
 
+  $("followSystemTheme").onchange = () => applyTheme($("followSystemTheme").checked ? "system" : themeSelect.value);
+  systemScheme.addEventListener("change", () => { if ($("followSystemTheme").checked) applyTheme("system", false); });
   applyTheme(saved, false);
 }
 
@@ -3944,30 +4794,90 @@ const DEFAULT_FOLDER_NAMES = {
   USER_DEFINED_TYPE: "User Defined Types",
 };
 
-const DEFAULT_DEPLOYMENT_ORDER = [
-  "USER_DEFINED_TYPE", "SEQUENCE", "TABLE", "VIEW", "FUNCTION", "PROCEDURE", "SYNONYM", "TRIGGER",
-];
+const modalInertLocks = new WeakMap();
+let activeModalCount = 0;
+let modalDialogSequence = 0;
+let modalFocusOrigin = null;
 
-function showConfirmModal({ title, message, buttons }) {
+function trapModalFocus(overlay) {
+  if (activeModalCount === 0) modalFocusOrigin = document.activeElement;
+  activeModalCount += 1;
+  const siblings = [...document.body.children].filter((element) => element !== overlay);
+  siblings.forEach((element) => {
+    const lock = modalInertLocks.get(element);
+    if (lock) lock.count += 1;
+    else modalInertLocks.set(element, { count: 1, originalInert: element.inert });
+    element.inert = true;
+  });
+  const handleKey = (event) => {
+    if (event.key !== "Tab") return;
+    const controls = [...overlay.querySelectorAll('button, input, select, textarea, a[href], [tabindex="0"]')]
+      .filter((element) => !element.disabled && element.getClientRects().length);
+    const first = controls[0];
+    const last = controls.at(-1);
+    if (!first) { event.preventDefault(); return; }
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  };
+  overlay.addEventListener("keydown", handleKey);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    overlay.removeEventListener("keydown", handleKey);
+    siblings.forEach((element) => {
+      const lock = modalInertLocks.get(element);
+      if (!lock) return;
+      lock.count -= 1;
+      if (lock.count > 0) return;
+      element.inert = lock.originalInert;
+      modalInertLocks.delete(element);
+    });
+    activeModalCount = Math.max(0, activeModalCount - 1);
+    if (activeModalCount > 0) {
+      const activeOverlay = [...document.querySelectorAll(".confirm-modal-overlay")].at(-1);
+      const focusTarget = [...(activeOverlay?.querySelectorAll('button, input, select, textarea, a[href], [tabindex="0"]') || [])]
+        .find((element) => !element.disabled && element.getClientRects().length);
+      focusTarget?.focus();
+      return;
+    }
+    const focusOrigin = modalFocusOrigin;
+    modalFocusOrigin = null;
+    if (focusOrigin?.isConnected && !focusOrigin.inert) focusOrigin.focus();
+  };
+}
+
+function showConfirmModal({ title, message, buttons, plan = null, defaultButton = 0 }) {
   return new Promise((resolve) => {
+    const dialogId = ++modalDialogSequence;
     const overlay = document.createElement("div");
     overlay.className = "confirm-modal-overlay";
     overlay.innerHTML = `
-      <div class="confirm-modal" role="dialog" aria-modal="true">
-        <h4>${escapeHtml(title)}</h4>
-        <p>${escapeHtml(message)}</p>
+      <div class="confirm-modal${plan ? " deployment-plan-modal" : ""}" role="dialog" aria-modal="true" aria-labelledby="confirmModalTitle-${dialogId}" aria-describedby="confirmModalMessage-${dialogId}">
+        <h4 id="confirmModalTitle-${dialogId}">${escapeHtml(title)}</h4>
+        <p id="confirmModalMessage-${dialogId}">${escapeHtml(message)}</p>
+        ${plan ? renderDeploymentPlanTable(plan) : ""}
         <div class="confirm-modal-actions">
           ${buttons.map((b, i) => `<button type="button" class="confirm-modal-btn${i === 0 ? " btn-primary" : i === buttons.length - 1 ? " btn-ghost" : ""}" data-idx="${i}">${escapeHtml(b)}</button>`).join("")}
         </div>
       </div>`;
     document.body.appendChild(overlay);
+    const releaseFocus = trapModalFocus(overlay);
+    let closed = false;
+    const close = (value) => {
+      if (closed) return;
+      closed = true;
+      overlay.remove();
+      releaseFocus();
+      resolve(value);
+    };
     overlay.querySelectorAll(".confirm-modal-btn").forEach((btn) => {
-      btn.onclick = () => { overlay.remove(); resolve(buttons[Number(btn.dataset.idx)]); };
+      btn.onclick = () => close(buttons[Number(btn.dataset.idx)]);
     });
     overlay.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { overlay.remove(); resolve(null); }
+      if (e.key === "Escape") close(null);
     });
-    overlay.querySelector(".confirm-modal-btn").focus();
+    overlay.querySelectorAll(".confirm-modal-btn")[defaultButton].focus();
   });
 }
 
@@ -3976,25 +4886,9 @@ function setupCustomize() {
 
   function normalizeCustomizeSettings(settings) {
     const safeFolderNames = { ...DEFAULT_FOLDER_NAMES, ...((settings && settings.folderNames) || {}) };
-    const validTypes = new Set([...Object.keys(DEFAULT_FOLDER_NAMES), ...DEFAULT_DEPLOYMENT_ORDER]);
-    const chosenOrder = Array.isArray(settings?.deploymentOrder) ? settings.deploymentOrder : [];
-    const seen = new Set();
-    const safeOrder = [];
-
-    chosenOrder.forEach((type) => {
-      const objectType = String(type || "").trim().toUpperCase();
-      if (!validTypes.has(objectType) || seen.has(objectType)) return;
-      seen.add(objectType);
-      safeOrder.push(objectType);
-    });
-
-    DEFAULT_DEPLOYMENT_ORDER.forEach((type) => {
-      if (!seen.has(type)) safeOrder.push(type);
-    });
 
     return {
       folderNames: safeFolderNames,
-      deploymentOrder: safeOrder,
       dacfx: {
         validationEnabled: Boolean(settings?.dacfx?.validationEnabled),
       },
@@ -4004,6 +4898,14 @@ function setupCustomize() {
       },
       formatting: {
         formatGeneratedSql: Boolean(settings?.formatting?.formatGeneratedSql),
+      },
+      execution: {
+        queryTimeoutSeconds: Number(settings?.execution?.queryTimeoutSeconds) || 120,
+        powershellTimeoutSeconds: Number(settings?.execution?.powershellTimeoutSeconds) || 180,
+        maxActiveTaskLogs: Number(settings?.execution?.maxActiveTaskLogs) || 200,
+      },
+      features: {
+        schedules: settings?.features?.schedules === true,
       },
     };
   }
@@ -4044,25 +4946,26 @@ function setupCustomize() {
 
   async function loadSettings() {
     renderFolderNames(DEFAULT_FOLDER_NAMES);
-    renderDeployOrder(DEFAULT_DEPLOYMENT_ORDER);
     try {
       currentSettings = normalizeCustomizeSettings(await api("/api/settings"));
       renderFolderNames(currentSettings.folderNames);
-      renderDeployOrder(currentSettings.deploymentOrder);
       if ($("dacfxValidationEnabled")) {
         $("dacfxValidationEnabled").checked = Boolean(currentSettings.dacfx?.validationEnabled);
       }
       applyTimeSettings(currentSettings.time);
       applyFormattingSettings(currentSettings.formatting);
+      applyExecutionSettings(currentSettings.execution);
+      applyFeatureSettings(currentSettings.features);
     } catch (error) {
       currentSettings = normalizeCustomizeSettings();
       renderFolderNames(currentSettings.folderNames);
-      renderDeployOrder(currentSettings.deploymentOrder);
       if ($("dacfxValidationEnabled")) {
         $("dacfxValidationEnabled").checked = Boolean(currentSettings.dacfx?.validationEnabled);
       }
       applyTimeSettings(currentSettings.time);
       applyFormattingSettings(currentSettings.formatting);
+      applyExecutionSettings(currentSettings.execution);
+      applyFeatureSettings(currentSettings.features);
       showToast("Failed to load settings: " + error.message, true);
     }
   }
@@ -4079,43 +4982,6 @@ function setupCustomize() {
 </tr>`;
       })
       .join("");
-  }
-
-  function renderDeployOrder(order) {
-    const list = $("deployOrderList");
-    if (!list) return;
-    const safeOrder = Array.isArray(order) && order.length ? order : [...DEFAULT_DEPLOYMENT_ORDER];
-    list.innerHTML = safeOrder
-      .map((type, idx) => `<li class="deploy-order-item" data-type="${type}">
-<span class="deploy-order-label">${OBJECT_TYPE_LABELS[type] || type}</span>
-<div class="deploy-order-actions">
-  <button type="button" class="btn-icon" data-move-up="${idx}" title="Move up" ${idx === 0 ? "disabled" : ""}>↑</button>
-  <button type="button" class="btn-icon" data-move-down="${idx}" title="Move down" ${idx === safeOrder.length - 1 ? "disabled" : ""}>↓</button>
-</div>
-</li>`)
-      .join("");
-
-    list.querySelectorAll("[data-move-up]").forEach((btn) => {
-      btn.onclick = () => {
-        const i = Number(btn.dataset.moveUp);
-        if (i === 0) return;
-        const newOrder = [...((currentSettings && currentSettings.deploymentOrder) || DEFAULT_DEPLOYMENT_ORDER)];
-        [newOrder[i - 1], newOrder[i]] = [newOrder[i], newOrder[i - 1]];
-        currentSettings.deploymentOrder = newOrder;
-        renderDeployOrder(newOrder);
-      };
-    });
-
-    list.querySelectorAll("[data-move-down]").forEach((btn) => {
-      btn.onclick = () => {
-        const i = Number(btn.dataset.moveDown);
-        const newOrder = [...((currentSettings && currentSettings.deploymentOrder) || DEFAULT_DEPLOYMENT_ORDER)];
-        if (i >= newOrder.length - 1) return;
-        [newOrder[i], newOrder[i + 1]] = [newOrder[i + 1], newOrder[i]];
-        currentSettings.deploymentOrder = newOrder;
-        renderDeployOrder(newOrder);
-      };
-    });
   }
 
   function collectFolderNames() {
@@ -4149,7 +5015,6 @@ function setupCustomize() {
       persistCurrentAppState({ delay: 0, silent: false });
 
       const folderNames = collectFolderNames();
-      const deploymentOrder = currentSettings?.deploymentOrder || DEFAULT_DEPLOYMENT_ORDER;
       const dacfx = {
         validationEnabled: Boolean($("dacfxValidationEnabled")?.checked),
       };
@@ -4160,16 +5025,24 @@ function setupCustomize() {
       const formatting = {
         formatGeneratedSql: Boolean($("formatGeneratedSqlToggle")?.checked),
       };
+      const execution = {
+        queryTimeoutSeconds: Number($("queryTimeoutSeconds")?.value) || undefined,
+        powershellTimeoutSeconds: Number($("powershellTimeoutSeconds")?.value) || undefined,
+        maxActiveTaskLogs: Number($("maxActiveTaskLogs")?.value) || undefined,
+      };
       const saved = await api("/api/settings", {
         method: "PUT",
-        body: JSON.stringify({ folderNames, deploymentOrder, dacfx, time, formatting }),
+        body: JSON.stringify({ folderNames, dacfx, time, formatting, execution, features: { schedules: $("schedulesFeatureToggle").checked } }),
       });
       currentSettings = normalizeCustomizeSettings(saved);
       applyTimeSettings(currentSettings.time);
       applyFormattingSettings(currentSettings.formatting);
+      applyExecutionSettings(currentSettings.execution);
+      applyFeatureSettings(currentSettings.features);
 
       showToast("All settings saved");
     } catch (error) {
+      $("schedulesFeatureToggle").checked = currentSettings?.features?.schedules === true;
       showToast("Failed to save: " + error.message, true);
     } finally {
       restore();
@@ -4203,10 +5076,25 @@ function setupCustomize() {
       showToast("Resetting script settings...", false);
       await api("/api/settings", {
         method: "PUT",
-        body: JSON.stringify({ folderNames: DEFAULT_FOLDER_NAMES, deploymentOrder: DEFAULT_DEPLOYMENT_ORDER, dacfx: { validationEnabled: false } }),
+        body: JSON.stringify({ folderNames: DEFAULT_FOLDER_NAMES, dacfx: { validationEnabled: false } }),
       });
       await loadSettings();
       applyTabVisibility([]);
+      const themeSelect = $("themeSelect");
+      if (themeSelect) {
+        themeSelect.value = DEFAULT_APPEARANCE_THEME;
+        themeSelect.dispatchEvent(new Event("change"));
+      }
+      const fontSelect = $("fontSelector");
+      if (fontSelect) {
+        fontSelect.value = DEFAULT_APPEARANCE_FONT_FAMILY;
+        fontSelect.dispatchEvent(new Event("change"));
+      }
+      const fontSizeRange = $("fontSizeRange");
+      if (fontSizeRange) {
+        fontSizeRange.value = DEFAULT_APPEARANCE_FONT_SIZE;
+        fontSizeRange.dispatchEvent(new Event("input"));
+      }
       persistCurrentAppState();
       showToast("Settings reset to defaults");
     } catch (error) {
@@ -4270,11 +5158,10 @@ function setupCustomize() {
     };
   }
 
-  // Enter-to-Save: pressing Enter anywhere in the Settings panel triggers Save All
   $("tab-customize").addEventListener("keydown", (e) => {
-    if (e.key !== "Enter") return;
+    if (e.key !== "Enter" || e.isComposing || e.defaultPrevented) return;
     if (e.target.classList?.contains("shortcut-input") && !e.target.readOnly) return;
-    if (e.target.tagName === "TEXTAREA" || e.target.tagName === "BUTTON") return;
+    if (e.target.tagName !== "INPUT" || !["text", "number", "search", "url", "email"].includes(e.target.type)) return;
     e.preventDefault();
     $("saveAllSettings").click();
   });
@@ -4513,12 +5400,12 @@ function setupFontSelector() {
     if (persist) scheduleAppStateSave({ preferences: { fontSize: size } }, { delay: 0 });
   }
 
-  const savedFont = appState?.preferences?.fontFamily || readAppPreference("font", "Segoe UI");
+  const savedFont = appState?.preferences?.fontFamily || readAppPreference("font", DEFAULT_APPEARANCE_FONT_FAMILY);
   if (savedFont) applyFont(savedFont, false);
 
-  const savedSize = appState?.preferences?.fontSize || Number(readAppPreference("fontSize", 14));
+  const savedSize = appState?.preferences?.fontSize || Number(readAppPreference("fontSize", DEFAULT_APPEARANCE_FONT_SIZE));
   if (savedSize) applyFontSize(Number(savedSize), false);
-  else if (sizeLabel) sizeLabel.textContent = sizeEl ? sizeEl.value + "px" : "14px";
+  else if (sizeLabel) sizeLabel.textContent = sizeEl ? sizeEl.value + "px" : `${DEFAULT_APPEARANCE_FONT_SIZE}px`;
 
   if (fontEl) fontEl.onchange = () => applyFont(fontEl.value);
   if (sizeEl) sizeEl.oninput = () => applyFontSize(Number(sizeEl.value));
@@ -4664,6 +5551,36 @@ async function start() {
   bindAppStatePersistence();
 
   $("refreshLogs").onclick = () => refreshLogs(1);
+  let archiveCleanupPreview = null;
+  $("archiveRetentionDays").addEventListener("input", () => {
+    archiveCleanupPreview = null;
+    $("deleteArchiveFiles").disabled = true;
+  });
+  $("previewArchiveCleanup").onclick = async function () {
+    const restore = setButtonLoading(this, "Checking...");
+    archiveCleanupPreview = null;
+    $("deleteArchiveFiles").disabled = true;
+    try {
+      archiveCleanupPreview = await api("/api/logs/archive/preview", { method: "POST", body: JSON.stringify({ olderThanDays: Number($("archiveRetentionDays").value) }) });
+      $("logDetail").classList.remove("hidden");
+      $("logDetail").textContent = [`Archive cleanup: ${archiveCleanupPreview.files.length} files (${archiveCleanupPreview.totalBytes} bytes)`, `Completed before: ${formatDateTime(archiveCleanupPreview.cutoff)}`, "", ...archiveCleanupPreview.files.map((file) => `${file.name}\t${file.bytes} bytes`)].join("\n");
+      $("deleteArchiveFiles").disabled = !archiveCleanupPreview.files.length;
+    } catch (error) { showToast(error.message, true); }
+    finally { restore(); }
+  };
+  $("deleteArchiveFiles").onclick = async function () {
+    const preview = archiveCleanupPreview;
+    if (!preview) return;
+    const answer = await showConfirmModal({ title: "Delete archived logs?", message: `Permanently delete the ${preview.files.length} files shown in the preview (${preview.totalBytes} bytes)?`, buttons: ["Delete Files", "Cancel"], defaultButton: 1 });
+    if (answer !== "Delete Files") return;
+    const restore = setButtonLoading(this, "Deleting...");
+    try {
+      const result = await api("/api/logs/archive/cleanup", { method: "POST", body: JSON.stringify({ token: preview.token, confirmed: true }) });
+      $("logDetail").textContent = `Deleted ${result.deleted} archived files.`;
+      showToast(`Deleted ${result.deleted} archived files`);
+    } catch (error) { showToast(error.message, true); }
+    finally { restore(); archiveCleanupPreview = null; $("deleteArchiveFiles").disabled = true; }
+  };
   $("clearLogDetail").onclick = () => {
     const pre = $("logDetail");
     pre.classList.add("hidden");

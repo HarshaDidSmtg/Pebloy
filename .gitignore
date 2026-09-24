@@ -20,6 +20,8 @@ data/profiles.json
 data/secrets.json
 data/server-info.json
 data/settings.json
+data/*.last-good
+data/*.corrupt
 
 # Artifacts generated at runtime
 artifacts/
@@ -65,6 +67,8 @@ desktop.ini
 
 # Test results and fixtures
 coverage/
+test-results/
+playwright-report/
 junit.xml
 test-output/
 

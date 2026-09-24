@@ -1,14 +1,14 @@
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const { randomUUID } = require("crypto");
-const { execFile } = require("child_process");
 
 const {
   testConnection,
   discoverObjects,
   resolveObjectTypes,
   fetchObjectDefinitionMap,
+  executeSqlScript,
+  executeSqlScriptsIndividually,
 } = require("./sqlService");
 const { runBackup } = require("./backupService");
 const { compareObjects } = require("./diffService");
@@ -17,8 +17,8 @@ const { runDeployment } = require("./deploymentService");
 jest.setTimeout(240000);
 
 const profilesPath = path.resolve(__dirname, "../../data/profiles.json");
-const devFixturePath = path.resolve(__dirname, "../../test-output/setup-dev.sql");
-const sliceFixturePath = path.resolve(__dirname, "../../test-output/setup-slice.sql");
+const devFixturePath = path.resolve(__dirname, "../../tests/fixtures/setup-dev.sql");
+const sliceFixturePath = path.resolve(__dirname, "../../tests/fixtures/setup-slice.sql");
 const integrationOutputRoot = path.resolve(__dirname, "../../artifacts/exports/integration-tests");
 
 function loadProfileByEnvironmentTag(environmentTag) {
@@ -30,106 +30,9 @@ function loadProfileByEnvironmentTag(environmentTag) {
   return profile;
 }
 
-function splitSqlBatches(sqlText) {
-  return String(sqlText || "")
-    .split(/^\s*GO\s*$/gim)
-    .map((batch) => batch.trim())
-    .filter(Boolean);
-}
-
-async function executeSqlBatches(profile, sqlText) {
-  const batches = splitSqlBatches(sqlText);
-  const tempScriptPath = path.join(os.tmpdir(), `pebloy_fixture_${randomUUID()}.ps1`);
-  const payload = Buffer.from(
-    JSON.stringify({
-      profile,
-      batches,
-    }),
-    "utf8"
-  ).toString("base64");
-
-  const psScript = `
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-Add-Type -AssemblyName System.Data
-$payload = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${payload}')) | ConvertFrom-Json
-$profile = $payload.profile
-$batches = @($payload.batches)
-$connection = $null
-
-try {
-  $builder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
-  $builder['Data Source'] = "tcp:$($profile.serverName)"
-  $builder['Initial Catalog'] = $profile.databaseName
-  $builder['TrustServerCertificate'] = $true
-  $builder['Encrypt'] = $false
-  $builder['Connect Timeout'] = 10
-  $builder['Application Name'] = 'PebloyIntegrationTests'
-
-  if ([string]::Equals([string]$profile.authenticationType, 'Windows', [System.StringComparison]::OrdinalIgnoreCase)) {
-    $builder['Integrated Security'] = $true
-  } else {
-    $builder['Integrated Security'] = $false
-    $builder['User ID'] = $profile.username
-    $builder['Password'] = $profile.password
-  }
-
-  $connection = New-Object System.Data.SqlClient.SqlConnection($builder.ConnectionString)
-  $connection.Open()
-
-  foreach ($batch in $batches) {
-    $text = [string]$batch
-    if ([string]::IsNullOrWhiteSpace($text)) {
-      continue
-    }
-
-    $command = $connection.CreateCommand()
-    $command.CommandText = $text
-    $command.CommandTimeout = 120
-    [void]$command.ExecuteNonQuery()
-    $command.Dispose()
-  }
-} finally {
-  if ($null -ne $connection) {
-    $connection.Close()
-    $connection.Dispose()
-  }
-}
-`;
-
-  fs.writeFileSync(tempScriptPath, psScript, "utf8");
-
-  try {
-    await new Promise((resolve, reject) => {
-      execFile(
-        "pwsh",
-        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tempScriptPath],
-        {
-          encoding: "utf8",
-          timeout: 300000,
-          maxBuffer: 1024 * 1024 * 10,
-        },
-        (error, stdout, stderr) => {
-          if (error) {
-            reject(new Error(String(stderr || stdout || error.message).trim() || "Fixture execution failed."));
-            return;
-          }
-          resolve();
-        }
-      );
-    });
-  } finally {
-    try {
-      fs.unlinkSync(tempScriptPath);
-    } catch (_error) {
-      // Ignore temp file cleanup failures in tests.
-    }
-  }
-}
-
 async function applyFixture(profile, fixturePath) {
   const scriptText = fs.readFileSync(fixturePath, "utf8");
-  await executeSqlBatches(profile, scriptText);
+  await executeSqlScript(profile, scriptText, { atomic: true });
 }
 
 function artifactPath(name) {
@@ -147,7 +50,53 @@ function hasProfile(tag) {
   } catch { return false; }
 }
 
-const describeIntegration = (hasProfile("DEV") && hasProfile("INT")) ? describe : describe.skip;
+function isIntegrationEnabled(environment, profileExists) {
+  return environment.PEBLOY_RUN_SQL_INTEGRATION === "1" && profileExists("DEV") && profileExists("INT");
+}
+
+function assertDisposableDatabasePair(identities) {
+  if (identities.length !== 2 || identities.some((identity) =>
+    !identity || typeof identity.serverName !== "string" || !identity.serverName.trim() ||
+    typeof identity.databaseName !== "string" || !/_PebloyTest$/i.test(identity.databaseName))) {
+    throw new Error("Live tests require two resolved disposable databases named with the _PebloyTest suffix.");
+  }
+  const keys = identities.map((identity) => JSON.stringify([identity.serverName.toLowerCase(), identity.databaseName.toLowerCase()]));
+  if (keys[0] === keys[1]) throw new Error("Live tests require two distinct databases.");
+}
+
+describe("Live SQL integration safety", () => {
+  test("requires disposable, distinct, resolved database identities", () => {
+    const source = { serverName: "host", databaseName: "Source_PebloyTest" };
+    const target = { serverName: "host", databaseName: "Target_PebloyTest" };
+    expect(() => assertDisposableDatabasePair([source, target])).not.toThrow();
+    expect(() => assertDisposableDatabasePair([source, { databaseName: "SOURCE_PEBLOYTEST", serverName: "HOST", extra: "ignored" }])).toThrow("distinct");
+    for (const invalid of [null, {}, { databaseName: "Target_PebloyTest" }, { ...target, databaseName: "SharedDevelopment" }]) {
+      expect(() => assertDisposableDatabasePair([source, invalid])).toThrow("disposable");
+    }
+  });
+  test("tracked fixtures begin with a disposable-database guard", () => {
+    for (const fixturePath of [devFixturePath, sliceFixturePath]) {
+      const script = fs.readFileSync(fixturePath, "utf8");
+      expect(script.replace(/\r\n/g, "\n").startsWith("IF DB_NAME() NOT LIKE N'%[_]PebloyTest'\n    THROW")).toBe(true);
+    }
+  });
+  test.each([
+    [undefined, ["DEV", "INT"], false],
+    ["0", ["DEV", "INT"], false],
+    ["true", ["DEV", "INT"], false],
+    ["1", ["DEV"], false],
+    ["1", ["DEV", "INT"], true],
+  ])("opt-in %s with profiles %j enables live tests: %s", (flag, profiles, expected) => {
+    const profileExists = jest.fn((tag) => profiles.includes(tag));
+
+    expect(isIntegrationEnabled({ PEBLOY_RUN_SQL_INTEGRATION: flag }, profileExists)).toBe(expected);
+    if (flag !== "1") {
+      expect(profileExists).not.toHaveBeenCalled();
+    }
+  });
+});
+
+const describeIntegration = isIntegrationEnabled(process.env, hasProfile) ? describe : describe.skip;
 
 describeIntegration("Integration: seeded database workflows", () => {
   let devProfile;
@@ -156,6 +105,16 @@ describeIntegration("Integration: seeded database workflows", () => {
   beforeAll(async () => {
     devProfile = loadProfileByEnvironmentTag("DEV");
     sliceProfile = loadProfileByEnvironmentTag("INT");
+
+    assertDisposableDatabasePair([devProfile, sliceProfile]);
+    const { getProfileWithSecret } = require("./profileService");
+    devProfile = getProfileWithSecret(devProfile.id);
+    sliceProfile = getProfileWithSecret(sliceProfile.id);
+    const identities = await Promise.all([testConnection(devProfile), testConnection(sliceProfile)]);
+    assertDisposableDatabasePair(identities);
+    for (const [index, profile] of [devProfile, sliceProfile].entries()) {
+      if (identities[index].databaseName.toLowerCase() !== profile.databaseName.toLowerCase()) throw new Error("Resolved database differs from the configured disposable test database.");
+    }
 
     await applyFixture(devProfile, devFixturePath);
     await applyFixture(sliceProfile, sliceFixturePath);
@@ -298,6 +257,37 @@ describeIntegration("Integration: seeded database workflows", () => {
     expect(getDefinition(afterMap, "TABLE", "bdeploy_test", "tbl_modified")).toBe(
       getDefinition(beforeMap, "TABLE", "bdeploy_test", "tbl_modified")
     );
+    await executeSqlScript(sliceProfile, "IF (SELECT COUNT(*) FROM bdeploy_test.tbl_modified WHERE id = 1) <> 1 THROW 51000, 'Rollback changed fixture data.', 1;");
+  });
+
+  test("atomic execution rolls back earlier batches when a later batch fails", async () => {
+    await expect(executeSqlScript(sliceProfile,
+      "ALTER TABLE bdeploy_test.tbl_modified ADD AtomicProbe INT NULL;\nGO\nUPDATE bdeploy_test.tbl_modified SET id = 2; THROW 51000, 'Expected atomic fixture failure.', 1;",
+      { atomic: true }
+    )).rejects.toThrow("Expected atomic fixture failure");
+    await executeSqlScript(sliceProfile, "IF COL_LENGTH(N'bdeploy_test.tbl_modified', N'AtomicProbe') IS NOT NULL THROW 51000, 'DDL survived failed transaction.', 1; IF (SELECT COUNT(*) FROM bdeploy_test.tbl_modified WHERE id = 1) <> 1 THROW 51000, 'Data survived failed transaction.', 1;");
+  });
+
+  test("independent execution rolls back a failed object before continuing", async () => {
+    const results = await executeSqlScriptsIndividually(sliceProfile, [
+      { key: "failed", sqlText: "UPDATE bdeploy_test.tbl_modified SET id = 2; THROW 51000, 'Expected object failure.', 1;" },
+      { key: "verify", sqlText: "IF (SELECT COUNT(*) FROM bdeploy_test.tbl_modified WHERE id = 1) <> 1 THROW 51000, 'Failed object changes were not rolled back.', 1;" },
+    ], { continueOnError: true });
+    expect(results).toEqual([expect.objectContaining({ key: "failed", ok: false }), expect.objectContaining({ key: "verify", ok: true })]);
+  });
+
+  test("format-and-execute applies source modules without modifying table data", async () => {
+    try {
+      const result = await runDeployment({ sourceProfile: devProfile, destinationProfile: devProfile,
+        selectedObjects: [{ objectType: "PROCEDURE", schemaName: "bdeploy_test", objectName: "usp_modified" }, { objectType: "TABLE", schemaName: "bdeploy_test", objectName: "tbl_modified" }],
+        mode: "FormatAndExecuteSource", continueOnError: false,
+        options: { confirmedSourceDatabase: devProfile.databaseName, scriptOutputPath: artifactPath("format-execute") },
+        task: { taskId: `integration-format-execute-${randomUUID()}` }, logEvent: () => {},
+      });
+      expect(result.results.find((item) => item.objectType === "PROCEDURE").status).toBe("Success");
+      expect(result.results.find((item) => item.objectType === "TABLE")).toMatchObject({ status: "Skipped", action: "NoStoredModuleText" });
+      await executeSqlScript(devProfile, "IF (SELECT COUNT(*) FROM bdeploy_test.tbl_modified WHERE id = 1 AND description = N'preserve this row') <> 1 THROW 51000, 'Format execution changed table data.', 1;");
+    } finally { await applyFixture(devProfile, devFixturePath); }
   });
 
   test("deploy mode executes combined stored procedure script against target", async () => {

@@ -23,7 +23,9 @@ const {
   buildRunRoot,
   createObjectListFile,
   generateObjectScripts,
+  generateTableDelta,
   normalizeExecutableSql,
+  normalizeDdlKeywords,
 } = require("./scriptAutomationService");
 
 describe("buildProfileOutputBasePath", () => {
@@ -36,6 +38,47 @@ describe("buildProfileOutputBasePath", () => {
   it("leaves the base path unchanged when alias is blank", () => {
     const basePath = path.join(os.tmpdir(), "easydeploy-exports");
     expect(buildProfileOutputBasePath(basePath, "   ")).toBe(basePath);
+  });
+});
+
+describe("table delta preflight", () => {
+  let directory;
+  let objectListPath;
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), "pebloy-delta-"));
+    objectListPath = null;
+    execFile.mockReset();
+  });
+  afterEach(() => {
+    fs.rmSync(directory, { recursive: true, force: true });
+    if (objectListPath) {
+      fs.rmSync(objectListPath, { force: true });
+      fs.rmSync(objectListPath.replace(/\.txt$/, ".json"), { force: true });
+    }
+  });
+
+  it("preserves metadata casing and detects case-only definitions in the real PowerShell generator", () => {
+    const output = jest.requireActual("child_process").execFileSync("pwsh", [
+      "-NoProfile", "-NonInteractive", "-File", path.resolve(__dirname, "../../tests/powershell/table-delta.tests.ps1"),
+    ], { encoding: "utf8", timeout: 20000, windowsHide: true });
+    expect(output).toContain("Table delta casing and case-only definition checks passed without SQL access.");
+  }, 25000);
+
+  it.each([
+    ["-- Manual review required: identity differs", "", "manual review"],
+    ["-- Source table listed but not found: dbo.Missing", "", "manual review"],
+    ["", "WARNING: Table not found in source database: dbo.Missing", "could not resolve"],
+    [null, "", "did not produce an output file"],
+  ])("rejects unresolved or missing delta output", async (sql, stdout, message) => {
+    execFile.mockImplementation((_command, args, _options, callback) => {
+      objectListPath = args[args.indexOf("-ObjectListPath") + 1];
+      if (sql !== null) fs.writeFileSync(args[args.indexOf("-OutputPath") + 1], sql);
+      callback(null, stdout, "");
+    });
+    await expect(generateTableDelta({ taskId: `delta-test-${Date.now()}`, sourceProfile: { serverName: "source", databaseName: "db", authenticationType: "Windows" },
+      destinationProfile: { serverName: "target", databaseName: "db", authenticationType: "Windows" },
+      selectedObjects: [{ objectType: "TABLE", schemaName: "dbo", objectName: "Fixture" }], outputDir: directory,
+    })).rejects.toThrow(message);
   });
 });
 
@@ -120,7 +163,7 @@ describe("generateObjectScripts — run-scoped artifact resolution", () => {
     const result = await generateObjectScripts({ taskId: "t-stdout", profile, selectedObjects, outputBasePath: base });
     expect(result.latestBuildPathFile).toBe(newBuild);
     expect(result.combinedStoredProceduresPath).toBe(newSp);
-    expect(execFile.mock.calls[0][2]).not.toHaveProperty("timeout");
+    expect(execFile.mock.calls[0][2].timeout).toBe(600000);
     cleanupObjectList(result);
   });
 
@@ -138,6 +181,25 @@ describe("generateObjectScripts — run-scoped artifact resolution", () => {
     cleanupObjectList(result);
   });
 
+  it("sends SQL passwords through stdin and never argv", async () => {
+    const end = jest.fn();
+    const password = "test-only-quote'\u00f3;";
+    const newBuild = path.join(runRoot, "BuildPaths_20260710_090000.txt");
+    execFile.mockImplementation((_command, args, options, callback) => {
+      expect(args).not.toContain("-Password");
+      expect(args.join(" ")).not.toContain(password);
+      expect(options.env.PEBLOY_CREDENTIAL_STDIN).toBe("1");
+      process.nextTick(() => {
+        fs.writeFileSync(newBuild, '<Build Include="dbo\\Views\\V.sql" />');
+        callback(null, `BuildPaths file: ${newBuild}`, "");
+      });
+      return { stdin: { on: jest.fn(), end } };
+    });
+    const result = await generateObjectScripts({ taskId: "secret-test", profile: { ...profile, authenticationType: "Sql", username: "test", password }, selectedObjects, outputBasePath: base });
+    expect(JSON.parse(Buffer.from(end.mock.calls[0][0], "base64").toString("utf8"))).toEqual({ Password: password });
+    cleanupObjectList(result);
+  });
+
   it("refuses to reuse an older run's manifest when the run produced none", async () => {
     execFile.mockImplementation((cmd, args, opts, cb) => {
       cb(null, "Completed DB: TestDb\r\n", "");
@@ -150,6 +212,45 @@ describe("generateObjectScripts — run-scoped artifact resolution", () => {
 });
 
 describe("normalizeExecutableSql — CREATE OR ALTER conversion", () => {
+  it.each(["VIEW", "FUNCTION", "TRIGGER"])("recreates ALTER %s definitions after dropping without altering comments", (objectType) => {
+    const prefix = `/* ALTER ${objectType} dbo.example */\n`;
+    const result = normalizeExecutableSql(`${prefix}ALTER ${objectType} dbo.actual AS SELECT 1`, objectType,
+      { schemaName: "dbo", objectName: "actual" }, { strategy: "dropCreate" });
+    expect(result).toContain(`${prefix}CREATE ${objectType} dbo.actual`);
+    expect(result).toContain(`DROP ${objectType}`);
+  });
+
+  it("refuses signed procedure replacement before its CREATE OR ALTER batch", () => {
+    const result = normalizeExecutableSql("CREATE PROCEDURE dbo.SignedProc AS SELECT 1", "PROCEDURE", { schemaName: "dbo", objectName: "SignedProc" });
+    expect(result).toContain("sys.crypt_properties");
+    expect(result).toContain("Signed module requires a reviewed re-signing migration");
+    expect(result.indexOf("sys.crypt_properties")).toBeLessThan(result.indexOf("CREATE OR ALTER"));
+  });
+
+  it.each(["VIEW", "FUNCTION", "SYNONYM", "SEQUENCE", "USER_DEFINED_TYPE"])("guards target metadata before dropping %s", (objectType) => {
+    const sql = normalizeExecutableSql("CREATE placeholder", objectType, { schemaName: "dbo", objectName: "Target" }, { strategy: "dropCreate" });
+    expect(sql).toContain("HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION')");
+    expect(sql).toContain("sys.database_permissions");
+    expect(sql).toContain("principal_id IS NOT NULL");
+    expect(sql.indexOf("THROW 51000")).toBeLessThan(sql.indexOf("DROP " + (objectType === "USER_DEFINED_TYPE" ? "TYPE" : objectType)));
+  });
+  it("quotes dotted and apostrophe-containing lookup names exactly once", () => {
+    const sql = "CREATE TYPE [custom.schema].[Customer'sType] FROM INT";
+    const output = normalizeExecutableSql(sql, "USER_DEFINED_TYPE", { schemaName: "custom.schema", objectName: "Customer'sType" }, { strategy: "dropCreate" });
+    expect(output).toContain("TYPE_ID(N'[custom.schema].[Customer''sType]')");
+    expect(output).not.toContain("Customer''''sType");
+  });
+  it("rewrites only the module declaration, preserving DDL words in comments, identifiers, and literals", () => {
+    const prefix = "/* CREATE PROCEDURE example /* nested */ */\n-- CREATE VIEW sample\n";
+    const body = " AS SELECT N'CREATE PROCEDURE inner', N'CREATE\nOR\nALTER', [CREATE PROCEDURE column]";
+    const output = normalizeExecutableSql(`${prefix}ALTER PROCEDURE dbo.actual${body}`, "PROCEDURE");
+    expect(output).toBe(`${prefix}CREATE OR ALTER PROCEDURE dbo.actual${body}`);
+  });
+
+  it("preserves multiline quoted SQL when joining DDL keywords", () => {
+    const sql = "CREATE\nPROCEDURE dbo.actual AS SELECT 'CREATE\nPROCEDURE test', \"CREATE\nVIEW column\"; -- CREATE\n";
+    expect(normalizeDdlKeywords(sql)).toBe(sql.replace("CREATE\nPROCEDURE dbo.actual", "CREATE PROCEDURE dbo.actual"));
+  });
   it("converts CREATE PROCEDURE → CREATE OR ALTER PROCEDURE", () => {
     const out = normalizeExecutableSql("CREATE PROCEDURE [dbo].[foo] AS SELECT 1", "PROCEDURE");
     expect(out).toMatch(/CREATE OR ALTER PROCEDURE/);
@@ -222,15 +323,13 @@ describe("normalizeExecutableSql — CREATE OR ALTER conversion", () => {
     expect(out).toContain("IF OBJECT_ID(N'dbo.seq_Id', 'SO') IS NOT NULL DROP SEQUENCE [dbo].[seq_Id];\nGO\nCREATE SEQUENCE [dbo].[seq_Id] START WITH 1 INCREMENT BY 1");
   });
 
-  it("wraps USER_DEFINED_TYPE by dropping dependent modules before drop/create and then recreating them", () => {
+  it("refuses dependent type migrations without dropping unselected modules", () => {
     const out = normalizeExecutableSql("CREATE TYPE [dbo].[PhoneType] FROM NVARCHAR(20) NOT NULL", "USER_DEFINED_TYPE", { schemaName: "dbo", objectName: "PhoneType" }, { strategy: "dropCreate" });
-    expect(out).toContain("DECLARE @PebloyTypeName nvarchar(776) = N'dbo.PhoneType';");
-    expect(out).toContain("DECLARE @PebloyTypeDropSql nvarchar(max) = N'DROP TYPE [dbo].[PhoneType];';");
-    expect(out).toContain("FROM sys.parameters p");
-    expect(out).toContain("AND m.definition IS NOT NULL;");
-    expect(out).toContain("EXEC(@PebloyDropSql);");
-    expect(out).toContain("EXEC(@PebloyTypeDropSql);");
+    expect(out).toContain("FROM sys.parameters");
+    expect(out).toContain("FROM sys.columns");
+    expect(out).toContain("THROW 51000");
+    expect(out).not.toContain("DROP PROCEDURE");
+    expect(out).not.toContain("DROP FUNCTION");
     expect(out).toContain("EXEC(N'CREATE TYPE [dbo].[PhoneType] FROM NVARCHAR(20) NOT NULL');");
-    expect(out).toContain("EXEC(@PebloyCreateSql);");
   });
 });

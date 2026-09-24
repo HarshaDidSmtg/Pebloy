@@ -23,6 +23,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($env:PEBLOY_CREDENTIAL_STDIN -eq "1") {
+    $credentialInput = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())) | ConvertFrom-Json
+    $SourcePassword = [string]$credentialInput.SourcePassword
+    $TargetPassword = [string]$credentialInput.TargetPassword
+    Remove-Variable credentialInput
+}
 
 function Ensure-Directory {
     param([Parameter(Mandatory)][string]$Path)
@@ -135,7 +141,10 @@ function New-IfColumnDifferentSql {
 
     $objectLiteral = Quote-SqlLiteral (Get-UnquotedQualifiedName $Column.SchemaName $Column.TableName)
     $columnLiteral = Quote-SqlLiteral $Column.ColumnName
-    $typeLiteral = Quote-SqlLiteral ([string]$Column.DataType).ToLowerInvariant()
+    $typeLiteral = Quote-SqlLiteral ([string]$Column.DataType)
+    $typeSchemaPredicate = if ($Column.IsUserDefined) {
+        "OR SCHEMA_NAME(ty.schema_id) <> $(Quote-SqlLiteral $Column.DataTypeSchema)"
+    } else { "" }
     $collationPredicate = if ([string]::IsNullOrWhiteSpace($Column.CollationName)) {
         "c.collation_name IS NULL"
     }
@@ -152,7 +161,8 @@ EXISTS (
     WHERE c.object_id = OBJECT_ID($objectLiteral, N'U')
       AND c.name = $columnLiteral
       AND (
-             LOWER(ty.name) <> $typeLiteral
+                 ty.name <> $typeLiteral
+             $typeSchemaPredicate
           OR c.max_length <> $($Column.max_length)
           OR c.precision <> $($Column.precision)
           OR c.scale <> $($Column.scale)
@@ -337,6 +347,10 @@ function Get-SqlTypeDefinition {
         return $null
     }
 
+    if ($Column.IsUserDefined) {
+        return Get-QualifiedName $Column.DataTypeSchema $Column.DataType
+    }
+
     $typeName = $Column.DataType.ToUpperInvariant()
     $maxLength = $Column.max_length
     $precision = $Column.precision
@@ -403,6 +417,8 @@ function Get-ColumnSignature {
 
     return @(
         $Column.DataType
+        $Column.DataTypeSchema
+        $Column.IsUserDefined
         $Column.max_length
         $Column.precision
         $Column.scale
@@ -427,6 +443,8 @@ SELECT
     c.name AS ColumnName,
     c.column_id AS ColumnId,
     ty.name AS DataType,
+    SCHEMA_NAME(ty.schema_id) AS DataTypeSchema,
+    ty.is_user_defined AS IsUserDefined,
     c.max_length,
     c.precision,
     c.scale,
@@ -462,7 +480,25 @@ function Get-ObjectKey {
         [Parameter(Mandatory)][string]$ObjectName
     )
 
-    return "$SchemaName.$ObjectName".ToLowerInvariant()
+    return "$SchemaName.$ObjectName"
+}
+
+function Get-IdentifierComparer {
+    param([Parameter(Mandatory)]$Database)
+
+    $query = @"
+SELECT CONVERT(int, COLLATIONPROPERTY(
+    CONVERT(sysname, SQL_VARIANT_PROPERTY(name, 'Collation')), 'ComparisonStyle')) AS ComparisonStyle
+FROM sys.schemas WHERE schema_id = 1;
+"@
+    $rows = $Database.ExecuteWithResults($query).Tables[0].Rows
+    if ($rows.Count -ne 1 -or $rows[0].ComparisonStyle -is [DBNull]) {
+        throw "Cannot determine identifier case sensitivity for database $($Database.Name)."
+    }
+    if (([int]$rows[0].ComparisonStyle -band 1) -eq 1) {
+        return [System.StringComparer]::OrdinalIgnoreCase
+    }
+    return [System.StringComparer]::Ordinal
 }
 
 function Read-ObjectList {
@@ -472,7 +508,7 @@ function Read-ObjectList {
         throw "Object list file not found: $Path"
     }
 
-    $selected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $selected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 
     foreach ($line in Get-Content -LiteralPath $Path) {
         $clean = ($line -replace "\[|\]", "").Trim()
@@ -496,7 +532,7 @@ function Read-ObjectList {
 function ConvertTo-SqlStringLiteral {
     param([Parameter(Mandatory)][string]$Value)
 
-    return "'" + $Value.Replace("'", "''") + "'"
+    return "N'" + $Value.Replace("'", "''") + "'"
 }
 
 function Get-TableFilterSql {
@@ -509,7 +545,7 @@ function Get-TableFilterSql {
 
         $schemaLiteral = ConvertTo-SqlStringLiteral $parts[0]
         $tableLiteral = ConvertTo-SqlStringLiteral $parts[1]
-        $conditions += "(LOWER(s.name) = $schemaLiteral AND LOWER(t.name) = $tableLiteral)"
+        $conditions += "(s.name = $schemaLiteral AND t.name = $tableLiteral)"
     }
 
     if ($conditions.Count -eq 0) {
@@ -522,7 +558,8 @@ function Get-TableFilterSql {
 function Resolve-SelectedTableKeysFromDatabase {
     param(
         [Parameter(Mandatory)]$Database,
-        [Parameter(Mandatory)]$SelectedTableKeys
+        [Parameter(Mandatory)]$SelectedTableKeys,
+        [System.StringComparer]$NameComparer = [System.StringComparer]::OrdinalIgnoreCase
     )
 
     $tableFilterSql = Get-TableFilterSql -SelectedTableKeys $SelectedTableKeys
@@ -539,7 +576,7 @@ AND (
 ORDER BY s.name, t.name;
 "@
 
-    $resolved = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $resolved = [System.Collections.Generic.HashSet[string]]::new($NameComparer)
     $rows = $Database.ExecuteWithResults($query).Tables[0].Rows
     foreach ($row in $rows) {
         $null = $resolved.Add((Get-ObjectKey ([string]$row.SchemaName) ([string]$row.TableName)))
@@ -558,17 +595,19 @@ function Find-DatabaseTable {
     param(
         [Parameter(Mandatory)]$Database,
         [Parameter(Mandatory)][string]$SchemaName,
-        [Parameter(Mandatory)][string]$TableName
+        [Parameter(Mandatory)][string]$TableName,
+        [System.StringComparer]$NameComparer = [System.StringComparer]::OrdinalIgnoreCase
     )
 
     $table = $Database.Tables[$TableName, $SchemaName]
-    if ($null -ne $table -and !$table.IsSystemObject) {
+    if ($null -ne $table -and !$table.IsSystemObject -and
+        $NameComparer.Equals([string]$table.Schema, $SchemaName) -and $NameComparer.Equals([string]$table.Name, $TableName)) {
         return $table
     }
 
     foreach ($candidate in $Database.Tables) {
         if ($candidate.IsSystemObject) { continue }
-        if ($candidate.Schema -ieq $SchemaName -and $candidate.Name -ieq $TableName) {
+        if ($NameComparer.Equals([string]$candidate.Schema, $SchemaName) -and $NameComparer.Equals([string]$candidate.Name, $TableName)) {
             return $candidate
         }
     }
@@ -579,10 +618,11 @@ function Find-DatabaseTable {
 function Get-SelectedSmoTables {
     param(
         [Parameter(Mandatory)]$Database,
-        [Parameter(Mandatory)]$SelectedTableKeys
+        [Parameter(Mandatory)]$SelectedTableKeys,
+        [System.StringComparer]$NameComparer = [System.StringComparer]::OrdinalIgnoreCase
     )
 
-    $tables = @{}
+    $tables = [System.Collections.Generic.Dictionary[string, object]]::new($NameComparer)
 
     foreach ($tableKey in $SelectedTableKeys) {
         $parts = ([string]$tableKey).Split(".", 2)
@@ -590,7 +630,7 @@ function Get-SelectedSmoTables {
 
         $schemaName = $parts[0]
         $tableName = $parts[1]
-        $table = Find-DatabaseTable -Database $Database -SchemaName $schemaName -TableName $tableName
+        $table = Find-DatabaseTable -Database $Database -SchemaName $schemaName -TableName $tableName -NameComparer $NameComparer
 
         if ($null -ne $table -and !$table.IsSystemObject) {
             $tables[(Get-ObjectKey $table.Schema $table.Name)] = $table
@@ -603,17 +643,22 @@ function Get-SelectedSmoTables {
 function Get-IndexKey {
     param($Index)
 
-    return "$($Index.Parent.Schema).$($Index.Parent.Name).$($Index.Name)".ToLowerInvariant()
+    return "$($Index.Parent.Schema).$($Index.Parent.Name).$($Index.Name)"
 }
 
 function Get-IndexSignature {
-    param($Index)
+    param(
+        $Index,
+        [System.StringComparer]$NameComparer = [System.StringComparer]::Ordinal
+    )
 
     $indexedColumns = @()
     foreach ($column in $Index.IndexedColumns) {
         $sortOrder = if ($column.Descending) { "DESC" } else { "ASC" }
         $include = if ($column.IsIncluded) { "INCLUDE" } else { "KEY" }
-        $indexedColumns += "$($column.Name):${include}:$sortOrder"
+        $columnKey = [string]$column.Name
+        if ($NameComparer.Equals('A', 'a')) { $columnKey = $columnKey.ToUpperInvariant() }
+        $indexedColumns += "${columnKey}:${include}:$sortOrder"
     }
 
     return @(
@@ -628,15 +673,20 @@ function Get-IndexSignature {
 }
 
 function Get-IndexSignatureKey {
-    param($Index)
+    param(
+        $Index,
+        [System.StringComparer]$NameComparer = [System.StringComparer]::Ordinal
+    )
 
-    return "$(Get-ObjectKey $Index.Parent.Schema $Index.Parent.Name)|$(Get-IndexSignature $Index)"
+    $tableKey = Get-ObjectKey $Index.Parent.Schema $Index.Parent.Name
+    if ($NameComparer.Equals('A', 'a')) { $tableKey = $tableKey.ToUpperInvariant() }
+    return "$tableKey|$(Get-IndexSignature -Index $Index -NameComparer $NameComparer)"
 }
 
 function Get-ConstraintKey {
     param($Constraint)
 
-    return "$($Constraint.Parent.Schema).$($Constraint.Parent.Name).$($Constraint.Name)".ToLowerInvariant()
+    return "$($Constraint.Parent.Schema).$($Constraint.Parent.Name).$($Constraint.Name)"
 }
 
 trap {
@@ -664,21 +714,30 @@ $targetDb = $targetServerObj.Databases[$TargetDatabase]
 if ($null -eq $sourceDb) { throw "Source database not found: $SourceDatabase" }
 if ($null -eq $targetDb) { throw "Target database not found: $TargetDatabase" }
 
+$sourceNameComparer = Get-IdentifierComparer -Database $sourceDb
+$targetNameComparer = Get-IdentifierComparer -Database $targetDb
 $scripter = New-TableScripter -SqlServer $sourceServerObj
 $createTableScripter = New-TableScripter -SqlServer $sourceServerObj -IncludeForeignKeysInTableScript $false -IncludeTriggersInTableScript $false
 $batches = [System.Collections.Generic.List[string]]::new()
 
-Add-Batch $batches "-- Generated from $SourceServer.$SourceDatabase to $TargetServer.$TargetDatabase on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-Add-Batch $batches "USE $(Quote-SqlName $TargetDatabase);"
+Add-Batch $batches "-- Generated from $SourceServer.$($sourceDb.Name) to $TargetServer.$($targetDb.Name) on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Add-Batch $batches "USE $(Quote-SqlName $targetDb.Name);"
 
 $selectedTableKeys = Read-ObjectList -Path $ObjectListPath
 if ($selectedTableKeys.Count -eq 0) {
     throw "No valid schema.table entries found in object list file: $ObjectListPath"
 }
 
-$selectedTableKeys = Resolve-SelectedTableKeysFromDatabase -Database $sourceDb -SelectedTableKeys $selectedTableKeys
+$selectedTableKeys = Resolve-SelectedTableKeysFromDatabase -Database $sourceDb -SelectedTableKeys $selectedTableKeys -NameComparer $sourceNameComparer
 if ($selectedTableKeys.Count -eq 0) {
     throw "No selected tables were resolved from source database metadata: $ObjectListPath"
+}
+
+$targetSelectionKeys = [System.Collections.Generic.HashSet[string]]::new($targetNameComparer)
+foreach ($tableKey in $selectedTableKeys) {
+    if (!$targetSelectionKeys.Add($tableKey)) {
+        throw "Selected source table names collide under target identifier case sensitivity: $tableKey. Review the selection before generating a delta."
+    }
 }
 
 Add-Batch $batches "-- Tables selected from $ObjectListPath : $($selectedTableKeys.Count)"
@@ -686,9 +745,9 @@ Add-Batch $batches "-- Tables selected from $ObjectListPath : $($selectedTableKe
 $sourceColumns = @(Get-TableColumns -SmoDatabase $sourceDb -SelectedTableKeys $selectedTableKeys)
 $targetColumns = @(Get-TableColumns -SmoDatabase $targetDb -SelectedTableKeys $selectedTableKeys)
 
-$sourceTables = Get-SelectedSmoTables -Database $sourceDb -SelectedTableKeys $selectedTableKeys
-$targetTables = Get-SelectedSmoTables -Database $targetDb -SelectedTableKeys $selectedTableKeys
-$missingTableKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$sourceTables = Get-SelectedSmoTables -Database $sourceDb -SelectedTableKeys $selectedTableKeys -NameComparer $sourceNameComparer
+$targetTables = Get-SelectedSmoTables -Database $targetDb -SelectedTableKeys $selectedTableKeys -NameComparer $targetNameComparer
+$missingTableKeys = [System.Collections.Generic.HashSet[string]]::new($sourceNameComparer)
 
 foreach ($selectedKey in ($selectedTableKeys | Sort-Object)) {
     if (!$sourceTables.ContainsKey($selectedKey)) {
@@ -696,13 +755,13 @@ foreach ($selectedKey in ($selectedTableKeys | Sort-Object)) {
     }
 }
 
-$targetColumnMap = @{}
+$targetColumnMap = [System.Collections.Generic.Dictionary[string, object]]::new($targetNameComparer)
 foreach ($column in $targetColumns) {
-    $key = "$(Get-ObjectKey $column.SchemaName $column.TableName)|$($column.ColumnName.ToLowerInvariant())"
+    $key = "$(Get-ObjectKey $column.SchemaName $column.TableName)|$($column.ColumnName)"
     $targetColumnMap[$key] = $column
 }
 
-$sourceColumnMap = @{}
+$sourceColumnMap = [System.Collections.Generic.Dictionary[string, object]]::new($sourceNameComparer)
 foreach ($column in $sourceColumns) {
     $tableKey = Get-ObjectKey $column.SchemaName $column.TableName
     if (!$sourceColumnMap.ContainsKey($tableKey)) {
@@ -729,7 +788,7 @@ foreach ($sourceTableKey in ($sourceTables.Keys | Sort-Object)) {
     }
 
     foreach ($sourceColumn in $sourceTableColumns) {
-        $columnKey = "$sourceTableKey|$($sourceColumn.ColumnName.ToLowerInvariant())"
+        $columnKey = "$sourceTableKey|$($sourceColumn.ColumnName)"
         $targetColumn = $targetColumnMap[$columnKey]
 
         if ($null -eq $targetColumn) {
@@ -743,7 +802,7 @@ foreach ($sourceTableKey in ($sourceTables.Keys | Sort-Object)) {
             continue
         }
 
-        if ((Get-ColumnSignature $sourceColumn) -ne (Get-ColumnSignature $targetColumn)) {
+        if ((Get-ColumnSignature $sourceColumn) -cne (Get-ColumnSignature $targetColumn)) {
             if ($sourceColumn.IsComputed -or $targetColumn.IsComputed -or $sourceColumn.IsIdentity -or $targetColumn.IsIdentity) {
                 Add-Batch $batches "-- Manual review required: computed/identity column differs on $qualifiedTable.$(Quote-SqlName $sourceColumn.ColumnName)."
                 continue
@@ -764,19 +823,19 @@ foreach ($sourceTableKey in ($sourceTables.Keys | Sort-Object)) {
                 $defaultSql = "ALTER TABLE $qualifiedTable ADD CONSTRAINT $(Quote-SqlName $sourceColumn.DefaultConstraintName) DEFAULT $($sourceColumn.DefaultDefinition) FOR $(Quote-SqlName $sourceColumn.ColumnName);"
                 Add-Batch $batches (New-IfDefaultMissingSql -Column $sourceColumn -Sql $defaultSql)
             }
-            elseif ($sourceColumn.DefaultDefinition -ne $targetColumn.DefaultDefinition) {
+            elseif ($sourceColumn.DefaultDefinition -cne $targetColumn.DefaultDefinition) {
                 Add-Batch $batches "-- Manual review required: default constraint differs on $qualifiedTable.$(Quote-SqlName $sourceColumn.ColumnName). Source: $($sourceColumn.DefaultDefinition) Target: $($targetColumn.DefaultDefinition)"
             }
         }
     }
 }
 
-$targetIndexMap = @{}
-$targetIndexSignatureKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$targetIndexMap = [System.Collections.Generic.Dictionary[string, object]]::new($targetNameComparer)
+$targetIndexSignatureKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 foreach ($table in $targetTables.Values) {
     foreach ($index in $table.Indexes) {
         $targetIndexMap[(Get-IndexKey $index)] = $index
-        $null = $targetIndexSignatureKeys.Add((Get-IndexSignatureKey $index))
+        $null = $targetIndexSignatureKeys.Add((Get-IndexSignatureKey -Index $index -NameComparer $targetNameComparer))
     }
 }
 
@@ -786,9 +845,9 @@ foreach ($table in $sourceTables.Values) {
     foreach ($index in $table.Indexes) {
         if ($index.IsHypothetical) { continue }
         $indexKey = Get-IndexKey $index
-        $indexSignatureKey = Get-IndexSignatureKey $index
+        $indexSignatureKey = Get-IndexSignatureKey -Index $index -NameComparer $targetNameComparer
         if ($targetIndexMap.ContainsKey($indexKey)) {
-            if ((Get-IndexSignature $index) -ne (Get-IndexSignature $targetIndexMap[$indexKey])) {
+            if ((Get-IndexSignature -Index $index -NameComparer $targetNameComparer) -cne (Get-IndexSignature -Index $targetIndexMap[$indexKey] -NameComparer $targetNameComparer)) {
                 Add-Batch $batches "-- Manual review required: index/key differs and may need DROP/CREATE: $(Quote-SqlName $index.Name) on $(Get-QualifiedName $table.Schema $table.Name)."
             }
             continue
@@ -808,7 +867,7 @@ foreach ($table in $sourceTables.Values) {
     }
 }
 
-$targetConstraintKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$targetConstraintKeys = [System.Collections.Generic.HashSet[string]]::new($targetNameComparer)
 foreach ($table in $targetTables.Values) {
     foreach ($check in $table.Checks) { $null = $targetConstraintKeys.Add((Get-ConstraintKey $check)) }
     foreach ($fk in $table.ForeignKeys) { $null = $targetConstraintKeys.Add((Get-ConstraintKey $fk)) }
@@ -844,7 +903,7 @@ if ($IncludeForeignKeys -and $missingTableKeys.Count -gt 0) {
 }
 
 if ($IncludeTriggers) {
-    $targetTriggerKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $targetTriggerKeys = [System.Collections.Generic.HashSet[string]]::new($targetNameComparer)
     foreach ($table in $targetTables.Values) {
         foreach ($trigger in $table.Triggers) {
             $null = $targetTriggerKeys.Add("$($table.Schema).$($table.Name).$($trigger.Name)")

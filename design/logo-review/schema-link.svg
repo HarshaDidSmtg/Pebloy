@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">Pebloy concept B: Schema Link</title>
+  <rect width="256" height="256" rx="52" fill="#edf2fb"/>
+  <path d="M111 48H66c-14 0-24 10-24 24v112c0 14 10 24 24 24h45v-38H81V86h30V48Z" fill="#285cdd"/>
+  <path d="M145 48h45c14 0 24 10 24 24v112c0 14-10 24-24 24h-45v-38h30V86h-30V48Z" fill="#ed573e"/>
+  <path d="M98 109h60v38H98z" fill="#172539"/>
+</svg>
