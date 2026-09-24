@@ -15,6 +15,7 @@ const { formatTextAsync, formatTextSync } = require("./tsqlFormatterProvider");
 const FORMAT_OPTIONS = { ...DEFAULT_INTERACTIVE_FORMATTER_OPTIONS };
 
 const FORMATTER_WORKER_PATH = path.resolve(__dirname, "formatterWorker.js");
+let activeFormatterWorkers = 0;
 
 function formatSql(text) {
   return formatTextSync(text, FORMAT_OPTIONS);
@@ -32,6 +33,11 @@ function formatGeneratedSql(text) {
   return formatTextSync(text, getGeneratedSqlFormatOptions());
 }
 
+async function formatGeneratedSqlAsync(text) {
+  const result = await formatInteractiveSql(text, { options: getGeneratedSqlFormatOptions() });
+  return result.formatted;
+}
+
 async function formatSqlAsync(text, { onProgress = null } = {}) {
   return formatTextAsync(text, FORMAT_OPTIONS, { onProgress });
 }
@@ -39,6 +45,7 @@ async function formatSqlAsync(text, { onProgress = null } = {}) {
 function formatInteractiveSql(sql, rawRequest = {}, { onProgress = null } = {}) {
   const normalizedRequest = normalizeFormatterRequest(rawRequest);
   const input = String(sql ?? "");
+  if (Buffer.byteLength(input, "utf8") > 20 * 1024 * 1024) return Promise.reject(new Error("SQL formatting input exceeds 20 MB."));
   if (!input.trim()) {
     return Promise.resolve({
       formatted: input,
@@ -48,8 +55,11 @@ function formatInteractiveSql(sql, rawRequest = {}, { onProgress = null } = {}) 
     });
   }
 
+  if (activeFormatterWorkers >= 2) return Promise.reject(new Error("Two formatting jobs are already running. Wait for one to finish."));
   return new Promise((resolve, reject) => {
     const worker = new Worker(FORMATTER_WORKER_PATH);
+    activeFormatterWorkers += 1;
+    let cleanedUp = false;
     const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
     // A pathological input must never leave a worker thread running forever.
@@ -60,6 +70,9 @@ function formatInteractiveSql(sql, rawRequest = {}, { onProgress = null } = {}) 
     }, timeoutMs);
 
     const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      activeFormatterWorkers -= 1;
       clearTimeout(timeout);
       worker.removeAllListeners();
       worker.terminate().catch(() => {});
@@ -68,7 +81,8 @@ function formatInteractiveSql(sql, rawRequest = {}, { onProgress = null } = {}) 
     worker.on("message", (message) => {
       if (!message || message.requestId !== requestId) return;
       if (message.type === "progress") {
-        if (onProgress) onProgress({ done: message.done, total: message.total });
+        try { if (onProgress) onProgress({ done: message.done, total: message.total }); }
+        catch (error) { cleanup(); reject(error); }
         return;
       }
       if (message.type === "result") {
@@ -93,9 +107,8 @@ function formatInteractiveSql(sql, rawRequest = {}, { onProgress = null } = {}) 
     });
 
     worker.on("exit", (code) => {
-      if (code !== 0) {
-        reject(new Error(`Formatter worker exited with code ${code}.`));
-      }
+      cleanup();
+      reject(new Error(`Formatter worker exited before returning a result (code ${code}).`));
     });
 
     worker.postMessage({
@@ -115,6 +128,7 @@ module.exports = {
   DEFAULT_INTERACTIVE_FORMATTER_OPTIONS,
   FORMAT_OPTIONS,
   formatGeneratedSql,
+  formatGeneratedSqlAsync,
   formatInteractiveSql,
   formatSql,
   formatSqlAsync,

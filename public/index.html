@@ -77,6 +77,7 @@
           <label id="usernameField" class="credentials-sql-only">Username <input id="username" maxlength="128" /></label>
           <label id="passwordField" class="credentials-sql-only">Password <input id="password" type="password" autocomplete="new-password" placeholder="Enter password" /></label>
           <label>Environment <input id="environmentTag" maxlength="20" placeholder="DEV/QA/UAT/PROD" /></label>
+          <label>Group <input id="profileGroup" maxlength="80" /></label>
           <div class="row-actions">
             <button type="submit">Save Profile</button>
             <button type="button" id="clearProfile" class="btn-ghost">Clear Form</button>
@@ -90,12 +91,18 @@
         <div id="profilesTable"></div>
         <h3>Connection Diagnostics</h3>
         <pre id="diagnosticsResult" class="result">Run diagnostics from a connection row.</pre>
+        <div class="row-actions">
+          <button id="checkSqlModule" type="button" class="btn-ghost">Check SqlServer Module</button>
+          <button id="installSqlModule" type="button" class="btn-ghost" disabled>Install Pinned Module</button>
+        </div>
+        <pre id="sqlModuleStatus" class="result"></pre>
       </section>
 
       <section class="panel" id="tab-diff">
         <h2>Code Diff <span class="stage-chip">Compare only — never executes</span></h2>
         <p class="muted">Object-level side-by-side comparison of live definitions between source and target connections.</p>
         <p id="diffObjectSummary" class="muted"></p>
+        <p class="folder-source-label muted hidden"></p>
         <div class="inline-form">
           <label>Source Connection <select id="diffSourceProfile"></select></label>
           <label>Target Connection <select id="diffDestProfile"></select></label>
@@ -111,10 +118,16 @@
         </div>
         <div id="diffEngineHint" class="deploy-mode-hint muted">Legacy Text Compare is the default for speed. DacFx is used only for structural comparisons like tables and types, and otherwise falls back automatically.</div>
         <div class="task-progress-wrap">
-          <div class="task-progress-track"><div id="diffProgressBar" class="task-progress-fill"></div></div>
+          <div class="task-progress-track"><div id="diffProgressBar" class="task-progress-fill" role="progressbar" aria-label="CodeDiff progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div>
           <div id="diffProgressText" class="task-progress-label muted">Idle</div>
         </div>
         <div id="diffSummary" class="summary-cards"></div>
+        <div class="inline-form">
+          <label>Export format <select id="diffExportFormat"><option value="html-highlighted">HTML with SQL highlighting</option><option value="html">HTML</option><option value="md">Markdown</option><option value="json">JSON</option></select></label>
+          <button id="exportDiff" type="button" class="btn-ghost" disabled>Export Diff</button>
+          <button id="copyDiff" type="button" class="btn-ghost" title="Copy diff as Markdown (Ctrl+Shift+C)" disabled>Copy Markdown</button>
+        </div>
+        <pre id="diffExportResult" class="result hidden"></pre>
         <div class="maximizable-wrap" id="diffMaxWrap">
           <div class="maximizable-header">
             <span>Diff Viewer</span>
@@ -135,11 +148,17 @@
             <select id="objectsMode">
               <option value="Specify">Manual Entry</option>
               <option value="Discover">Browse Database</option>
+              <option value="Folder">SQL Folder</option>
             </select>
           </label>
           <button id="clearSharedObjects" type="button" class="btn-ghost">Clear Selection</button>
         </div>
 
+        <div id="objectsFolderSection" class="inline-form hidden">
+          <label class="path-field">Source SQL Folder <input id="folderSourcePath" /></label>
+          <button id="folderSourceBrowse" type="button" class="btn-ghost browse-icon-btn" title="Choose source SQL folder" aria-label="Choose source SQL folder"><span class="icon-folder" aria-hidden="true"></span></button>
+          <button id="loadFolderSource" type="button">Load Folder Objects</button>
+        </div>
         <div class="maximizable-wrap" id="specifyWrap">
           <div class="maximizable-header">
             <span>Manual Object Entry</span>
@@ -184,6 +203,7 @@
             <label>Object Type <select id="sharedTypeFilter"></select></label>
             <label>Schema <select id="sharedSchemaFilter"></select></label>
             <label>Object Name <input id="sharedNameFilter" placeholder="contains object name" /></label>
+            <label>Rows per page <select id="discoverPageSize"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option></select></label>
             <button id="discoverSharedObjects" type="button">Search</button>
             <button id="addDiscoveredObjects" type="button">Add Selected Objects</button>
           </div>
@@ -191,7 +211,7 @@
         </div>
 
         <div class="task-progress-wrap">
-          <div class="task-progress-track"><div id="objectsProgressBar" class="task-progress-fill"></div></div>
+          <div class="task-progress-track"><div id="objectsProgressBar" class="task-progress-fill" role="progressbar" aria-label="Object discovery progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div>
           <div id="objectsProgressText" class="task-progress-label muted">Idle</div>
         </div>
 
@@ -207,25 +227,25 @@
 
       <section class="panel" id="tab-backup">
         <h2>Backup <span class="stage-chip">Script generation</span></h2>
-        <p class="muted">Scripts selected objects to SQL files, preserving schema folder structure for restore readiness. With Format &amp; Execute in Source enabled, formatted module definitions are also re-applied to the source database.</p>
         <p id="backupObjectSummary" class="muted"></p>
+        <p class="folder-source-label muted hidden"></p>
         <div class="inline-form">
           <label>Source Connection <select id="backupProfile"></select></label>
           <label class="path-field path-field-wide">Output Folder <input id="backupPath" placeholder="C:/Backups" /></label>
           <button id="backupPathBrowse" type="button" class="btn-ghost browse-icon-btn" title="Choose backup folder" aria-label="Choose backup folder"><span class="icon-folder" aria-hidden="true"></span></button>
-          <label title="Format &amp; Execute additionally re-applies each procedure, view, function, and trigger to the SOURCE database via CREATE OR ALTER, so the stored definitions become formatted">
+          <label>
             SQL Formatting
             <select id="backupFormatMode">
               <option value="off">No Formatting</option>
               <option value="format">Format Generated SQL</option>
-              <option value="formatExecute">Format &amp; Execute in Source</option>
+              <option value="formatExecute">Format &amp; Execute in Source...</option>
             </select>
           </label>
           <button id="goToObjectsFromBackup" type="button" class="btn-ghost">Select Objects</button>
           <button id="runBackup" type="button">Run Backup</button>
         </div>
         <div class="task-progress-wrap">
-          <div class="task-progress-track"><div id="backupProgressBar" class="task-progress-fill"></div></div>
+          <div class="task-progress-track"><div id="backupProgressBar" class="task-progress-fill" role="progressbar" aria-label="Backup progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div>
           <div id="backupProgressText" class="task-progress-label muted">Idle</div>
         </div>
         <pre id="backupResult" class="result"></pre>
@@ -235,13 +255,19 @@
         <h2>Deployment <span class="stage-chip stage-amber">Executes on target</span></h2>
         <p class="muted">Generates object scripts from the source connection, computes table schema deltas, then applies changes to the target connection.</p>
         <p id="deployObjectSummary" class="muted"></p>
+        <fieldset id="deployBatchSection" class="hidden">
+          <legend>Target Connections</legend>
+          <div id="deployBatchTargets" class="batch-targets"></div>
+          <label class="flag-label"><input id="continueTargetsOnError" type="checkbox" /> Continue to later targets after a target fails</label>
+        </fieldset>
+        <p class="folder-source-label muted hidden"></p>
         <div class="inline-form">
           <label>Source Connection <select id="deploySourceProfile"></select></label>
           <label>Target Connection <select id="deployDestProfile"></select></label>
+          <label>Targets <select id="deployTargetMode"><option value="single">Single</option><option value="multiple">Multiple</option></select></label>
           <label>Engine
             <select id="deployEngine">
               <option value="Legacy" selected>Legacy Per-Object Deployment</option>
-              <option value="DacFx">DacFx Deployment</option>
             </select>
           </label>
           <label>
@@ -249,6 +275,7 @@
             <select id="deployMode">
               <option value="ExecuteDirectly" selected>Apply Changes</option>
               <option value="Rollback">Validate Only (Rollback)</option>
+              <option value="DryRun">Dry Run (generate scripts only)</option>
             </select>
           </label>
           <label class="path-field path-field-wide">Script Output Folder <input id="deployScriptPath" placeholder="C:/ScriptExports" /></label>
@@ -259,7 +286,7 @@
         </div>
         <div id="deployModeHint" class="deploy-mode-hint muted"></div>
         <div class="task-progress-wrap">
-          <div class="task-progress-track"><div id="deployProgressBar" class="task-progress-fill"></div></div>
+          <div class="task-progress-track"><div id="deployProgressBar" class="task-progress-fill" role="progressbar" aria-label="Deployment progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div>
           <div id="deployProgressText" class="task-progress-label muted">Idle</div>
         </div>
         <div class="deploy-actions-row">
@@ -272,13 +299,27 @@
         <div id="deployRetryRow" class="hidden">
           <button id="retryFailedObjects" type="button" class="btn-ghost">Retry Failed Objects</button>
         </div>
+        <div id="scheduleSection" class="hidden">
+        <h3>Schedules</h3>
+        <div class="inline-form">
+          <label>Name <input id="scheduleName" maxlength="100" /></label>
+          <label>First Run (Machine Time) <input id="scheduleTime" type="datetime-local" /></label>
+          <label>Repeat <select id="scheduleRepeat"><option value="once">Once</option><option value="daily">Daily</option><option value="weekly">Weekly</option></select></label>
+          <label class="flag-label"><input id="scheduleWake" type="checkbox" disabled /> Start Pebloy via Windows Task Scheduler</label>
+          <button id="saveSchedule" type="button">Review &amp; Save Schedule</button>
+          <button id="newSchedule" type="button" class="btn-ghost">New from Current Selection</button>
+          <button id="refreshSchedules" type="button" class="btn-ghost">Refresh Schedules</button>
+        </div>
+        <p id="scheduleRuntime" class="muted"></p>
+        <div id="scheduleList" class="table-viewport"></div>
+        </div>
       </section>
 
       <section class="panel" id="tab-formatter">
         <h2>SQL Formatter <span class="stage-chip">Local only — never touches a database</span></h2>
         <p class="muted">Offline T-SQL formatting workbench with Monaco editing, local file actions, and before/after diffing. GO batches, comments, BOM, EOL style, trailing newline, and string literal content are preserved.</p>
         <div class="task-progress-wrap">
-          <div class="task-progress-track"><div id="formatterProgressBar" class="task-progress-fill"></div></div>
+          <div class="task-progress-track"><div id="formatterProgressBar" class="task-progress-fill" role="progressbar" aria-label="Formatter progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div>
           <div id="formatterProgressText" class="task-progress-label muted">Idle</div>
         </div>
         <div class="formatter-frame">
@@ -405,6 +446,7 @@
             <div class="customize-field">
               <label for="themeSelect">Theme</label>
               <select id="themeSelect"></select>
+              <label class="flag-label"><input id="followSystemTheme" type="checkbox" /> Follow system</label>
             </div>
           </div>
 
@@ -454,6 +496,27 @@
                 <input type="checkbox" id="formatGeneratedSqlToggle" />
                 <span class="toggle-slider"></span>
               </label>
+            </div>
+            <div class="customize-field toggle-field">
+              <label for="schedulesFeatureToggle">Scheduled Deployments</label>
+              <label class="toggle-switch" aria-label="Scheduled Deployments">
+                <input type="checkbox" id="schedulesFeatureToggle" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <p class="muted settings-small-note">Adds reviewed, repeatable deployments to the Deployment tab. Off by default; saved schedules must be deleted before turning it off.</p>
+            <div class="customize-field">
+              <label for="queryTimeoutSeconds">SQL Query Timeout (seconds)</label>
+              <input type="number" id="queryTimeoutSeconds" min="5" max="3600" step="5" />
+            </div>
+            <div class="customize-field">
+              <label for="powershellTimeoutSeconds">PowerShell Timeout (seconds)</label>
+              <input type="number" id="powershellTimeoutSeconds" min="30" max="7200" step="10" />
+            </div>
+            <div class="customize-field">
+              <label for="maxActiveTaskLogs">Keep Recent Task Logs</label>
+              <input type="number" id="maxActiveTaskLogs" min="10" max="5000" step="10" />
+              <p class="muted settings-small-note">Older completed logs move to the archive folder; nothing is deleted.</p>
             </div>
           </div>
 
@@ -533,11 +596,6 @@
             </table>
           </div>
 
-          <div class="customize-card">
-            <h3>Deployment Order</h3>
-            <p class="muted">Use arrows to reorder how object types are deployed (top = first).</p>
-            <ul class="deploy-order-list" id="deployOrderList"></ul>
-          </div>
         </div>
 
       </section>
@@ -576,6 +634,11 @@
           <span id="logAutoRefreshLabel" class="log-autorefresh-label"></span>
         </div>
         <div id="logsTable"></div>
+        <div class="inline-form">
+          <label>Archive age (days) <input id="archiveRetentionDays" type="number" min="1" max="3650" value="90" /></label>
+          <button id="previewArchiveCleanup" type="button" class="btn-ghost">Preview Archive Cleanup</button>
+          <button id="deleteArchiveFiles" type="button" class="btn-ghost" disabled>Delete Previewed Files...</button>
+        </div>
         <pre id="logDetail" class="result hidden"></pre>
       </section>
     </main>

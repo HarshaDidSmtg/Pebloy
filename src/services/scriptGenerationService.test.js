@@ -25,6 +25,7 @@ jest.mock("./sqlService", () => ({
 jest.mock("fs", () => ({
   writeFileSync: jest.fn(),
   readFileSync: jest.fn(),
+  existsSync: jest.fn(() => false),
 }));
 
 const fs = require("fs");
@@ -41,6 +42,23 @@ const {
 const { UTF8_BOM } = require("./sqlFileEncoding");
 
 describe("buildCombinedStoredProcedureText", () => {
+  it("rehydrates each procedure's session metadata through the real executable normalizer", () => {
+    const mockedNormalizer = require("./scriptAutomationService").normalizeExecutableSql;
+    const realNormalizer = jest.requireActual("./scriptAutomationService").normalizeExecutableSql;
+    mockedNormalizer.mockImplementationOnce(realNormalizer).mockImplementationOnce(realNormalizer);
+    const text = buildCombinedStoredProcedureText([
+      { definitionText: "CREATE PROCEDURE dbo.FirstProc AS SELECT N'A  B'", moduleMetadata: { usesAnsiNulls: false, usesQuotedIdentifier: false } },
+      { definitionText: "CREATE PROCEDURE dbo.SecondProc AS SELECT 2", moduleMetadata: { usesAnsiNulls: true, usesQuotedIdentifier: true } },
+    ]);
+    expect(text).toContain("SET ANSI_NULLS OFF");
+    expect(text).toContain("SET QUOTED_IDENTIFIER OFF");
+    expect(text).toContain("SET ANSI_NULLS ON");
+    expect(text).toContain("SET QUOTED_IDENTIFIER ON");
+    expect(text).toContain("N'A  B'");
+    expect(text.indexOf("CREATE OR ALTER PROCEDURE dbo.FirstProc")).toBeLessThan(text.indexOf("SET ANSI_NULLS ON"));
+    expect(text.indexOf("SET QUOTED_IDENTIFIER ON")).toBeLessThan(text.indexOf("CREATE OR ALTER PROCEDURE dbo.SecondProc"));
+  });
+
   it("rewrites procedure headers to CREATE OR ALTER without session-setting prefixes", () => {
     const text = buildCombinedStoredProcedureText([
       { definitionText: "CREATE PROCEDURE [dbo].[ProcA]\nAS\nSELECT 1" },
@@ -138,6 +156,20 @@ describe("generateScriptsForProfile", () => {
       usesQuotedIdentifier: true,
       definitionSource: "exact",
     });
+  });
+
+  it.each([false, true])("rebuilds combined procedures in planned order (metadata unavailable: %s)", async (metadataUnavailable) => {
+    const objects = ["Provider", "Consumer"].map((objectName) => ({ objectType: "PROCEDURE", schemaName: "dbo", objectName }));
+    generateObjectScripts.mockResolvedValue({ runRoot: "/out", combinedStoredProceduresPath: "/out/AllStoredProcedures.sql" });
+    listGeneratedObjectScripts.mockReturnValue([...objects].reverse().map((item) => ({ ...item, scriptPath: `/out/${item.objectName}.sql` })));
+    fetchObjectDefinitionMap.mockResolvedValue(new Map(objects.map((item) => [item.objectName, {
+      ...item, definition: `CREATE PROCEDURE dbo.${item.objectName} AS SELECT 1`, usesAnsiNulls: true, usesQuotedIdentifier: true,
+    }])));
+    if (metadataUnavailable) fetchObjectDefinitionMap.mockRejectedValueOnce(new Error("Metadata unavailable"));
+    fs.readFileSync.mockImplementation((filePath) => `CREATE PROCEDURE dbo.${String(filePath).includes("Provider") ? "Provider" : "Consumer"} AS SELECT 1`);
+    await generateScriptsForProfile({ taskId: "ordered", profile: {}, selectedObjects: objects, outputBasePath: "/out", appTaskMode: "deploy" });
+    const combined = fs.writeFileSync.mock.calls.find(([filePath]) => filePath === "/out/AllStoredProcedures.sql")[1];
+    expect(combined.indexOf("dbo.Provider")).toBeLessThan(combined.indexOf("dbo.Consumer"));
   });
 
   it("keeps individual procedure files free of session-setting prefixes outside backup mode", async () => {

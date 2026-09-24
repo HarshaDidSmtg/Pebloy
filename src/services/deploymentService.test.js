@@ -1,12 +1,14 @@
 "use strict";
 
 jest.mock("./sqlService", () => ({
+  testConnection: jest.fn(async (profile) => ({ serverName: profile.serverName, databaseName: profile.databaseName })),
   executeSql: jest.fn().mockResolvedValue(undefined),
   executeSqlScript: jest.fn().mockResolvedValue(undefined),
   executeSqlScriptsIndividually: jest.fn().mockImplementation((_profile, scripts) => Promise.resolve(
     scripts.map((script) => ({ key: script.key, ok: true, error: null }))
   )),
   fetchObjectDefinitionMap: jest.fn().mockResolvedValue(new Map()),
+  fetchTypeSignatureMap: jest.fn().mockResolvedValue(new Map()),
   fetchObjectDependencyEdges: jest.fn().mockResolvedValue([]),
 }));
 jest.mock("./loggingService", () => ({
@@ -75,10 +77,10 @@ const {
   generateTableDelta,
   normalizeExecutableSql,
 } = require("./scriptAutomationService");
-const { fetchObjectDefinitionMap, fetchObjectDependencyEdges } = require("./sqlService");
+const { testConnection, fetchObjectDefinitionMap, fetchObjectDependencyEdges } = require("./sqlService");
 const { compareGeneratedArtifacts, deployGeneratedArtifacts } = require("./dacfxService");
 const { generateScriptsForProfile } = require("./scriptGenerationService");
-const { runDeployment, buildDeploymentPlan, buildDerivedDeploymentPlan } = require("./deploymentService");
+const { runDeployment, buildDeploymentPlan, buildDerivedDeploymentPlan, deploymentPlanFingerprint } = require("./deploymentService");
 
 const srcProfile = { serverName: "srcServer", databaseName: "srcDb" };
 const dstProfile = { serverName: "dstServer", databaseName: "dstDb" };
@@ -97,6 +99,221 @@ function makeGeneratedInfo(runRoot = "/out", scripts = []) {
 }
 
 describe("runDeployment", () => {
+  const udt = { objectType: "USER_DEFINED_TYPE", schemaName: "finance", objectName: "OverPaymentUsedType" };
+
+  it("skips an identical user-defined type instead of dropping and recreating it", async () => {
+    const { fetchTypeSignatureMap, executeSqlScriptsIndividually } = require("./sqlService");
+    const signature = new Map([["USER_DEFINED_TYPE|finance|overpaymentusedtype", "TYPE#0#decimal:9:19:4::0:0"]]);
+    fetchTypeSignatureMap.mockResolvedValueOnce(signature).mockResolvedValueOnce(new Map(signature));
+    generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", [
+      { ...udt, scriptPath: "/out/finance.OverPaymentUsedType.sql" },
+    ]));
+
+    const result = await runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects: [udt], mode: "ExecuteDirectly", options: {}, task, logEvent,
+    });
+
+    expect(result.results[0]).toMatchObject({ status: "Skipped", action: "NoChange" });
+    expect(executeSqlScriptsIndividually).not.toHaveBeenCalled();
+  });
+
+  it("still deploys a user-defined type whose shape changed", async () => {
+    const { fetchTypeSignatureMap, executeSqlScriptsIndividually } = require("./sqlService");
+    fetchTypeSignatureMap
+      .mockResolvedValueOnce(new Map([["USER_DEFINED_TYPE|finance|overpaymentusedtype", "TYPE#0#decimal:9:19:4::0:0"]]))
+      .mockResolvedValueOnce(new Map([["USER_DEFINED_TYPE|finance|overpaymentusedtype", "TYPE#0#decimal:9:19:2::0:0"]]));
+    generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", [
+      { ...udt, scriptPath: "/out/finance.OverPaymentUsedType.sql" },
+    ]));
+
+    const result = await runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects: [udt], mode: "ExecuteDirectly", options: {}, task, logEvent,
+    });
+
+    expect(result.results[0].status).toBe("Success");
+    expect(executeSqlScriptsIndividually).toHaveBeenCalled();
+  });
+
+  it.each(["ExecuteDirectly", "Rollback", "DryRun"])("stops %s when UDT comparison fails, even with continue-on-error", async (mode) => {
+    const sql = require("./sqlService");
+    sql.fetchTypeSignatureMap.mockRejectedValueOnce(new Error("Cannot resolve collation conflict in UNION ALL column 5"));
+    generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", [
+      { ...udt, scriptPath: "/out/type.sql" },
+      { objectType: "PROCEDURE", schemaName: "dbo", objectName: "Consumer", scriptPath: "/out/consumer.sql" },
+    ]));
+    await expect(runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects: [udt, { objectType: "PROCEDURE", schemaName: "dbo", objectName: "Consumer" }],
+      mode, continueOnError: true, options: {}, task, logEvent,
+    })).rejects.toThrow("User-defined type comparison failed; no deployment SQL was executed.");
+    expect(sql.executeSqlScript).not.toHaveBeenCalled();
+    expect(sql.executeSqlScriptsIndividually).not.toHaveBeenCalled();
+    expect(sql.executeSql).not.toHaveBeenCalled();
+    expect(generateTableDelta).not.toHaveBeenCalled();
+  });
+
+  it("does not treat missing structural metadata as equal based on coarse type definitions", async () => {
+    generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", [{ ...udt, scriptPath: "/out/type.sql" }]));
+    await expect(runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects: [udt], mode: "ExecuteDirectly", options: {}, task, logEvent,
+    })).rejects.toThrow("Source type metadata is missing for finance.OverPaymentUsedType");
+    expect(fetchObjectDefinitionMap).not.toHaveBeenCalled();
+    expect(require("./sqlService").executeSqlScriptsIndividually).not.toHaveBeenCalled();
+  });
+
+  it("retains an identical UDT skip when unrelated definition comparison fails", async () => {
+    const sql = require("./sqlService");
+    const signatures = new Map([["USER_DEFINED_TYPE|finance|overpaymentusedtype", "TYPE#0#table"]]);
+    sql.fetchTypeSignatureMap.mockResolvedValueOnce(signatures).mockResolvedValueOnce(new Map(signatures));
+    fetchObjectDefinitionMap.mockRejectedValueOnce(new Error("Module metadata unavailable"));
+    const view = { objectType: "VIEW", schemaName: "dbo", objectName: "ViewA" };
+    generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", [
+      { ...udt, scriptPath: "/out/type.sql" }, { ...view, scriptPath: "/out/view.sql" },
+    ]));
+    const result = await runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects: [udt, view], mode: "ExecuteDirectly", options: {}, task, logEvent,
+    });
+    expect(result.results.find((item) => item.objectType === "USER_DEFINED_TYPE")).toMatchObject({ status: "Skipped", action: "NoChange" });
+    expect(sql.executeSqlScriptsIndividually.mock.calls[0][1]).toHaveLength(1);
+    expect(sql.executeSqlScriptsIndividually.mock.calls[0][1][0].key).toBe("VIEW|dbo|viewa");
+  });
+
+  it("creates a UDT absent from the target when source metadata is available", async () => {
+    const sql = require("./sqlService");
+    sql.fetchTypeSignatureMap.mockResolvedValueOnce(new Map([["USER_DEFINED_TYPE|finance|overpaymentusedtype", "TYPE#0#table"]]))
+      .mockResolvedValueOnce(new Map());
+    generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", [{ ...udt, scriptPath: "/out/type.sql" }]));
+    const result = await runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects: [udt], mode: "ExecuteDirectly", options: {}, task, logEvent,
+    });
+    expect(result.results[0].status).toBe("Success");
+    expect(logEvent).toHaveBeenCalledWith("INFO", "User-defined type comparison completed", expect.objectContaining({ comparison: "MissingOnTarget" }));
+  });
+
+  it("DryRun writes every script for review and executes nothing", async () => {
+    const fs = require("fs");
+    generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", [
+      { objectType: "VIEW", schemaName: "dbo", objectName: "ViewA", scriptPath: "/out/dbo.ViewA.sql" },
+      { objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcA", scriptPath: "/out/dbo.ProcA.sql" },
+    ]));
+    generateTableDelta.mockResolvedValue({ scriptText: "ALTER TABLE dbo.T ADD C INT NULL;", outputPath: "/out/delta.sql" });
+
+    const result = await runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects: [
+        { objectType: "VIEW", schemaName: "dbo", objectName: "ViewA" },
+        { objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcA" },
+        { objectType: "TABLE", schemaName: "dbo", objectName: "T" },
+      ],
+      mode: "DryRun", options: {}, task, logEvent,
+    });
+
+    expect(result.dryRun).toBe(true);
+    expect(result.results.every((item) => item.status === "ScriptGenerated")).toBe(true);
+    expect(result.results.find((item) => item.objectType === "TABLE").scriptPath).toBe("/out/delta.sql");
+    expect(fs.writeFileSync).toHaveBeenCalledWith(expect.stringContaining("VIEW_dbo_ViewA.sql"), expect.any(String), "utf8");
+    const sql = require("./sqlService");
+    expect(sql.executeSqlScript).not.toHaveBeenCalled();
+    expect(sql.executeSqlScriptsIndividually).not.toHaveBeenCalled();
+    expect(sql.executeSql).not.toHaveBeenCalled();
+  });
+
+  it("reports guarded table migrations as ReviewRequired without executing the delta", async () => {
+    generateTableDelta.mockRejectedValueOnce(new Error("Table delta requires manual review; no table delta was executed."));
+    const progress = jest.fn();
+    const result = await runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects: [{ objectType: "TABLE", schemaName: "dbo", objectName: "Data" }], mode: "ExecuteDirectly", options: {}, task, logEvent, broadcastProgress: progress,
+    });
+    expect(result.results[0].status).toBe("ReviewRequired");
+    expect(progress).toHaveBeenCalledWith("deployProgress", expect.objectContaining({ status: "ReviewRequired" }));
+    expect(require("./sqlService").executeSqlScript).not.toHaveBeenCalled();
+  });
+
+  it("formats all fresh source objects and executes only supported modules", async () => {
+    generateScriptsForProfile.mockResolvedValue({
+      ...makeGeneratedInfo("/out", [
+        { objectType: "PROCEDURE", schemaName: "dbo", objectName: "GetUser", scriptPath: "/out/dbo.GetUser.sql" },
+        { objectType: "TABLE", schemaName: "dbo", objectName: "Data", scriptPath: "/out/dbo.Data.sql" },
+      ]),
+      formattingApplied: true,
+    });
+    const result = await runDeployment({ sourceProfile: srcProfile, destinationProfile: srcProfile,
+      selectedObjects: [{ objectType: "PROCEDURE", schemaName: "dbo", objectName: "GetUser" }, { objectType: "TABLE", schemaName: "dbo", objectName: "Data" }],
+      mode: "FormatAndExecuteSource", options: { confirmedSourceDatabase: srcProfile.databaseName }, task, logEvent,
+    });
+    expect(generateScriptsForProfile).toHaveBeenCalledWith(expect.objectContaining({ forceFormatting: true, appTaskMode: "deploy", selectedObjects: [
+      expect.objectContaining({ objectType: "TABLE" }),
+      expect.objectContaining({ objectType: "PROCEDURE" }),
+    ] }));
+    expect(require("./sqlService").executeSqlScript).toHaveBeenCalledWith(srcProfile, expect.stringContaining("PROCEDURE"), { atomic: true });
+    expect(generateTableDelta).not.toHaveBeenCalled();
+    expect(result.results.find((item) => item.objectType === "TABLE")).toMatchObject({
+      status: "Skipped", action: "NoStoredModuleText", scriptPath: "/out/dbo.Data.sql",
+    });
+    expect(result.results.find((item) => item.objectType === "PROCEDURE").status).toBe("Success");
+  });
+
+  it("refuses format-and-execute when target identity differs from the confirmed source", async () => {
+    await expect(runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects: [{ objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcA" }],
+      mode: "FormatAndExecuteSource", options: { confirmedSourceDatabase: srcProfile.databaseName }, task, logEvent,
+    })).rejects.toThrow("must target the confirmed source");
+    expect(generateScriptsForProfile).not.toHaveBeenCalled();
+  });
+
+  it("requires explicit source confirmation before format-and-execute connects or generates", async () => {
+    await expect(runDeployment({ sourceProfile: srcProfile, destinationProfile: srcProfile,
+      selectedObjects: [{ objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcA" }],
+      mode: "FormatAndExecuteSource", options: {}, task, logEvent,
+    })).rejects.toThrow("Confirm the source database");
+    expect(testConnection).not.toHaveBeenCalled();
+    expect(generateScriptsForProfile).not.toHaveBeenCalled();
+  });
+
+  it("rejects a changed confirmed plan before generating or executing scripts", async () => {
+    const selectedObjects = [{ objectType: "VIEW", schemaName: "dbo", objectName: "Current" }];
+    const confirmedPlanFingerprint = deploymentPlanFingerprint([
+      { objectType: "VIEW", schemaName: "dbo", objectName: "Previous" },
+    ], srcProfile, dstProfile, "ExecuteDirectly");
+    await expect(runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects, mode: "ExecuteDirectly", options: { confirmedPlanFingerprint }, task, logEvent,
+    })).rejects.toThrow("Review and confirm a fresh plan");
+    expect(generateScriptsForProfile).not.toHaveBeenCalled();
+    expect(require("./sqlService").executeSqlScript).not.toHaveBeenCalled();
+  });
+
+  it("binds confirmation to connection identity, mode, and dependency edges", () => {
+    const plan = [{ objectType: "VIEW", schemaName: "dbo", objectName: "Current" }];
+    const fingerprint = deploymentPlanFingerprint(plan, srcProfile, dstProfile, "ExecuteDirectly");
+    expect(deploymentPlanFingerprint(plan, srcProfile, { ...dstProfile, databaseName: "Other" }, "ExecuteDirectly")).not.toBe(fingerprint);
+    expect(deploymentPlanFingerprint(plan, srcProfile, dstProfile, "Rollback")).not.toBe(fingerprint);
+    expect(deploymentPlanFingerprint([{ ...plan[0], dependencies: ["dbo.New"] }], srcProfile, dstProfile, "ExecuteDirectly")).not.toBe(fingerprint);
+  });
+
+  it("places all external dependencies before a combined procedure group", () => {
+    const plan = buildDeploymentPlan([
+      { objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcA" },
+      { objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcB", dependencies: ["dbo.LateSynonym"] },
+      { objectType: "SYNONYM", schemaName: "dbo", objectName: "LateSynonym" },
+    ]);
+    expect(plan.map((item) => item.objectName)).toEqual(["LateSynonym", "ProcA", "ProcB"]);
+  });
+
+  it("rejects a dependency cycle introduced by mandatory grouping", () => {
+    expect(() => buildDeploymentPlan([
+      { objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcA" },
+      { objectType: "SYNONYM", schemaName: "dbo", objectName: "Bridge", dependencies: ["dbo.ProcA"] },
+      { objectType: "PROCEDURE", schemaName: "dbo", objectName: "ProcB", dependencies: ["dbo.Bridge"] },
+    ])).toThrow("cycle across combined deployment groups");
+  });
+
+  it("rejects distinct aliases that resolve to the same physical database", async () => {
+    testConnection.mockResolvedValueOnce({ serverName: "SQLHOST", databaseName: "ActualDb" })
+      .mockResolvedValueOnce({ serverName: "sqlhost", databaseName: "actualdb" });
+    await expect(runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects: [{ objectType: "VIEW", schemaName: "dbo", objectName: "ViewA" }],
+      mode: "ExecuteDirectly", options: {}, task, logEvent,
+    })).rejects.toThrow("resolve to the same database");
+    expect(generateScriptsForProfile).not.toHaveBeenCalled();
+  });
   beforeEach(() => {
     jest.clearAllMocks();
     const fs = require("fs");
@@ -133,8 +350,9 @@ describe("runDeployment", () => {
     expect(generateScriptsForProfile).toHaveBeenCalledWith(expect.objectContaining({ appTaskMode: "deploy" }));
   });
 
-  it("validates objects in Rollback mode without committing changes", async () => {
+  it.each([false, true])("reports rollback acknowledgement accurately when execution fails: %s", async (executionFails) => {
     const fs = require("fs");
+    if (executionFails) require("./sqlService").executeSql.mockRejectedValueOnce(new Error("Database outcome is uncertain"));
     generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", [
       { objectType: "PROCEDURE", schemaName: "dbo", objectName: "GetUser", scriptPath: "/out/dbo.GetUser.sql" },
     ]));
@@ -150,8 +368,8 @@ describe("runDeployment", () => {
       logEvent,
     });
 
-    expect(result.results[0].status).toBe("RolledBack");
-    expect(result.rollbackApplied).toBe(true);
+    expect(result.results[0].status).toBe(executionFails ? "Failed" : "RolledBack");
+    expect(result.rollbackApplied).toBe(!executionFails);
     // executeSql is called once with the rollback transaction wrapper
     expect(require("./sqlService").executeSql).toHaveBeenCalledTimes(1);
     const sqlArg = require("./sqlService").executeSql.mock.calls[0][1];
@@ -235,10 +453,10 @@ describe("runDeployment", () => {
     );
   });
 
-  it("marks object as Skipped when no generated script is found", async () => {
+  it("fails before execution when a fresh source script is missing", async () => {
     generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", []));
 
-    const result = await runDeployment({
+    await expect(runDeployment({
       sourceProfile: srcProfile,
       destinationProfile: dstProfile,
       selectedObjects: [{ objectType: "VIEW", schemaName: "dbo", objectName: "Missing" }],
@@ -247,9 +465,25 @@ describe("runDeployment", () => {
       options: { engine: "Legacy" },
       task,
       logEvent,
-    });
+    })).rejects.toThrow("no fresh source script was generated");
+    expect(require("./sqlService").executeSqlScript).not.toHaveBeenCalled();
+    expect(require("./sqlService").executeSqlScriptsIndividually).not.toHaveBeenCalled();
+  });
 
-    expect(result.results[0].status).toBe("Skipped");
+  it.each(["ExecuteDirectly", "Rollback"])("requires the fresh combined procedure artifact before any execution in %s", async (mode) => {
+    generateScriptsForProfile.mockResolvedValue({
+      ...makeGeneratedInfo("/out", [
+        { objectType: "PROCEDURE", schemaName: "dbo", objectName: "GetUser", scriptPath: "/out/dbo.GetUser.sql" },
+      ]),
+      combinedStoredProceduresPath: null,
+    });
+    await expect(runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects: [{ objectType: "PROCEDURE", schemaName: "dbo", objectName: "GetUser" }],
+      mode, options: {}, task, logEvent,
+    })).rejects.toThrow("nonempty combined stored procedure");
+    expect(require("./sqlService").executeSql).not.toHaveBeenCalled();
+    expect(require("./sqlService").executeSqlScript).not.toHaveBeenCalled();
+    expect(require("./sqlService").executeSqlScriptsIndividually).not.toHaveBeenCalled();
   });
 
   it("matches generated scripts case-insensitively when PowerShell emits different filename casing", async () => {
@@ -446,14 +680,14 @@ describe("runDeployment", () => {
     }));
   });
 
-  it("uses legacy object-type deployment behavior even when DacFx engine is selected", async () => {
+  it("rejects unsupported DacFx deployment before generating or executing SQL", async () => {
     const fs = require("fs");
     fs.readFileSync.mockImplementation(() => "CREATE VIEW dbo.ViewA AS SELECT 1");
     generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", [
       { objectType: "VIEW", schemaName: "dbo", objectName: "ViewA", scriptPath: "/out/dbo.ViewA.sql" },
     ]));
 
-    const result = await runDeployment({
+    await expect(runDeployment({
       sourceProfile: srcProfile,
       destinationProfile: dstProfile,
       selectedObjects: [{ objectType: "VIEW", schemaName: "dbo", objectName: "ViewA" }],
@@ -462,18 +696,21 @@ describe("runDeployment", () => {
       options: { engine: "DacFx" },
       task,
       logEvent,
-    });
+    })).rejects.toThrow("DacFx deployment is not supported");
 
     expect(compareGeneratedArtifacts).not.toHaveBeenCalled();
     expect(deployGeneratedArtifacts).not.toHaveBeenCalled();
-    expect(require("./sqlService").executeSqlScriptsIndividually).toHaveBeenCalledTimes(1);
-    expect(result.results[0].status).toBe("Success");
-    expect(result.results[0].action).toBe("DropAndCreate");
-    expect(result.generationWarnings).toEqual([]);
-    expect(result.dacfxValidation).toEqual({ enabled: false });
-    expect(result.engine).toBe("Legacy");
-    expect(result.deployScriptPath).toBeNull();
+    expect(require("./sqlService").executeSqlScriptsIndividually).not.toHaveBeenCalled();
+    expect(generateScriptsForProfile).not.toHaveBeenCalled();
     expect(generateTableDelta).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "", "GenerateScriptOnly", "rollback", "invalid"])("rejects invalid mode %s before execution", async (mode) => {
+    await expect(runDeployment({ sourceProfile: srcProfile, destinationProfile: dstProfile,
+      selectedObjects: [{ objectType: "VIEW", schemaName: "dbo", objectName: "ViewA" }],
+      mode, options: {}, task, logEvent,
+    })).rejects.toThrow("Invalid deployment mode");
+    expect(generateScriptsForProfile).not.toHaveBeenCalled();
   });
 
   it("builds a legacy execution plan even when DacFx engine is selected", () => {
@@ -490,13 +727,8 @@ describe("runDeployment", () => {
   it("marks unchanged alias-type direct deploy artifacts as no-op skips", async () => {
     const fs = require("fs");
     fs.readFileSync.mockImplementation(() => "CREATE TYPE [dbo].[AliasA] FROM [nvarchar](20) NOT NULL");
-    fetchObjectDefinitionMap
-      .mockResolvedValueOnce(new Map([
-        ["USER_DEFINED_TYPE|dbo|AliasA", { objectType: "USER_DEFINED_TYPE", schemaName: "dbo", objectName: "AliasA", definition: "AliasA based on nvarchar" }],
-      ]))
-      .mockResolvedValueOnce(new Map([
-        ["USER_DEFINED_TYPE|dbo|AliasA", { objectType: "USER_DEFINED_TYPE", schemaName: "dbo", objectName: "AliasA", definition: "AliasA based on nvarchar" }],
-      ]));
+    const signature = new Map([["USER_DEFINED_TYPE|dbo|aliasa", "TYPE#0#nvarchar:40:0:0:Latin1_General_CI_AS:0:0"]]);
+    require("./sqlService").fetchTypeSignatureMap.mockResolvedValueOnce(signature).mockResolvedValueOnce(new Map(signature));
     generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", [
       { objectType: "USER_DEFINED_TYPE", schemaName: "dbo", objectName: "AliasA", scriptPath: "/out/dbo.AliasA.sql" },
     ]));
@@ -636,26 +868,14 @@ describe("runDeployment", () => {
     }));
   });
 
-  it("dependency ordering: UDTs before tables before procedures", async () => {
-    generateScriptsForProfile.mockResolvedValue(makeGeneratedInfo("/out", []));
-    generateTableDelta.mockResolvedValue({ scriptText: "", outputPath: "/out/delta.sql" });
-
-    const result = await runDeployment({
-      sourceProfile: srcProfile,
-      destinationProfile: dstProfile,
-      selectedObjects: [
+  it("dependency ordering: UDTs before tables before procedures", () => {
+    const plan = buildDeploymentPlan([
         { objectType: "PROCEDURE", schemaName: "dbo", objectName: "P1" },
         { objectType: "TABLE", schemaName: "dbo", objectName: "T1" },
         { objectType: "USER_DEFINED_TYPE", schemaName: "dbo", objectName: "U1" },
-      ],
-      mode: "ExecuteDirectly",
-      continueOnError: false,
-      options: { engine: "Legacy" },
-      task,
-      logEvent,
-    });
+    ]);
 
-    const planTypes = result.plan.map((x) => x.objectType);
+    const planTypes = plan.map((item) => item.objectType);
     expect(planTypes[0]).toBe("USER_DEFINED_TYPE");
     expect(planTypes[1]).toBe("TABLE");
     expect(planTypes[2]).toBe("PROCEDURE");
@@ -693,5 +913,48 @@ describe("runDeployment", () => {
     ], logEvent);
 
     expect(plan.map((item) => item.objectName)).toEqual(["ViewBase", "ViewConsumer"]);
+  });
+
+  it("uses live dependencies ahead of type priorities and ignores legacy order settings", async () => {
+    const settings = require("./settingsService").getSettings;
+    settings.mockImplementationOnce(() => { throw new Error("Legacy order must not be read"); });
+    fetchObjectDependencyEdges.mockResolvedValueOnce([{
+      objectType: "TABLE", schemaName: "dbo", objectName: "Data",
+      dependencyObjectType: "FUNCTION", dependencySchemaName: "dbo", dependencyObjectName: "Compute",
+    }]);
+    const plan = await buildDerivedDeploymentPlan(srcProfile, [
+      { objectType: "TABLE", schemaName: "dbo", objectName: "Data" },
+      { objectType: "FUNCTION", schemaName: "dbo", objectName: "Compute" },
+    ]);
+    expect(plan.map((item) => item.objectName)).toEqual(["Compute", "Data"]);
+    expect(settings).not.toHaveBeenCalled();
+    settings.mockReset();
+  });
+
+  it("stops planning when dependency metadata cannot be read", async () => {
+    fetchObjectDependencyEdges.mockRejectedValueOnce(new Error("Permission denied"));
+    await expect(buildDerivedDeploymentPlan(srcProfile, [
+      { objectType: "VIEW", schemaName: "dbo", objectName: "Base" },
+      { objectType: "VIEW", schemaName: "dbo", objectName: "Consumer" },
+    ])).rejects.toThrow("Unable to determine deployment dependencies: Permission denied");
+    expect(generateScriptsForProfile).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes a type from an object with the same schema and name", () => {
+    const plan = buildDeploymentPlan([
+      { objectType: "TABLE", schemaName: "dbo", objectName: "Shared", dependencies: [
+        { objectType: "USER_DEFINED_TYPE", schemaName: "dbo", objectName: "Shared" },
+      ] },
+      { objectType: "USER_DEFINED_TYPE", schemaName: "dbo", objectName: "Shared" },
+    ]);
+    expect(plan.map((item) => item.objectType)).toEqual(["USER_DEFINED_TYPE", "TABLE"]);
+  });
+
+  it("does not merge stale client dependencies into the live graph", async () => {
+    const plan = await buildDerivedDeploymentPlan(srcProfile, [
+      { objectType: "VIEW", schemaName: "dbo", objectName: "Base", dependencies: ["dbo.Consumer"] },
+      { objectType: "VIEW", schemaName: "dbo", objectName: "Consumer", dependencies: ["dbo.Base"] },
+    ]);
+    expect(plan.map((item) => item.objectName)).toEqual(["Base", "Consumer"]);
   });
 });

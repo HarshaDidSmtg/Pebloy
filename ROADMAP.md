@@ -2,35 +2,51 @@
 
 Tracked improvements and planned features. Items are grouped by scope; there are no committed release targets.
 
+## Review Follow-Up
+
+Implemented locally: mode isolation; fresh/literal-sensitive diffs; combined
+procedure and table execution guards; SQL-aware batch handling; bounded workers;
+credential transport and rotation; local API/IPC protection; atomic writes and log
+checkpoints; paginated selection; reconnect progress; dirty-editor protection;
+Windows CI and unpacked-app smoke tests. See [the changelog](CHANGELOG.md) and
+[security notes](SECURITY.md) for the changed contracts.
+
+The follow-up implementation restores Format & Execute as a confirmed source
+action available only from Backup, adds dynamic deployment order and required plan
+confirmation, OS-managed runtime ownership, preference recovery,
+PID-reuse-safe Interrupted detection, task-registry shutdown draining, signer
+certificate pinning, and distinct ReviewRequired migration results. Offline tests
+cover these paths. SQL fixtures now include row retention and injected-failure
+rollback checks, but those live cases have not been executed.
+
+The remaining gates need an authorized environment or a database-owner decision:
+
+1. **Live execution (on hold):** authorize two disposable `_PebloyTest` databases and run the guarded suite, including source formatting and failure injection. Shared DEV/INT databases must not be seeded.
+2. **Release installation (on hold):** provision signing outside chat and verify an actual signed installer/update. Updates pin the current app's certificate; certificate changes require a separately verified manual upgrade. Remote CI still needs a published branch and an authorized workflow run.
+3. **Interrupted SQL reconciliation:** addressed as far as it can be without live validation. Deploy now has a **Dry Run** mode that writes every script without executing, and an interrupted, failed, or review-required task offers a read-only **Verify Target** check comparing the target's current module definitions against the source. Force-cancellation and automatic retries remain unavailable: neither this check nor the runtime locks can prove whether an aborted transaction committed, and only a live disposable environment can establish that.
+4. **Metadata migrations:** guarded refusals are no longer dead ends. **Generate migration script** captures the target's permissions, ownership, signatures, sequence current value, and dependent objects into a reviewable scaffold under `artifacts/exports/migration-prep`. Pebloy never executes that scaffold and still refuses to drop protected objects; authoring and running the migration stays a deliberate human decision.
+
 ---
 
 ## Near-Term Improvements
 
-### Settings
-
-- **Configurable query and script timeouts** — `SQL_QUERY_TIMEOUT_MS` (120 s) and `POWERSHELL_TIMEOUT_MS` (180 s) are currently hardcoded constants in `src/services/sqlService.js`. Expose them as fields in the Settings tab and persist to `data/settings.json` so long-running scripts on slow servers don't time out silently.
-
-- **Deployment order drag-to-reorder** — the object-type execution order in Settings is persisted but can only be changed by editing. Add drag-and-drop reordering for the deployment order list.
-
 ### Connections
 
-- **Connection profile grouping** — when many profiles exist (DEV/QA/UAT/PROD sets for multiple projects) the flat list becomes hard to scan. Add an optional Group field to profiles and group rows by it in the Connections table.
+- **Connection profile grouping: implemented locally.** Optional Group values organize connection rows and native dropdowns and survive import/export.
 
-- **SQL Server module install helper** — the Connections tab could check whether the `SqlServer` PS module is present and offer a one-click Install-Module button when it is missing, instead of leaving users to discover this only after a failed operation.
+- **SQL Server module helper: implemented locally.** Read-only pinned-module status and explicit installation for source runs; packaged missing resources require installation repair.
 
 ### Object Discovery
 
-- **Schema filter memory** — the type/schema filters in Discover mode reset on every visit. Persist the last-used filter values in app state.
-
-- **Discover pagination page-size control** — currently fixed at 50 per page. Let users pick 25/50/100.
+- **Discover page size: implemented locally.** Persisted 25/50/100 choices preserve selection.
 
 ### Build
 
-- **prebuild-win.js download fallback** — `scripts/prebuild-win.js` can only extract an already-cached winCodeSign archive; it skips silently if none is present, leaving the symlink error to surface at build time. Extend it to download the archive itself (same URL electron-builder uses) so `npm run build` always succeeds on a clean machine without Developer Mode.
+- **Clean-runner validation** — the current builder prepares missing icons, pinned SMO, and self-contained DacFx resources. Run the optional Windows package-smoke CI job on a clean hosted runner; local cached-tool success is not proof of first-run provisioning. The old prebuild workaround is no longer invoked.
 
 ### Logging
 
-- **Log retention cap** — `loggingService` trims individual `.log` files at 2 MB but does not cap the total number of task logs. Add an optional auto-delete policy (e.g. keep last N tasks) configurable in Settings.
+- **Log retention: implemented locally.** Configurable archive-age previews require explicit confirmation, expire, and reject changed file lists. No automatic deletion occurs. Text-log trimming preserves selected objects; JSON retains complete events.
 
 ---
 
@@ -38,24 +54,29 @@ Tracked improvements and planned features. Items are grouped by scope; there are
 
 ### Folder-as-Source Workflows
 
-All Backup, Diff, and Deploy modes currently require live database profiles. A folder-as-source mode would let users point the diff or deploy at a directory of previously generated SQL scripts instead of a live DB — useful for offline review, auditing historical backups, or integrating with a source-controlled scripts folder.
+Implemented locally through explicit SQL Folder selection, fresh ScriptDom inspection, source-preserving copies, content fingerprints, and the existing guarded deployment path. Offline tables can be compared but cannot be deployed; mandatory table deltas still require two live databases. Folder module SET metadata defaults to ON unless supplied in the file.
 
 ### SQL Parser / Build Validation (DacFx)
 
-Current canonical-source validation is pattern-based (prefix checks, keyword scans). Compiler-grade validation using `sqlproj` / DacFx would catch syntax errors, unresolved references, and compatibility issues before execution. This requires a .NET toolchain dependency; the backend remains PowerShell-first.
+The .NET 8 DacFx worker now provides offline compiler validation and optional
+comparison. Expand reference/compatibility coverage as needed; deployment remains
+PowerShell-first and explicitly rejects the DacFx execution engine.
 
 ### Check for Updates — Release Publishing
 
-The updater IPC flow is implemented and covered by service tests for release checks, installer asset selection, download progress, `shell.openPath`, and app quit scheduling. A real user-facing update still requires publishing a semantic-versioned GitHub release with a non-portable Setup `.exe` asset, for example `Pebloy-Setup.exe`.
+The updater flow is covered by service tests, including trusted URLs, hashes, and
+signature refusal. A real update requires a semantic-versioned GitHub release with
+a signed non-portable Setup `.exe`, a GitHub SHA-256 asset digest, and validation of
+the actual install flow. Nothing in the validation workflow publishes a release.
 
 ### Diff Export Improvements
 
-- Export currently supports Markdown, HTML, and JSON. Add a side-by-side **HTML with syntax highlighting** option that can be opened standalone in a browser.
-- Add a **"copy diff to clipboard"** shortcut for quick pasting into PR descriptions or Jira tickets.
+- Implemented locally: Markdown, HTML, JSON, and standalone syntax-highlighted HTML.
+- Implemented locally: Markdown clipboard copying and Ctrl+Shift+C from Code Diff without regenerating the report.
 
 ### Deploy — Dry-Run Report
 
-Deploy plan preview exists (`/api/deploy/plan`), but the plan only shows execution order and object list. Add a dry-run report that generates all scripts (including table delta) without executing, and writes them to `artifacts/scripts/` so they can be reviewed in SSMS before committing.
+Implemented as the **Dry Run** execution mode: it generates every deployment script, including the table delta, writes them to the run's `Deployment Scripts` folder for SSMS review, and executes nothing.
 
 ---
 
@@ -63,19 +84,22 @@ Deploy plan preview exists (`/api/deploy/plan`), but the plan only shows executi
 
 ### Multi-Database Batch Operations
 
-Run Backup or Deploy across multiple destination profiles in one task (e.g. deploy to QA and UAT simultaneously). Requires per-destination result aggregation and per-destination log artifacts.
+Multi-database deployment is implemented locally: up to 20 distinct resolved targets, sequential execution, combined reviewed plans, per-target logs/results/output roots, and explicit stop/continue policies. No cross-database transaction is claimed.
 
 ### Scheduled Deployments
 
-Allow a deploy task to be saved as a scheduled job (Windows Task Scheduler via `schtasks`), with a saved object list and destination profile. Useful for repeating nightly sync jobs.
+Implemented locally: reviewed once/daily/weekly jobs, app-open execution, optional Windows Task Scheduler wake-up through the ScheduledTasks API, no embedded credentials, no overlap/backlog replay, and reapproval after changed plans or uncertain outcomes. Windows wake-up requires a signed-in user. Native registration is covered with mocked process tests; actual registration and live SQL execution remain user-confirmed operations.
 
 ### Dark Mode Auto-Detection
 
-Respect `prefers-color-scheme` when no theme has been explicitly saved, defaulting to Light or Dark without requiring a manual Settings change on first launch.
+Implemented locally: first-launch `prefers-color-scheme` following and an explicit Follow system checkbox. Existing named themes remain preserved.
 
 ### Integration Test Database
 
-The integration test suite in `src/services/integration.test.js` skips entirely when no DEV and INT profiles are found in `data/profiles.json`. Provide a documented test-database setup script (create lightweight SQL Server Express instance with sample objects) so the integration suite can run in CI.
+The integration suite is opt-in and requires two distinct databases ending in
+`_PebloyTest`, with configured/resolved identity checks and tracked guarded fixtures.
+CI deliberately disables it. Provision dedicated disposable SQL infrastructure and
+separate credentials before enabling live database execution in automation.
 
 ---
 
@@ -85,6 +109,6 @@ The integration test suite in `src/services/integration.test.js` skips entirely 
 | ---- | ---------- |
 | Platform | Windows only — DPAPI and PowerShell SMO are Windows-specific. No Linux/macOS support planned. |
 | SQL Server | Tested against SQL Server 2016–2022. Azure SQL and SQL Managed Instance may work but are not validated. |
-| Tables | Delta script generation requires both source and destination to be accessible simultaneously. Offline table diff is not supported. |
-| Symlink extraction | `npm run build` requires winCodeSign pre-extraction on Windows without Developer Mode. `scripts/prebuild-win.js` handles this if the archive is already cached; a fresh machine still needs one failed build attempt to populate the cache. |
+| Tables | Delta generation requires both databases live. Folder scripts support textual table comparison, not offline table deployment. |
+| Release packaging | Unpacked Windows builds and native file smoke tests pass locally. A clean hosted run and an actual signed-installer/update test remain release gates. |
 | Exact definitions | Some object types (synonyms, sequences, UDTs) do not have exact-definition metadata and fall back to SMO-generated scripts, which may differ slightly in whitespace or casing from the original DDL. |

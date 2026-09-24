@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
-const { executeSql, executeSqlScript, executeSqlScriptsIndividually, fetchObjectDefinitionMap, fetchObjectDependencyEdges } = require("./sqlService");
+const { createHash } = require("crypto");
+const { executeSql, executeSqlScript, executeSqlScriptsIndividually, fetchObjectDefinitionMap, fetchTypeSignatureMap, fetchObjectDependencyEdges, testConnection } = require("./sqlService");
 const { writeScriptArtifact } = require("./loggingService");
 const { writeSqlFileSync } = require("./sqlFileEncoding");
 const {
@@ -19,6 +20,9 @@ const {
 } = require("./scriptAutomationService");
 const { generateScriptsForProfile } = require("./scriptGenerationService");
 const { EXPORTS_DIR } = require("./paths");
+const { splitSqlBatches } = require("./sqlBatchService");
+const FORMAT_EXECUTABLE_TYPES = new Set(["PROCEDURE", "VIEW", "FUNCTION", "TRIGGER"]);
+const { requiresManualReview } = require("./errorService");
 
 function toWindowsLineEndings(text) {
   return String(text || "").replace(/\r?\n/g, "\r\n");
@@ -31,18 +35,13 @@ function normalizeLookupName(value) {
 function normalizeDefinitionForCompare(value) {
   return String(value || "")
     .replace(/\r\n/g, "\n")
-    .replace(/[ \t]+/g, " ")
     .trim();
 }
 
 function buildTypeOrder() {
-  const settings = getSettings();
-  const order = settings.deploymentOrder || [];
-  const result = {};
-  order.forEach((type, index) => {
-    result[String(type).toUpperCase()] = index + 1;
-  });
-  return result;
+  return Object.fromEntries([
+    "USER_DEFINED_TYPE", "SEQUENCE", "TABLE", "VIEW", "FUNCTION", "PROCEDURE", "SYNONYM", "TRIGGER",
+  ].map((type, index) => [type, index + 1]));
 }
 
 function normalizeSelection(items = []) {
@@ -86,6 +85,7 @@ function getDependencyNames(item) {
       if (!dependency || typeof dependency !== "object") return "";
       const schemaName = dependency.schemaName || dependency.schema || "";
       const objectName = dependency.objectName || dependency.name || "";
+      if (dependency.objectType) return normalizeLookupName(keyOf({ ...dependency, schemaName, objectName }));
       return normalizeLookupName(`${schemaName}.${objectName}`);
     })
     .filter(Boolean);
@@ -123,7 +123,7 @@ function sortedByDependency(items) {
   });
 
   const indexed = baseOrdered.map((item) => ({ item, key: keyOf(item) }));
-  const byKey = new Map(indexed.map((entry) => [entry.key, entry]));
+  const byKey = new Map(indexed.map((entry) => [normalizeLookupName(entry.key), entry]));
   const byName = new Map(indexed.map((entry) => [normalizeLookupName(`${entry.item.schemaName}.${entry.item.objectName}`), entry]));
   const visited = new Set();
   const visiting = new Set();
@@ -149,14 +149,27 @@ function sortedByDependency(items) {
 }
 
 async function deriveSelectionDependencies(sourceProfile, selectedObjects, logEvent = () => {}) {
-  const unique = dedupeSelection(selectedObjects);
+  const unique = dedupeSelection(selectedObjects).map((item) => {
+    if (!sourceProfile) return item;
+    const { dependencies, ...selection } = item;
+    return selection;
+  });
+  if (sourceProfile?.kind === "Folder") {
+    if (unique.some((item) => item.objectType === "TABLE")) throw new Error("Folder-source table deployment is not supported. Use a live source database for data-preserving table deltas.");
+    const scripts = require("./folderSourceService").selectFolderScripts(sourceProfile, unique);
+    return scripts.map((script) => ({ objectType: script.objectType, schemaName: script.schemaName, objectName: script.objectName,
+      dependencies: (script.dependencies || []).flatMap((dependency) => unique.filter((candidate) =>
+        normalizeLookupName(candidate.schemaName) === normalizeLookupName(dependency.schemaName) &&
+        normalizeLookupName(candidate.objectName) === normalizeLookupName(dependency.objectName) && keyOf(candidate) !== keyOf(script))) }));
+  }
   if (!sourceProfile || unique.length < 2) {
     return unique;
   }
 
   try {
     const edges = await fetchObjectDependencyEdges(sourceProfile, unique);
-    if (!Array.isArray(edges) || !edges.length) {
+    if (!Array.isArray(edges)) throw new Error("Dependency metadata returned an invalid response.");
+    if (!edges.length) {
       return unique;
     }
 
@@ -190,16 +203,48 @@ async function deriveSelectionDependencies(sourceProfile, selectedObjects, logEv
       return derived.length ? { ...item, dependencies: [...existing, ...derived] } : item;
     });
   } catch (error) {
-    logEvent("WARN", "Unable to derive deployment order from SQL dependency metadata; using configured fallback order.", {
+    logEvent("ERROR", "Unable to derive deployment order from SQL dependency metadata; deployment planning stopped.", {
       errorMessage: error.message,
     });
-    return unique;
+    throw new Error(`Unable to determine deployment dependencies: ${error.message}`);
   }
 }
 
 async function buildDependencyOrderedSelection(sourceProfile, selectedObjects, logEvent = () => {}) {
   const enriched = await deriveSelectionDependencies(sourceProfile, selectedObjects, logEvent);
-  return sortedByDependency(enriched);
+  return orderExecutionGroups(enriched);
+}
+
+function orderExecutionGroups(items) {
+  const ordered = sortedByDependency(items);
+  const groups = new Map();
+  const groupByName = new Map();
+  for (const item of ordered) {
+    const groupKey = ["TABLE", "PROCEDURE"].includes(item.objectType) ? item.objectType : keyOf(item);
+    if (!groups.has(groupKey)) groups.set(groupKey, []);
+    groups.get(groupKey).push(item);
+    groupByName.set(normalizeLookupName(`${item.schemaName}.${item.objectName}`), groupKey);
+    groupByName.set(normalizeLookupName(keyOf(item)), groupKey);
+  }
+  const visited = new Set();
+  const visiting = new Set();
+  const result = [];
+  function visit(groupKey) {
+    if (visited.has(groupKey)) return;
+    if (visiting.has(groupKey)) throw new Error("Selected dependencies form a cycle across combined deployment groups. Review the selection before deploying.");
+    visiting.add(groupKey);
+    for (const item of groups.get(groupKey)) {
+      for (const dependencyName of getDependencyNames(item)) {
+        const dependencyGroup = groupByName.get(dependencyName);
+        if (dependencyGroup && dependencyGroup !== groupKey) visit(dependencyGroup);
+      }
+    }
+    visiting.delete(groupKey);
+    visited.add(groupKey);
+    result.push(...groups.get(groupKey));
+  }
+  for (const groupKey of groups.keys()) visit(groupKey);
+  return result;
 }
 
 function keyOf(item) {
@@ -207,7 +252,7 @@ function keyOf(item) {
 }
 
 async function executeSqlBatches(profile, sqlText) {
-  await executeSqlScript(profile, sqlText);
+  await executeSqlScript(profile, sqlText, { atomic: true });
 }
 
 function escapeSqlString(str) {
@@ -215,20 +260,14 @@ function escapeSqlString(str) {
 }
 
 function buildRollbackSql(batches) {
-  // Wraps each batch in EXEC() inside a transaction that ALWAYS rolls back.
-  // XACT_ABORT OFF so individual EXEC() errors don't abort the whole batch —
-  // we let PS/Node surface them as warnings, then rollback unconditionally.
   const execLines = batches
-    .map((b) => `EXEC('${escapeSqlString(b)}');`)
+    .map((batch) => `EXEC(N'${escapeSqlString(batch)}');`)
     .join("\n");
-  return `SET XACT_ABORT OFF;\nBEGIN TRANSACTION;\n${execLines}\nROLLBACK TRANSACTION;`;
+  return `SET XACT_ABORT ON;\nBEGIN TRY\nBEGIN TRANSACTION;\n${execLines}\nROLLBACK TRANSACTION;\nEND TRY\nBEGIN CATCH\nIF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\nTHROW;\nEND CATCH;`;
 }
 
 function splitBatches(sqlText) {
-  return String(sqlText || "")
-    .split(/^\s*GO\s*$/gim)
-    .map((part) => part.trim())
-    .filter(Boolean);
+  return splitSqlBatches(sqlText);
 }
 
 function writeDeploymentSql(outputDir, fileName, sqlText) {
@@ -322,19 +361,30 @@ function broadcastProcedureResults({
 
 function buildDeploymentPlan(selectedObjects) {
   const unique = dedupeSelection(selectedObjects);
-  const ordered = sortedByDependency(unique);
+  const ordered = orderExecutionGroups(unique);
   return ordered.map((item) => ({
     ...item,
     action: getActionForObjectType(item.objectType),
   }));
 }
 
-async function buildDerivedDeploymentPlan(sourceProfile, selectedObjects, logEvent = () => {}) {
+async function buildDerivedDeploymentPlan(sourceProfile, selectedObjects, logEvent = () => {}, mode = "ExecuteDirectly") {
+  if (sourceProfile?.kind === "Folder" && mode === "FormatAndExecuteSource") throw new Error("Format & Execute in Source requires a live database.");
   const ordered = await buildDependencyOrderedSelection(sourceProfile, selectedObjects, logEvent);
   return ordered.map((item) => ({
     ...item,
-    action: getActionForObjectType(item.objectType),
+    action: mode === "FormatAndExecuteSource" && !FORMAT_EXECUTABLE_TYPES.has(item.objectType)
+      ? "NoStoredModuleText" : getActionForObjectType(item.objectType),
   }));
+}
+
+function deploymentPlanFingerprint(plan, sourceProfile, destinationProfile, mode) {
+  const profileIdentity = (profile) => [profile?.id, profile?.profileLabel, profile?.serverName,
+    profile?.databaseName, profile?.authenticationType, profile?.username, profile?.environmentTag, profile?.folderFingerprint];
+  return createHash("sha256").update(JSON.stringify({
+    source: profileIdentity(sourceProfile), target: profileIdentity(destinationProfile), mode,
+    objects: plan.map((item) => [keyOf(item), [...new Set(getDependencyNames(item))].sort()]),
+  })).digest("hex");
 }
 
 function buildDefinitionLookup(definitions) {
@@ -351,6 +401,7 @@ function buildDefinitionLookup(definitions) {
 }
 
 async function findUnchangedDirectExecutionKeys({ sourceProfile, destinationProfile, selectedObjects, logEvent }) {
+  if (sourceProfile?.kind === "Folder") return new Set();
   const comparableObjects = (selectedObjects || []).filter(
     (item) => !["TABLE", "PROCEDURE"].includes(String(item.objectType || "").toUpperCase())
   );
@@ -358,16 +409,46 @@ async function findUnchangedDirectExecutionKeys({ sourceProfile, destinationProf
     return new Set();
   }
 
+  const unchangedKeys = new Set();
+  const typeObjects = comparableObjects.filter((item) => item.objectType === "USER_DEFINED_TYPE");
+  if (typeObjects.length) {
+    try {
+      const [sourceTypes, destinationTypes] = await Promise.all([
+        fetchTypeSignatureMap(sourceProfile, typeObjects),
+        fetchTypeSignatureMap(destinationProfile, typeObjects),
+      ]);
+      for (const item of typeObjects) {
+        const itemKey = keyOf(item);
+        const sourceSignature = sourceTypes.get(itemKey);
+        const destinationSignature = destinationTypes.get(itemKey);
+        if (!sourceSignature) throw new Error(`Source type metadata is missing for ${item.schemaName}.${item.objectName}.`);
+        const unchanged = sourceSignature === destinationSignature;
+        if (unchanged) unchangedKeys.add(itemKey);
+        logEvent("INFO", "User-defined type comparison completed", {
+          objectType: item.objectType, schemaName: item.schemaName, objectName: item.objectName,
+          comparison: unchanged ? "Identical" : destinationSignature ? "Changed" : "MissingOnTarget",
+        });
+      }
+    } catch (error) {
+      logEvent("ERROR", "User-defined type comparison failed; deployment stopped before SQL execution.", {
+        errorMessage: error.message,
+      });
+      throw new Error(`User-defined type comparison failed; no deployment SQL was executed. ${error.message}`);
+    }
+  }
+
+  const definitionObjects = comparableObjects.filter((item) => item.objectType !== "USER_DEFINED_TYPE");
+  if (!definitionObjects.length) return unchangedKeys;
+
   try {
     const [sourceDefinitions, destinationDefinitions] = await Promise.all([
-      fetchObjectDefinitionMap(sourceProfile, comparableObjects),
-      fetchObjectDefinitionMap(destinationProfile, comparableObjects),
+      fetchObjectDefinitionMap(sourceProfile, definitionObjects),
+      fetchObjectDefinitionMap(destinationProfile, definitionObjects),
     ]);
     const sourceLookup = buildDefinitionLookup(sourceDefinitions);
     const destinationLookup = buildDefinitionLookup(destinationDefinitions);
-    const unchangedKeys = new Set();
 
-    for (const item of comparableObjects) {
+    for (const item of definitionObjects) {
       const itemKey = keyOf(item);
       const sourceDefinition = sourceLookup.get(itemKey);
       const destinationDefinition = destinationLookup.get(itemKey);
@@ -382,10 +463,10 @@ async function findUnchangedDirectExecutionKeys({ sourceProfile, destinationProf
 
     return unchangedKeys;
   } catch (error) {
-    logEvent("WARN", "Unable to pre-compare direct deploy objects; continuing with generated scripts.", {
+    logEvent("WARN", "Unable to pre-compare non-type deploy objects; continuing with generated scripts for those objects.", {
       errorMessage: error.message,
     });
-    return new Set();
+    return unchangedKeys;
   }
 }
 
@@ -596,7 +677,7 @@ async function runDacFxDeployment({
   };
 }
 
-async function runDeployment({
+async function executeDeployment({
   sourceProfile,
   destinationProfile,
   selectedObjects,
@@ -607,15 +688,44 @@ async function runDeployment({
   logEvent,
   broadcastProgress = () => {},
 }) {
-  const requestedEngine = normalizeEngine(options?.engine || "Legacy");
-  if (isDacFxEngine(requestedEngine)) {
-    logEvent("INFO", "Deploy execution is using the legacy object-type contract instead of DacFx apply.", {
-      requestedEngine,
-      mode,
-    });
+  if (!["ExecuteDirectly", "Rollback", "FormatAndExecuteSource", "DryRun"].includes(mode)) {
+    throw new Error("Invalid deployment mode. Choose ExecuteDirectly, Rollback, FormatAndExecuteSource, or DryRun.");
+  }
+  const formatInSource = mode === "FormatAndExecuteSource";
+  if (formatInSource && options?.confirmedSourceDatabase !== sourceProfile?.databaseName) {
+    throw new Error("Confirm the source database before formatting and executing its modules.");
+  }
+  if (options?.engine && options.engine !== "Legacy") {
+    throw new Error("DacFx deployment is not supported. Choose Legacy; DacFx remains available for comparison and validation.");
+  }
+  if (!Array.isArray(selectedObjects) || !selectedObjects.length) {
+    throw new Error("Select at least one object before deploying.");
+  }
+  const folderSource = sourceProfile?.kind === "Folder";
+  if (folderSource && (formatInSource || selectedObjects.some((item) => item.objectType === "TABLE"))) throw new Error("Folder deployment supports non-table objects only; source execution and table deltas require a live database.");
+  const identities = await Promise.all([folderSource ? Promise.resolve(sourceProfile) : testConnection(sourceProfile), testConnection(destinationProfile)]);
+  if (identities.some((identity) => !identity?.serverName || !identity?.databaseName)) {
+    throw new Error("Could not verify source and target database identity. Deployment was not started.");
+  }
+  for (const [expected, actual] of [[options?.confirmedSourceIdentity, identities[0]], [options?.confirmedTargetIdentity, identities[1]]]) {
+    if (expected && (normalizeLookupName(expected.serverName) !== normalizeLookupName(actual.serverName) || normalizeLookupName(expected.databaseName) !== normalizeLookupName(actual.databaseName))) {
+      throw new Error("A database identity changed after confirmation. Review a fresh deployment plan.");
+    }
+  }
+  const sameDatabase = normalizeLookupName(identities[0].serverName) === normalizeLookupName(identities[1].serverName) &&
+    normalizeLookupName(identities[0].databaseName) === normalizeLookupName(identities[1].databaseName);
+  if (formatInSource && !sameDatabase) {
+    throw new Error("Format & Execute must target the confirmed source database.");
+  }
+  if (!formatInSource && sameDatabase) {
+    throw new Error("Source and target resolve to the same database. Deployment was not started.");
   }
 
   const ordered = await buildDependencyOrderedSelection(sourceProfile, selectedObjects, logEvent);
+  if (options?.confirmedPlanFingerprint && options.confirmedPlanFingerprint !==
+      deploymentPlanFingerprint(ordered, sourceProfile, destinationProfile, mode)) {
+    throw new Error("The deployment plan or connections changed. Review and confirm a fresh plan before deploying.");
+  }
   const total = ordered.length;
   let doneCount = 0;
   const resultsByKey = new Map();
@@ -630,7 +740,10 @@ async function runDeployment({
   }
 
   const scriptOutputRoot = options?.scriptOutputPath || EXPORTS_DIR;
-  const exportedSourceObjects = ordered.filter((item) => item.objectType !== "TABLE");
+  const exportedSourceObjects = formatInSource
+    ? ordered
+    : ordered.filter((item) => item.objectType !== "TABLE");
+  if (formatInSource && !exportedSourceObjects.length) throw new Error("Select at least one procedure, view, function, or trigger to format and execute.");
   broadcastProgress("taskProgress", {
     taskId: task.taskId,
     taskType: "Deploy",
@@ -645,6 +758,7 @@ async function runDeployment({
         selectedObjects: exportedSourceObjects,
         outputBasePath: scriptOutputRoot,
         appTaskMode: "deploy",
+        ...(formatInSource ? { forceFormatting: true } : {}),
       })
     : {
         generated: {
@@ -658,15 +772,24 @@ async function runDeployment({
         combinedStoredProceduresPath: null,
       };
   const generated = generatedInfo.generated;
+  if (formatInSource && generatedInfo.formattingApplied !== true) throw new Error("Source execution was not started: formatting did not complete.");
   fs.mkdirSync(generated.runRoot, { recursive: true });
   const deploymentScriptDir = path.join(generated.runRoot, "Deployment Scripts");
   const generatedScripts = generatedInfo.scripts;
   const generatedScriptMap = new Map(generatedScripts.map((entry) => [keyOf(entry), entry]));
+  const missingScripts = exportedSourceObjects.filter((item) => !generatedScriptMap.has(keyOf(item)));
+  if (missingScripts.length) {
+    throw new Error(`Deployment was not started: no fresh source script was generated for ${missingScripts.map((item) => `${item.objectType} ${item.schemaName}.${item.objectName}`).join(", ")}.`);
+  }
   const combinedStoredProceduresPath = generatedInfo.combinedStoredProceduresPath;
-  const hasTables = ordered.some((item) => item.objectType === "TABLE");
+  if (ordered.some((item) => item.objectType === "PROCEDURE") &&
+      (!combinedStoredProceduresPath || !fs.existsSync(combinedStoredProceduresPath) || !fs.readFileSync(combinedStoredProceduresPath, "utf8").trim())) {
+    throw new Error("Deployment was not started: a nonempty combined stored procedure deployment script is required.");
+  }
+  const hasTables = !formatInSource && ordered.some((item) => item.objectType === "TABLE");
   const generationWarnings = generatedInfo.generationWarnings || [];
   const deploymentMetadata = buildLegacyDeploymentMetadata(generationWarnings);
-  const unchangedDirectExecutionKeys = await findUnchangedDirectExecutionKeys({
+  const unchangedDirectExecutionKeys = formatInSource ? new Set() : await findUnchangedDirectExecutionKeys({
     sourceProfile,
     destinationProfile,
     selectedObjects: ordered,
@@ -692,6 +815,58 @@ async function runDeployment({
   });
   const selectedProcedures = ordered.filter((item) => item.objectType === "PROCEDURE");
   const isRollback = mode === "Rollback";
+
+  if (mode === "DryRun") {
+    let tableDeltaPath = null;
+    if (hasTables) {
+      const delta = await generateTableDelta({
+        taskId: task.taskId,
+        sourceProfile,
+        destinationProfile,
+        selectedObjects: ordered.filter((item) => item.objectType === "TABLE"),
+        outputDir: deploymentScriptDir,
+      });
+      tableDeltaPath = delta?.outputPath || null;
+      logEvent("INFO", "Table delta generated for review", { outputPath: tableDeltaPath });
+    }
+
+    for (const item of ordered) {
+      const current = resultsByKey.get(keyOf(item));
+      if (!current) continue;
+      current.status = "ScriptGenerated";
+      current.errorMessage = null;
+      if (item.objectType === "TABLE") {
+        current.action = "AlterDelta";
+        current.scriptPath = tableDeltaPath;
+      } else if (item.objectType === "PROCEDURE") {
+        current.action = "ExecuteCombinedProcedures";
+        current.scriptPath = combinedStoredProceduresPath;
+      } else {
+        const genItem = generatedScriptMap.get(keyOf(item));
+        const executableSql = toWindowsLineEndings(normalizeExecutableSql(
+          fs.readFileSync(genItem.scriptPath, "utf8"), genItem.objectType,
+          { schemaName: genItem.schemaName, objectName: genItem.objectName },
+          { strategy: getDirectStrategy(genItem.objectType), moduleMetadata: genItem.moduleMetadata || null }
+        ));
+        current.scriptPath = writeDeploymentSql(deploymentScriptDir,
+          `${task.taskId}_${item.objectType}_${item.schemaName}_${item.objectName}`, executableSql);
+      }
+      doneCount += 1;
+      broadcastProgress("deployProgress", { taskId: task.taskId, objectType: current.objectType,
+        schemaName: current.schemaName, objectName: current.objectName, status: "ScriptGenerated", done: doneCount, total });
+    }
+
+    logEvent("INFO", "Dry run complete. Scripts were written for review; nothing was executed.", { deploymentScriptDir });
+    return {
+      plan: ordered,
+      results: [...resultsByKey.values()],
+      generatedRoot: generated.runRoot,
+      buildPathFile: generated.latestBuildPathFile,
+      dryRun: true,
+      deploymentScriptDir,
+      ...deploymentMetadata,
+    };
+  }
 
   if (isRollback) {
     // Rollback mode: validate the ordered deployment plan inside a transaction that always rolls back.
@@ -817,7 +992,7 @@ async function runDeployment({
         await executeSql(destinationProfile, rollbackSql);
         for (const item of ordered) {
           const current = resultsByKey.get(keyOf(item));
-          if (current && current.scriptPath && current.status !== "Failed" && current.status !== "RolledBack") {
+          if (current && current.scriptPath && current.status !== "Failed" && current.status !== "RolledBack" && current.action !== "NoChange") {
             current.status = "RolledBack";
             current.errorMessage = null;
             doneCount += 1;
@@ -832,7 +1007,7 @@ async function runDeployment({
             });
           }
         }
-        logEvent("INFO", "Rollback validation completed. No DB changes made.");
+        logEvent("INFO", "Rollback validation completed and its transaction was rolled back. External effects and non-transactional operations are not covered.");
       } catch (error) {
         logEvent("ERROR", "Rollback test encountered an error", { errorMessage: error.message });
         for (const item of ordered) {
@@ -860,7 +1035,7 @@ async function runDeployment({
       results: [...resultsByKey.values()],
       generatedRoot: generated.runRoot,
       buildPathFile: generated.latestBuildPathFile,
-      rollbackApplied: true,
+      rollbackApplied: [...resultsByKey.values()].some((item) => item.status === "RolledBack") && ![...resultsByKey.values()].some((item) => item.status === "Failed"),
       ...deploymentMetadata,
     };
   }
@@ -880,6 +1055,16 @@ async function runDeployment({
   });
   for (let index = 0; index < ordered.length && !stopDirectExecution;) {
     const item = ordered[index];
+    if (formatInSource && !FORMAT_EXECUTABLE_TYPES.has(item.objectType)) {
+      const current = resultsByKey.get(keyOf(item));
+      current.action = "NoStoredModuleText";
+      current.scriptPath = generatedScriptMap.get(keyOf(item))?.scriptPath || null;
+      current.errorMessage = null;
+      doneCount += 1;
+      broadcastProgress("deployProgress", { taskId: task.taskId, ...item, status: "Skipped", done: doneCount, total });
+      index += 1;
+      continue;
+    }
     if (item.objectType === "PROCEDURE") {
       if (proceduresProcessed) {
         index += 1;
@@ -1124,7 +1309,9 @@ async function runDeployment({
 
       entry.current.status = "Failed";
       entry.current.errorMessage = executionResult.error || "Deployment failed.";
-      logEvent("ERROR", "Object deployment failed", {
+      const needsReview = requiresManualReview(entry.current.errorMessage);
+      logEvent(needsReview ? "WARN" : "ERROR",
+        needsReview ? "Object needs a reviewed migration" : "Object deployment failed", {
         objectType: entry.current.objectType,
         schemaName: entry.current.schemaName,
         objectName: entry.current.objectName,
@@ -1190,8 +1377,21 @@ async function runDeployment({
   };
 }
 
+async function runDeployment(request) {
+  const reportProgress = request.broadcastProgress || (() => {});
+  const result = await executeDeployment({
+    ...request,
+    broadcastProgress: (event, data) => reportProgress(event,
+      data.status === "Failed" && requiresManualReview(data.error) ? { ...data, status: "ReviewRequired" } : data),
+  });
+  result.results = result.results.map((item) => item.status === "Failed" && requiresManualReview(item.errorMessage)
+    ? { ...item, status: "ReviewRequired" } : item);
+  return result;
+}
+
 module.exports = {
   runDeployment,
   buildDeploymentPlan,
   buildDerivedDeploymentPlan,
+  deploymentPlanFingerprint,
 };

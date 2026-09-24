@@ -1,0 +1,65 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      package_smoke:
+        description: Build and smoke-test the unpacked Windows app
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PEBLOY_RUN_SQL_INTEGRATION: "0"
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - run: npm ci
+      - run: npm run check
+      - run: npm test -- --runInBand
+      - run: npm audit --audit-level=high
+      - run: npx playwright install chromium
+      - run: npm run test:browser
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-failure-evidence
+          path: test-results/
+          retention-days: 7
+
+  package-smoke:
+    if: github.event_name == 'workflow_dispatch' && inputs.package_smoke
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - run: npm ci
+      - run: npm run build:dir
+      - run: npm run test:desktop

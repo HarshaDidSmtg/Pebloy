@@ -130,7 +130,7 @@ describe("runBackup", () => {
     expect(result.backupMode).toBe("ObjectScriptGenerationOnly");
   });
 
-  it("formats scripts and re-applies modules to the SOURCE connection when formatAndExecute is on", async () => {
+  it("rejects source execution requested through Backup", async () => {
     const profile = { serverName: "srcServer", databaseName: "srcDb" };
     const scripts = [
       { objectType: "PROCEDURE", schemaName: "dbo", objectName: "P1", scriptPath: "/x/p1.sql", definitionText: "create procedure dbo.P1 as select 1" },
@@ -143,41 +143,13 @@ describe("runBackup", () => {
       { key: "VIEW|dbo|v1", ok: false, errorMessage: "boom" },
     ]);
 
-    const result = await runBackup(
+    await expect(runBackup(
       profile,
       scripts.map(({ objectType, schemaName, objectName }) => ({ objectType, schemaName, objectName })),
       { destinationPath: "/exports", formatAndExecute: true },
       { taskId: "backup-task" }
-    );
-
-    // Every generated file is formatted in place.
-    expect(fs.writeFileSync).toHaveBeenCalledWith("/x/p1.sql", expect.stringContaining("FORMATTED:"), "utf8");
-    expect(fs.writeFileSync).toHaveBeenCalledWith("/x/t1.sql", expect.stringContaining("FORMATTED:"), "utf8");
-
-    // Only programmable modules execute, via CREATE OR ALTER, against the source profile.
-    expect(normalizeExecutableSql).toHaveBeenCalledWith(
-      expect.stringContaining("FORMATTED:"),
-      "PROCEDURE",
-      { schemaName: "dbo", objectName: "P1" },
-      { strategy: "createOrAlter", moduleMetadata: null }
-    );
-    expect(executeSqlScriptsIndividually).toHaveBeenCalledTimes(1);
-    const [execProfile, entries, execOptions] = executeSqlScriptsIndividually.mock.calls[0];
-    expect(execProfile).toBe(profile);
-    expect(entries.map((entry) => entry.key)).toEqual(["PROCEDURE|dbo|p1", "VIEW|dbo|v1"]);
-    expect(entries[0].scriptPath).toContain("Deployment Scripts");
-    expect(entries[0].sqlText).toContain("EXECUTABLE:FORMATTED:");
-    expect(execOptions).toEqual({ continueOnError: true });
-
-    expect(result.backupMode).toBe("ScriptGenerationWithFormatExecute");
-    expect(result.formatAndExecute).toEqual({
-      enabled: true,
-      formattedCount: 3,
-      executedCount: 1,
-      failedCount: 1,
-      skippedCount: 1,
-      failures: [{ object: "VIEW dbo.V1", scriptPath: expect.stringContaining("Deployment Scripts"), error: "boom" }],
-      deploymentScriptDir: expect.stringContaining("Deployment Scripts"),
-    });
+    )).rejects.toThrow("script generation only");
+    expect(executeSqlScriptsIndividually).not.toHaveBeenCalled();
+    expect(generateScriptsForProfile).not.toHaveBeenCalled();
   });
 });

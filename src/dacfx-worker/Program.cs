@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using Microsoft.SqlServer.Dac;
 using Microsoft.SqlServer.Dac.Model;
+using Microsoft.SqlServer.TransactSql.ScriptDom;
 
 return await WorkerProgram.RunAsync(args);
 
@@ -49,6 +50,7 @@ internal static class WorkerProgram
 
             object result = (envelope.Command ?? string.Empty).Trim().ToLowerInvariant() switch
             {
+                "inspect" => HandleInspect(envelope.Payload),
                 "validate" => HandleValidate(envelope.Payload.Deserialize<ValidateRequest>(JsonOptions)
                     ?? throw new InvalidOperationException("Invalid validate request payload.")),
                 "compare" => HandleCompare(envelope.Payload.Deserialize<CompareRequest>(JsonOptions)
@@ -65,6 +67,86 @@ internal static class WorkerProgram
         {
             Console.Out.Write(JsonSerializer.Serialize(new WorkerFailure(BuildError(error)), JsonOptions));
             return 1;
+        }
+    }
+
+    private static object HandleInspect(JsonElement payload)
+    {
+        var result = new List<object>();
+        var scripts = payload.GetProperty("scripts");
+        if (scripts.GetArrayLength() is < 1 or > 5000) throw new InvalidOperationException("Inspect accepts 1 to 5000 scripts.");
+        foreach (var input in scripts.EnumerateArray())
+        {
+            var sqlText = input.GetProperty("sqlText").GetString() ?? "";
+            var fileName = input.GetProperty("fileName").GetString() ?? "";
+            var parser = new TSql160Parser(true);
+            var fragment = parser.Parse(new StringReader(sqlText), out var errors);
+            if (errors.Count > 0) throw new InvalidOperationException($"Invalid SQL in {fileName}: {errors[0].Message} (line {errors[0].Line}).");
+            var statements = ((TSqlScript)fragment).Batches.SelectMany(batch => batch.Statements).ToList();
+            var ansiNulls = true;
+            var quotedIdentifier = true;
+            foreach (var setting in statements.OfType<PredicateSetStatement>())
+            {
+                if (statements.TakeWhile(statement => statement != setting).Any(statement => statement is not PredicateSetStatement))
+                    throw new InvalidOperationException($"SET headers must precede the object declaration in {fileName}.");
+                var option = setting.Options.ToString();
+                if (option == "AnsiNulls") ansiNulls = setting.IsOn;
+                else if (option == "QuotedIdentifier") quotedIdentifier = setting.IsOn;
+                else throw new InvalidOperationException($"Unsupported SET option in {fileName}: {option}.");
+            }
+            var declarations = statements.Where(statement => statement is not PredicateSetStatement).ToList();
+            if (declarations.Count != 1) throw new InvalidOperationException($"{fileName} must contain exactly one object declaration and optional ANSI_NULLS/QUOTED_IDENTIFIER settings.");
+            var declaration = declarations[0];
+            (string ObjectType, SchemaObjectName Name) identity = declaration switch
+            {
+                ProcedureStatementBody procedure => ("PROCEDURE", procedure.ProcedureReference.Name),
+                ViewStatementBody view => ("VIEW", view.SchemaObjectName),
+                FunctionStatementBody function => ("FUNCTION", function.Name),
+                TriggerStatementBody trigger => ("TRIGGER", trigger.Name),
+                CreateTableStatement table => ("TABLE", table.SchemaObjectName),
+                CreateSynonymStatement synonym => ("SYNONYM", synonym.Name),
+                CreateSequenceStatement sequence => ("SEQUENCE", sequence.Name),
+                CreateTypeTableStatement tableType => ("USER_DEFINED_TYPE", tableType.Name),
+                CreateTypeUddtStatement aliasType => ("USER_DEFINED_TYPE", aliasType.Name),
+                _ => throw new InvalidOperationException($"Unsupported folder declaration in {fileName}: {declaration.GetType().Name}."),
+            };
+            if (identity.Name.Identifiers.Count != 2) throw new InvalidOperationException($"Use a two-part schema.object declaration in {fileName}.");
+            var dependencies = new FolderDependencyVisitor(identity.Name.SchemaIdentifier.Value);
+            declaration.Accept(dependencies);
+            result.Add(new
+            {
+                fileName,
+                objectType = identity.ObjectType,
+                schemaName = identity.Name.SchemaIdentifier.Value,
+                objectName = identity.Name.BaseIdentifier.Value,
+                definitionText = sqlText.Substring(declaration.StartOffset, declaration.FragmentLength),
+                moduleMetadata = new { usesAnsiNulls = ansiNulls, usesQuotedIdentifier = quotedIdentifier },
+                dependencies = dependencies.Names.Distinct().Select(name => new { schemaName = name.Schema, objectName = name.Name }).ToList(),
+            });
+        }
+        return result;
+    }
+
+    private sealed class FolderDependencyVisitor : TSqlFragmentVisitor
+    {
+        private readonly string defaultSchema;
+        public FolderDependencyVisitor(string schema) { defaultSchema = schema; }
+        public List<(string Schema, string Name)> Names { get; } = new();
+        public override void ExplicitVisit(SchemaObjectName node)
+        {
+            if (node.Identifiers.Count == 2) Names.Add((node.SchemaIdentifier.Value, node.BaseIdentifier.Value));
+            else if (node.Identifiers.Count == 1)
+            {
+                Names.Add((defaultSchema, node.BaseIdentifier.Value));
+                Names.Add(("dbo", node.BaseIdentifier.Value));
+            }
+            base.ExplicitVisit(node);
+        }
+        public override void ExplicitVisit(FunctionCall node)
+        {
+            if (node.CallTarget is MultiPartIdentifierCallTarget target && target.MultiPartIdentifier.Identifiers.Count == 1)
+                Names.Add((target.MultiPartIdentifier.Identifiers[0].Value, node.FunctionName.Value));
+            base.ExplicitVisit(node);
         }
     }
 

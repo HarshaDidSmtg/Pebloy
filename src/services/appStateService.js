@@ -1,5 +1,5 @@
 const path = require("path");
-const { readJson, writeJson, writeJsonAtomic } = require("./storage");
+const { readRecoverableJson, writeRecoverableJson } = require("./storage");
 
 const DATA_DIR = process.env.DATA_DIR || path.resolve(__dirname, "..", "..", "data");
 const APP_STATE_PATH = path.join(DATA_DIR, "app-state.json");
@@ -42,7 +42,7 @@ const DEFAULT_APP_STATE = {
     notificationsEnabled: false,
     defaultBackupPath: "",
     defaultScriptPath: "",
-    theme: "sepia",
+    theme: "system",
     favoriteThemes: [...DEFAULT_THEME_FAVORITES],
     fontFamily: "JetBrains Mono",
     fontSize: 14,
@@ -54,6 +54,9 @@ const DEFAULT_APP_STATE = {
     activeTab: "credentials",
     objectsProfileId: "",
     objectsMode: "Specify",
+    objectsTypeFilter: "",
+    objectsSchemaFilter: "",
+    objectsNameFilter: "",
     sharedObjectText: "",
     sharedSelectedObjects: [],
     diffSourceProfileId: "",
@@ -130,6 +133,9 @@ function sanitizeState(raw = {}) {
       activeTab: KNOWN_TAB_IDS.includes(activeTab) ? activeTab : DEFAULT_APP_STATE.ui.activeTab,
       objectsProfileId: String(merged.ui.objectsProfileId || ""),
       objectsMode: String(merged.ui.objectsMode || DEFAULT_APP_STATE.ui.objectsMode),
+      objectsTypeFilter: String(merged.ui.objectsTypeFilter || "").slice(0, 128),
+      objectsSchemaFilter: String(merged.ui.objectsSchemaFilter || "").slice(0, 128),
+      objectsNameFilter: String(merged.ui.objectsNameFilter || "").slice(0, 128),
       sharedObjectText: String(merged.ui.sharedObjectText || ""),
       sharedSelectedObjects: Array.isArray(merged.ui.sharedSelectedObjects) ? merged.ui.sharedSelectedObjects : [],
       diffSourceProfileId: String(merged.ui.diffSourceProfileId || ""),
@@ -139,7 +145,9 @@ function sanitizeState(raw = {}) {
       deploySourceProfileId: String(merged.ui.deploySourceProfileId || ""),
       deployDestProfileId: String(merged.ui.deployDestProfileId || ""),
       deployEngine: String(merged.ui.deployEngine || DEFAULT_APP_STATE.ui.deployEngine),
-      deployMode: String(merged.ui.deployMode || DEFAULT_APP_STATE.ui.deployMode),
+      deployMode: String(merged.ui.deployMode) === "FormatAndExecuteSource"
+        ? DEFAULT_APP_STATE.ui.deployMode
+        : String(merged.ui.deployMode || DEFAULT_APP_STATE.ui.deployMode),
       deployScriptPath: String(merged.ui.deployScriptPath || ""),
       continueOnError: Boolean(merged.ui.continueOnError),
       formatter: merged.ui.formatter && typeof merged.ui.formatter === "object" && !Array.isArray(merged.ui.formatter)
@@ -150,21 +158,17 @@ function sanitizeState(raw = {}) {
 }
 
 function getAppState() {
-  try {
-    return sanitizeState(readJson(APP_STATE_PATH, DEFAULT_APP_STATE));
-  } catch (_error) {
-    return sanitizeState(DEFAULT_APP_STATE);
-  }
+  return sanitizeState(readRecoverableJson(APP_STATE_PATH, DEFAULT_APP_STATE));
 }
 
 function saveAppState(partial = {}) {
   const updated = sanitizeState(mergeState(getAppState(), partial));
-  writeJsonAtomic(APP_STATE_PATH, updated);
+  writeRecoverableJson(APP_STATE_PATH, updated);
   return updated;
 }
 
 function resetAppState() {
-  writeJsonAtomic(APP_STATE_PATH, DEFAULT_APP_STATE);
+  writeRecoverableJson(APP_STATE_PATH, DEFAULT_APP_STATE);
   return getAppState();
 }
 

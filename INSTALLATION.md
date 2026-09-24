@@ -5,10 +5,11 @@
 | Requirement | Version | Notes |
 | ----------- | ------- | ----- |
 | Windows | 10 or 11 (64-bit) | Required — DPAPI and PowerShell integration are Windows-only |
-| Node.js | 18 LTS or newer | [nodejs.org](https://nodejs.org) |
-| PowerShell | 5.1 or 7+ | PowerShell 7 recommended |
-| SQL Server module | latest | `Install-Module -Name SqlServer -Scope CurrentUser` |
-| SQL Server | 2016 or newer | Source and/or destination databases |
+| Node.js | 24 LTS recommended | Source development/builds; bundled by Electron for packaged use |
+| PowerShell | 7 (`pwsh`) plus Windows PowerShell 5.1 | SQL helpers require `pwsh`; DPAPI/native helpers use Windows PowerShell |
+| SQL Server module | 22.4.5.1 | Pinned version; bundled in packaged apps |
+| .NET SDK | 8.0 | Source DacFx development, offline compiler tests, and packaging only |
+| SQL Server | 2016 SP1 or newer | `CREATE OR ALTER` requires SP1 or newer |
 
 ---
 
@@ -19,11 +20,11 @@ Clone the repository and run from the repository root:
 ```powershell
 git clone https://github.com/HarshaDidSmtg/Pebloy.git
 cd Pebloy
-npm install
+npm ci
 npm start
 ```
 
-Open `http://localhost:5089` in your browser.
+Open `http://127.0.0.1:5089` or the next available URL printed at startup.
 
 To launch the desktop app directly, use **Launch-Pebloy.cmd** or **scripts/powershell/Launch-Pebloy.ps1**. The launcher verifies Electron dependencies, starts the Electron shell, and refreshes the `Pebloy.lnk` desktop shortcut.
 
@@ -49,7 +50,7 @@ npm run electron:dev
 
 ## Option C — Build Windows Installer
 
-1. Confirm the generated app icon files exist:
+1. Confirm the tracked source logo exists; the build generates a missing ICO automatically:
 
    - `build/icon.ico`
    - `public/logo.png`
@@ -64,23 +65,54 @@ npm run build
 
 Output: `dist/Pebloy-Setup.exe`
 
+The build first prepares the pinned SMO module and publishes the .NET 8 DacFx worker
+as self-contained `win-x64` resources. This preparation needs network access on a
+clean checkout. Packaged runtime does not fall back to `dotnet run` or download a
+missing module; reinstall/repair the package if resources are absent. PowerShell 7
+is still an external runtime prerequisite.
+
+Run `npm run build:dir` followed by `npm run test:desktop` to smoke-test the unpacked
+application without installing it. Building does not prove an installer is signed.
+In-app updates require a trusted release URL, GitHub SHA-256 asset digest, and a valid
+Authenticode signature matching the currently installed app's signing certificate.
+Unsigned releases/builds are refused. A changed signing certificate requires a
+separately verified manual upgrade.
+
 The generated Setup `.exe` installs per user under the current Windows account. It does not request administrator credentials because the installer is configured with `perMachine: false`, `allowElevation: false`, and `requestedExecutionLevel: asInvoker`.
 
 ---
 
 ## Environment Variables
 
-Copy `.env.example` to `.env` to override defaults:
+### Local Schedules
 
-```env
-PORT=5089
-DB_OBJECTS_SCRIPT=C:/path/to/scripts/powershell/DBObjectsBulkScriptGenerator.ps1
-TABLE_DELTA_SCRIPT=C:/path/to/scripts/powershell/CompareTablesGenerateDelta.ps1
-ARTIFACTS_DIR=C:/path/to/artifacts
-TEMP_DIR=C:/path/to/temp
+Scheduled Deployments are off by default. Turn them on in **Settings > Behavior > Scheduled Deployments** and select **Save All**; the Deployment tab then shows the Schedules section. Delete saved schedules before turning the feature off, so no Windows wake-up task is left behind. While it is off, no schedule can be created or edited and none runs.
+
+Deployment then includes once/daily/weekly schedules. Review the selected objects, target databases, execution mode, timing, and continuation policies before saving. Saving does not execute SQL immediately. Without Windows wake-up, Pebloy must be running; an overdue schedule runs once at the next startup, not once per missed interval.
+
+In the desktop app, **Start Pebloy via Windows Task Scheduler** registers a task for the current signed-in user at limited privilege. No password or SQL credential is stored in Windows task arguments. The machine must be awake and the user signed in; this is not a Windows service or unattended logged-off execution. Keep the installed/portable executable at its registered location, or edit and save the schedule again after moving it. Windows registration failures leave the schedule paused.
+
+Plan changes, target identity changes, folder-content changes, failures, and interrupted runs require reapproval. Inspect logs and database state before reauthorizing uncertain executions. Delete schedules in Pebloy before uninstalling or factory-resetting it; pausing/removing them also removes their Windows wake-up tasks. No live schedule or SQL execution is part of the offline test suite.
+
+### Runtime Configuration
+
+Set environment variables in the launching PowerShell session. The server does not
+automatically load a `.env` file:
+
+```powershell
+$env:PORT = "5089"
+$env:ARTIFACTS_DIR = "C:/Pebloy/artifacts"
+npm start
 ```
 
-If `.env` is not present, defaults defined in the source are used.
+Unset variables use source defaults. Electron normally stores runtime data under
+its per-user application data directory; source mode uses the workspace. The
+absolute `PEBLOY_RUNTIME_ROOT` override exists for isolated desktop testing.
+
+Only one backend may own a configured data/artifact directory at a time. Close the
+other backend before launching against the same runtime storage. If settings/app
+state become malformed, a previous valid snapshot is restored and the corrupt
+file is retained for inspection. Recheck recovered preferences before deployment.
 
 ---
 
@@ -104,19 +136,15 @@ Generated script output now nests under the selected Connection Alias before the
 
 ## Installing the SQL Server PowerShell Module
 
-Pebloy requires the `SqlServer` module for all database operations:
+Source mode prepares the pinned `SqlServer` module locally for SMO scripting:
 
 ```powershell
-Install-Module -Name SqlServer -Scope CurrentUser -Force
+npm run prepare:resources
 ```
 
-To verify:
-
-```powershell
-Get-Module -ListAvailable SqlServer
-```
-
-If you see a version listed, the module is ready.
+This also builds DacFx and therefore requires the .NET 8 SDK. Module setup uses
+`Save-Module` for version 22.4.5.1 under the project's vendor directory, without
+requiring a machine-wide installation. Packaged apps include that directory.
 
 ---
 
@@ -124,10 +152,10 @@ If you see a version listed, the module is ready.
 
 | Issue | Fix |
 | ----- | --- |
-| `npm install` fails | Ensure Node.js 18+ is installed. Run `node --version` to check. |
+| `npm ci` fails | Use Node.js 24 LTS and the tracked dependency lockfile. Run `node --version` to check. |
 | Port 5089 already in use | The launcher auto-selects the next port. Check `data/server-info.json` for the active URL. |
 | PowerShell script blocked by execution policy | Run: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
-| `SqlServer` module not found | Run: `Install-Module -Name SqlServer -Scope CurrentUser` |
+| `SqlServer` module not found | Source: run `npm run prepare:resources`. Packaged: repair/reinstall the app. |
 | Electron app does not open | Run `scripts/powershell/Launch-Pebloy.ps1` or `Launch-Pebloy.cmd` so dependency checks and Electron startup happen in one path. |
 | Electron window is blank | Run `npm start` first to check for server errors, then retry `npm run electron`, `scripts/powershell/Launch-Pebloy.ps1`, or `Launch-Pebloy.cmd`. |
 

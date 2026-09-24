@@ -2,6 +2,9 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const packageMetadata = require("../package.json");
+const { randomUUID } = require("crypto");
+const { acquireRuntimeLocks } = require("./services/runtimeLockService");
+const { STARTUP_FAILURE_PREFIX } = require("./services/startupFailure");
 
 const {
   listProfiles,
@@ -14,28 +17,68 @@ const {
 const { testConnection, runConnectionDiagnostics, discoverObjects, resolveObjectTypes, fetchObjectDependencies, buildObjectDependenciesQuery } = require("./services/sqlService");
 
 const { pickFile, pickFolder, openPath } = require("./services/systemService");
-const { compareObjects, exportReport } = require("./services/diffService");
+const { compareObjects, exportReport, formatMarkdownReport } = require("./services/diffService");
 const { runBackup } = require("./services/backupService");
-const { runDeployment, buildDeploymentPlan, buildDerivedDeploymentPlan } = require("./services/deploymentService");
+const { runDeployment, buildDerivedDeploymentPlan, deploymentPlanFingerprint } = require("./services/deploymentService");
+const { reconcileObjects } = require("./services/reconciliationService");
+const { buildMigrationPrep } = require("./services/migrationPrepService");
+const { loadFolderSource } = require("./services/folderSourceService");
+const { buildBatchPlan, runDeploymentBatch } = require("./services/deploymentBatchService");
+const schedules = require("./services/scheduleService");
+const windowsSchedules = require("./services/windowsScheduleService");
 const {
   createTaskLog,
   appendTaskEvent,
   finalizeTaskLog,
+  flushTaskLogs,
   listLogFiles,
   getTaskLog,
   clearAllLogs,
+  previewArchiveCleanup,
+  executeArchiveCleanup,
+  LOG_DIR,
 } = require("./services/loggingService");
-const { ensureSqlServerModule } = require("./services/scriptAutomationService");
+const { ensureSqlServerModule, getSqlServerModuleStatus } = require("./services/scriptAutomationService");
 const { getSettings, saveSettings } = require("./services/settingsService");
 const { getAppState, saveAppState } = require("./services/appStateService");
 const { performFactoryReset } = require("./services/factoryResetService");
 const { buildClientError } = require("./services/errorService");
-const { LOOPBACK_HOST, isLoopbackRequest } = require("./services/formatterAccessService");
+const { LOOPBACK_HOST, isLoopbackRequest, isLocalBrowserRequest, isAuthorizedMutation } = require("./services/formatterAccessService");
 
 
 const { formatInteractiveSql, getFormatterCapabilities } = require("./services/formatterService");
 
 const app = express();
+const requestToken = randomUUID();
+let shuttingDown = false;
+let schedulerRunning = false;
+let finishShutdown = () => {};
+app.disable("x-powered-by");
+
+// The server binds to loopback, but a remote page can still reach it via DNS rebinding
+// or a cross-site form post; Host/Origin are what actually distinguish those.
+app.use((req, res, next) => {
+  if (shuttingDown) return res.status(503).json({ error: "Pebloy is shutting down. Wait for active workflows to finish." });
+  if (isLocalBrowserRequest(req)) {
+    return next();
+  }
+  res.status(403).json({ error: "Pebloy accepts local requests only.", status: 403 });
+});
+
+app.get("/api/session", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ token: requestToken });
+});
+
+app.use((req, res, next) => {
+  if (!isAuthorizedMutation(req, requestToken)) {
+    return res.status(403).json({ error: "Session authorization required. Reload Pebloy before retrying." });
+  }
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  next();
+});
+
 app.use(express.json({ limit: "20mb" }));
 app.use("/vendor/monaco", express.static(path.resolve(__dirname, "..", "node_modules", "monaco-editor", "min")));
 app.use(express.static(path.resolve(__dirname, "..", "public")));
@@ -106,15 +149,68 @@ app.get("/api/objects/schemas", async (req, res) => {
 
 const runningTasks = new Map(); // taskId → { taskType, objectCount, startedAt }
 const sseClients = new Set();
+const protectedWorkflows = new Set(["/api/backup/run", "/api/deploy/run", "/api/deploy/batch/run", "/api/diff/compare", "/api/data-import"]);
+const selectionWorkflows = new Set(["/api/backup/run", "/api/deploy/run", "/api/deploy/plan", "/api/deploy/batch/plan", "/api/deploy/batch/run", "/api/diff/compare"]);
+const metadataWorkflows = new Set(["/api/objects/resolve-types", "/api/objects/dependencies", "/api/objects/dependencies/query"]);const supportedObjectTypes = new Set(["TABLE", "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SYNONYM", "SEQUENCE", "USER_DEFINED_TYPE"]);
+
+app.use((req, res, next) => {
+  if (req.method === "POST" && metadataWorkflows.has(req.path)) {
+    const objects = req.body?.objects;
+    if (!Array.isArray(objects) || objects.length < 1 || objects.length > 5000 || objects.some((object) =>
+      !object || typeof object.objectName !== "string" || !object.objectName.trim() || object.objectName.length > 128 || /[\r\n\0]/.test(object.objectName) ||
+      (object.schemaName != null && (typeof object.schemaName !== "string" || object.schemaName.length > 128 || /[\r\n\0]/.test(object.schemaName))))) {
+      return res.status(400).json({ error: "Metadata requests require 1 to 5000 objects with valid names (maximum 128 characters)." });
+    }
+  }
+  if (req.method === "POST" && req.path === "/api/data-import") {
+    const profiles = req.body?.profiles ?? [];
+    if (!Array.isArray(profiles) || profiles.length > 100 || profiles.some((profile) => !profile || typeof profile !== "object" || Array.isArray(profile))) {
+      return res.status(400).json({ error: "Import accepts at most 100 profile records per request." });
+    }
+  }
+  if (req.method === "POST" && selectionWorkflows.has(req.path)) {
+    const objects = req.body?.selectedObjects;
+    if (!Array.isArray(objects) || objects.length < 1 || objects.length > 5000 || objects.some((object) =>
+      !object || !supportedObjectTypes.has(object.objectType) ||
+      [object.schemaName, object.objectName].some((name) => typeof name !== "string" || !name.trim() || name.length > 128 || /[\r\n\0]/.test(name)))) {
+      return res.status(400).json({ error: "Supply 1 to 5000 objects with supported types and valid schema/object names (maximum 128 characters)." });
+    }
+    if (req.path.startsWith("/api/deploy/") && [req.body.engine, req.body.options?.engine].some((engine) => engine && engine !== "Legacy")) {
+      return res.status(400).json({ error: "Only Legacy deployment is supported. DacFx is available for comparison and validation." });
+    }
+    if (req.path === "/api/deploy/run" && !["ExecuteDirectly", "Rollback", "FormatAndExecuteSource", "DryRun"].includes(req.body.mode)) {
+      return res.status(400).json({ error: "Choose a supported execution mode before deploying." });
+    }
+    if (req.path === "/api/deploy/run" && req.body.mode === "FormatAndExecuteSource" &&
+        (!req.body.sourceProfileId || req.body.destinationProfileId !== req.body.sourceProfileId || !req.body.options?.confirmedSourceDatabase)) {
+      return res.status(400).json({ error: "Format & Execute requires the same source/target profile and explicit source database confirmation." });
+    }
+  }
+  if (req.method === "POST" && protectedWorkflows.has(req.path) && runningTasks.size) {
+    return res.status(409).json({ error: "A database workflow is already running. Wait for it to finish before starting another." });
+  }
+  next();
+});
 
 function broadcastEvent(event, data) {
+  const task = runningTasks.get(data.taskId);
+  if (task && event === "taskProgress") {
+    task.percent = data.percent;
+    task.progressLabel = data.operation;
+  }
+  if (task && event === "deployProgress") {
+    task.objectProgress ||= Object.create(null);
+    task.objectProgress[JSON.stringify([data.objectType, data.schemaName, data.objectName])] = data;
+  }
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of sseClients) {
-    try { res.write(payload); } catch (_e) { sseClients.delete(res); }
+    try { if (!res.write(payload)) { sseClients.delete(res); res.destroy(); } }
+    catch (_e) { sseClients.delete(res); }
   }
 }
 
 app.get("/api/events", (req, res) => {
+  if (sseClients.size >= 16) return res.status(429).json({ error: "Too many event connections. Close unused Pebloy tabs." });
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -122,15 +218,19 @@ app.get("/api/events", (req, res) => {
   sseClients.add(res);
   const keepAlive = setInterval(() => { try { res.write(":ping\n\n"); } catch (_e) {} }, 20000);
   req.on("close", () => { clearInterval(keepAlive); sseClients.delete(res); });
-  // Send current running tasks immediately on connect
-  for (const [taskId, info] of runningTasks) {
-    try { res.write(`event: taskStart\ndata: ${JSON.stringify({ taskId, ...info })}\n\n`); } catch (_e) {}
-  }
+  const tasks = [...runningTasks].map(([taskId, info]) => ({ ...info, taskId, objectProgress: Object.values(info.objectProgress || {}) }));
+  res.write(`event: snapshot\ndata: ${JSON.stringify({ tasks })}\n\n`);
 });
 
 function httpError(res, error, status = 400) {
   const clientError = buildClientError(error, status);
   res.status(clientError.status).json(clientError);
+}
+
+function isContainedIn(candidatePath, baseDir) {
+  const base = path.resolve(baseDir);
+  const target = path.resolve(String(candidatePath));
+  return target === base || target.startsWith(base + path.sep);
 }
 
 function ensureLoopbackFormatterRequest(req, res) {
@@ -147,6 +247,7 @@ function ensureLoopbackFormatterRequest(req, res) {
 function requireProfile(id) {
   const profile = getProfileWithSecret(id);
   if (!profile) throw new Error("Profile not found: " + id);
+  if (profile.secretError) throw new Error(profile.secretError);
   return profile;
 }
 
@@ -336,10 +437,23 @@ app.post("/api/objects/dependencies/query", async (req, res) => {
   }
 });
 
+async function requireSource(body) {
+  return body.sourceFolder ? loadFolderSource(body.sourceFolder) : requireProfile(body.sourceProfileId);
+}
+
+app.post("/api/sources/folder", async (req, res) => {
+  try {
+    const source = await loadFolderSource(req.body.folderPath);
+    res.json({ folderPath: source.folderPath, fingerprint: source.folderFingerprint,
+      objects: source.folderScripts.map(({ objectType, schemaName, objectName }) => ({ objectType, schemaName, objectName })) });
+  } catch (error) { httpError(res, error); }
+});
+
 app.post("/api/diff/compare", async (req, res) => {
   let task;
   try {
-    const sourceProfile = requireProfile(req.body.sourceProfileId);
+    const sourceProfile = await requireSource(req.body);
+    if (runningTasks.size) throw new Error("A database workflow is already running.");
     const destinationProfile = requireProfile(req.body.destinationProfileId);
 
     task = createTaskLog("Diff", {
@@ -373,13 +487,19 @@ app.post("/api/diff/compare", async (req, res) => {
   } finally {
     if (task) {
       runningTasks.delete(task.taskId);
+      finishShutdown();
     }
   }
 });
 
+app.post("/api/diff/clipboard", (req, res) => {
+  try { res.json({ text: formatMarkdownReport(req.body.report) }); }
+  catch (error) { httpError(res, error); }
+});
+
 app.post("/api/diff/export", (req, res) => {
   try {
-    const ALLOWED_FORMATS = ["md", "html"];
+    const ALLOWED_FORMATS = ["md", "html", "html-highlighted", "json"];
     if (!ALLOWED_FORMATS.includes(req.body.format)) {
       return res.status(400).json({ error: `Invalid export format. Allowed: ${ALLOWED_FORMATS.join(", ")}` });
     }
@@ -392,14 +512,65 @@ app.post("/api/diff/export", (req, res) => {
 
 app.post("/api/deploy/plan", async (req, res) => {
   try {
-    const sourceProfile = req.body.sourceProfileId ? requireProfile(req.body.sourceProfileId) : null;
-    const plan = sourceProfile
-      ? await buildDerivedDeploymentPlan(sourceProfile, req.body.selectedObjects || [])
-      : buildDeploymentPlan(req.body.selectedObjects || [], { engine: req.body.engine });
-    res.json({ plan });
+    const sourceProfile = await requireSource(req.body);
+    const destinationProfile = requireProfile(req.body.destinationProfileId);
+    const mode = req.body.mode || "ExecuteDirectly";
+    if (!["ExecuteDirectly", "Rollback", "FormatAndExecuteSource", "DryRun"].includes(mode)) throw new Error("Invalid deployment mode.");
+    if (mode !== "FormatAndExecuteSource" && sourceProfile.serverName === destinationProfile.serverName &&
+        sourceProfile.databaseName === destinationProfile.databaseName) throw new Error("Source and target are identical. Choose a different target connection.");
+    const plan = await buildDerivedDeploymentPlan(sourceProfile, req.body.selectedObjects || [], undefined, mode);
+    const describeConnection = (profile) => ({ id: profile.id, profileLabel: profile.profileLabel,
+      serverName: profile.serverName, databaseName: profile.databaseName, environmentTag: profile.environmentTag, kind: profile.kind, folderPath: profile.folderPath });
+    res.json({ plan, fingerprint: deploymentPlanFingerprint(plan, sourceProfile, destinationProfile, mode),
+      sourceConnection: describeConnection(sourceProfile), targetConnection: describeConnection(destinationProfile) });
   } catch (error) {
     httpError(res, error);
   }
+});
+
+async function resolveBatchRequest(body) {
+  if (!Array.isArray(body.targetProfileIds) || !body.targetProfileIds.length || body.targetProfileIds.length > 20) throw new Error("Choose 1 to 20 target connections.");
+  return { sourceProfile: await requireSource(body), targetProfiles: body.targetProfileIds.map(requireProfile),
+    selectedObjects: body.selectedObjects, mode: body.mode, continueOnError: Boolean(body.continueOnError),
+    continueTargetsOnError: Boolean(body.continueTargetsOnError), options: body.options || {}, logLevel: body.logLevel };
+}
+
+app.post("/api/deploy/batch/plan", async (req, res) => {
+  try { res.json(await buildBatchPlan(await resolveBatchRequest(req.body))); }
+  catch (error) { httpError(res, error); }
+});
+
+async function executeBatchWorkflow(body) {
+  if (runningTasks.size) throw new Error("A database workflow is already running. Wait for it to finish.");
+  if (!/^[a-f0-9]{64}$/.test(body.options?.confirmedBatchFingerprint || "")) throw new Error("Review and confirm the multi-target plan first.");
+  const task = createTaskLog("Deploy", { sourceProfileLabel: body.sourceFolder || body.sourceProfileId,
+    destinationProfileLabel: "Multiple targets", selectedObjects: body.selectedObjects, logLevel: body.logLevel });
+  const info = { taskType: "Deploy", objectCount: body.selectedObjects.length, startedAt: new Date().toISOString() };
+  runningTasks.set(task.taskId, info);
+  broadcastEvent("taskStart", { taskId: task.taskId, ...info });
+  try {
+    const request = await resolveBatchRequest(body);
+    const result = await runDeploymentBatch({ ...request, onProgress: (event, data) => {
+      if (event === "targetStart") appendTaskEvent(task, "INFO", `Target ${data.index}/${data.total}: ${data.target.profileLabel}`, { targetTaskId: data.taskId });
+      else broadcastEvent(event, { ...data, targetTaskId: data.taskId, taskId: task.taskId,
+        ...(event === "taskProgress" ? { operation: `${data.targetProfileLabel}: ${data.operation}` } : {}) });
+    } });
+    const status = result.summary.failed ? "Failed" : result.summary.reviewRequired ? "ReviewRequired" : "Success";
+    appendTaskEvent(task, "INFO", "Target batch completed", { summary: result.summary, targets: result.targets.map((target) => ({ target: target.targetConnection.profileLabel, taskId: target.taskId, status: target.status })) });
+    finalizeTaskLog(task, status, result.summary);
+    broadcastEvent("taskEnd", { taskId: task.taskId, taskType: "Deploy", status, summary: result.summary });
+    return { ...result, taskId: task.taskId, logFilePath: task.textPath, mode: body.mode };
+  } catch (error) {
+    appendTaskEvent(task, "ERROR", "Target batch failed", { error: error.message });
+    finalizeTaskLog(task, "Failed", { error: error.message });
+    broadcastEvent("taskEnd", { taskId: task.taskId, taskType: "Deploy", status: "Failed", error: error.message });
+    throw error;
+  } finally { runningTasks.delete(task.taskId); finishShutdown(); }
+}
+
+app.post("/api/deploy/batch/run", async (req, res) => {
+  try { res.json(await executeBatchWorkflow(req.body)); }
+  catch (error) { httpError(res, error); }
 });
 
 app.get("/api/profiles/export", (req, res) => {
@@ -421,6 +592,7 @@ app.post("/api/profiles/import", async (req, res) => {
         username: p.username || "",
         password: "",
         environmentTag: p.environmentTag || "",
+        groupName: p.groupName || "",
       });
       created.push(newProfile);
     } catch (e) {
@@ -433,7 +605,8 @@ app.post("/api/profiles/import", async (req, res) => {
 app.post("/api/backup/run", async (req, res) => {
   let task;
   try {
-    const sourceProfile = requireProfile(req.body.sourceProfileId);
+    const sourceProfile = await requireSource(req.body);
+    if (runningTasks.size) throw new Error("A database workflow is already running.");
     if (!(req.body.selectedObjects || []).length) {
       throw new Error("Backup requires at least one selected object.");
     }
@@ -470,6 +643,7 @@ app.post("/api/backup/run", async (req, res) => {
   } finally {
     if (task) {
       runningTasks.delete(task.taskId);
+      finishShutdown();
     }
   }
 });
@@ -477,14 +651,23 @@ app.post("/api/backup/run", async (req, res) => {
 app.post("/api/deploy/run", async (req, res) => {
   let task;
   try {
-    const sourceProfile = requireProfile(req.body.sourceProfileId);
+    if (!/^[a-f0-9]{64}$/.test(req.body.options?.confirmedPlanFingerprint || "")) {
+      return httpError(res, new Error("Review and confirm the deployment plan before running deployment."), 400);
+    }
+    const sourceProfile = await requireSource(req.body);
+    if (runningTasks.size) throw new Error("A database workflow is already running.");
     const destinationProfile = requireProfile(req.body.destinationProfileId);
+    const formatInSource = req.body.mode === "FormatAndExecuteSource";
+    if (formatInSource && req.body.options?.confirmedSourceDatabase !== sourceProfile.databaseName) {
+      throw new Error("The source database changed. Confirm it again before executing.");
+    }
 
     if (
+      !formatInSource &&
       sourceProfile.serverName === destinationProfile.serverName &&
       sourceProfile.databaseName === destinationProfile.databaseName
     ) {
-      throw new Error("Source and destination are identical. Use Backup > Format & Execute in Source when you need to format objects in the same database.");
+      throw new Error("Source and destination are identical. Deployment was not started.");
     }
 
     task = createTaskLog("Deploy", {
@@ -503,9 +686,9 @@ app.post("/api/deploy/run", async (req, res) => {
       sourceProfile,
       destinationProfile,
       selectedObjects: req.body.selectedObjects || [],
-      mode: req.body.mode || "ExecuteDirectly",
+      mode: req.body.mode,
       continueOnError: Boolean(req.body.continueOnError),
-      options: { ...(req.body.options || {}), engine: req.body.engine },
+      options: { ...(req.body.options || {}), engine: req.body.engine || req.body.options?.engine || "Legacy" },
       task,
       logEvent: (level, message, details) => appendTaskEvent(task, level, message, details),
       broadcastProgress: (event, data) => broadcastEvent(event, data),
@@ -516,10 +699,11 @@ app.post("/api/deploy/run", async (req, res) => {
       success: result.results.filter((x) => x.status === "Success").length,
       rolledBack: result.results.filter((x) => x.status === "RolledBack").length,
       failed: result.results.filter((x) => x.status === "Failed").length,
+      reviewRequired: result.results.filter((x) => x.status === "ReviewRequired").length,
       skipped: result.results.filter((x) => x.status === "Skipped").length,
     };
 
-    const overallStatus = summary.failed > 0 ? "Failed" : "Success";
+    const overallStatus = summary.failed > 0 ? "Failed" : summary.reviewRequired > 0 ? "ReviewRequired" : "Success";
 
     appendTaskEvent(task, "INFO", "Deployment task completed", summary);
     finalizeTaskLog(task, overallStatus, summary);
@@ -550,8 +734,19 @@ app.post("/api/deploy/run", async (req, res) => {
   } finally {
     if (task) {
       runningTasks.delete(task.taskId);
+      finishShutdown();
     }
   }
+});
+
+app.post("/api/logs/archive/preview", (req, res) => {
+  try { res.json(previewArchiveCleanup(req.body.olderThanDays)); }
+  catch (error) { httpError(res, error); }
+});
+
+app.post("/api/logs/archive/cleanup", (req, res) => {
+  try { res.json(executeArchiveCleanup(req.body.token, req.body.confirmed)); }
+  catch (error) { httpError(res, error); }
 });
 
 app.get("/api/logs", (req, res) => {
@@ -560,6 +755,7 @@ app.get("/api/logs", (req, res) => {
 
 app.delete("/api/logs", (req, res) => {
   try {
+    if (runningTasks.size) return httpError(res, new Error("Cannot clear logs while a task is running."), 409);
     const result = clearAllLogs();
     res.json(result);
   } catch (error) {
@@ -575,6 +771,35 @@ app.get("/api/tasks/:taskId", (req, res) => {
   res.json(task);
 });
 
+app.post("/api/deploy/migration-prep", async (req, res) => {
+  try {
+    const destinationProfile = requireProfile(req.body.destinationProfileId);
+    const objects = req.body.selectedObjects || [];
+    if (!Array.isArray(objects) || !objects.length || objects.length > 500) {
+      throw new Error("Supply 1 to 500 objects that need a reviewed migration.");
+    }
+    const result = await buildMigrationPrep(destinationProfile, objects, { taskId: req.body.taskId });
+    res.json({ outputPath: result.outputPath, objectCount: result.objectCount,
+      protectedObjectCount: result.protectedObjectCount, executed: false });
+  } catch (error) {
+    httpError(res, error);
+  }
+});
+
+app.post("/api/tasks/:taskId/reconcile", async (req, res) => {  try {
+    const task = getTaskLog(req.params.taskId);
+    if (!task) {
+      return httpError(res, new Error("Task not found."), 404);
+    }
+    const sourceProfile = requireProfile(req.body.sourceProfileId);
+    const destinationProfile = requireProfile(req.body.destinationProfileId);
+    const result = await reconcileObjects(sourceProfile, destinationProfile, task.selectedObjects || []);
+    res.json({ taskId: task.taskId, taskStatus: task.status, ...result });
+  } catch (error) {
+    httpError(res, error);
+  }
+});
+
 app.post("/api/logs/:taskId/open", async (req, res) => {
   try {
     const task = getTaskLog(req.params.taskId);
@@ -583,7 +808,9 @@ app.post("/api/logs/:taskId/open", async (req, res) => {
     }
 
     const logEntry = listLogFiles().find((item) => item.taskId === req.params.taskId);
-    const openCandidates = [logEntry?.textPath, logEntry?.jsonPath].filter((candidate) => candidate && fs.existsSync(candidate));
+    const openCandidates = [logEntry?.textPath, logEntry?.jsonPath]
+      .filter((candidate) => candidate && isContainedIn(candidate, LOG_DIR))
+      .filter((candidate) => fs.existsSync(candidate));
     if (!openCandidates.length) {
       return httpError(res, new Error("Log file path not found."), 404);
     }
@@ -644,8 +871,19 @@ app.get("/api/settings", (req, res) => {
   res.json(getSettings());
 });
 
+function schedulesEnabled() {
+  return getSettings().features.schedules === true;
+}
+
+function assertSchedulesCanBeDisabled(partial) {
+  if (partial?.features?.schedules === false && schedules.readSchedules().length) {
+    throw new Error("Delete saved schedules before turning off Scheduled Deployments so their Windows wake-up tasks are removed.");
+  }
+}
+
 app.put("/api/settings", (req, res) => {
   try {
+    assertSchedulesCanBeDisabled(req.body);
     const updated = saveSettings(req.body || {});
     res.json(updated);
   } catch (error) {
@@ -671,6 +909,7 @@ app.post("/api/factory-reset", (req, res) => {
     if (runningTasks.size > 0) {
       return httpError(res, new Error("Cannot run factory reset while a task is running."), 409);
     }
+    if (schedules.readSchedules().length) throw new Error("Delete saved schedules before factory reset so their Windows wake-up tasks are removed.");
 
     const result = performFactoryReset();
     res.json(result);
@@ -704,7 +943,10 @@ app.post("/api/data-import", (req, res) => {
         errors.push({ label: p.profileLabel || p.id, error: e.message });
       }
     }
-    if (settings && typeof settings === "object") saveSettings(settings);
+    if (settings && typeof settings === "object") {
+      assertSchedulesCanBeDisabled(settings);
+      saveSettings(settings);
+    }
     if (appState && typeof appState === "object") saveAppState(appState);
     res.json({ restored: true, profilesImported: created, errors });
   } catch (error) {
@@ -712,11 +954,61 @@ app.post("/api/data-import", (req, res) => {
   }
 });
 
+app.get("/api/prerequisites/sqlserver", (req, res) => res.json(getSqlServerModuleStatus()));
+app.post("/api/prerequisites/sqlserver/install", async (req, res) => {
+  try { await ensureSqlServerModule(); res.json(getSqlServerModuleStatus()); }
+  catch (error) { httpError(res, error); }
+});
+
+app.get("/api/schedules", (req, res) => {
+  try { res.json({ enabled: schedulesEnabled(), items: schedules.readSchedules(), capabilities: windowsSchedules.capabilities(), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }); }
+  catch (error) { httpError(res, error); }
+});
+
+async function saveReviewedSchedule(req, res) {
+  let record;
+  try {
+    if (!schedulesEnabled()) throw new Error("Scheduled Deployments are turned off. Enable them in Settings first.");
+    const request = schedules.cleanRequest(req.body.request);
+    const reviewed = await buildBatchPlan(await resolveBatchRequest(request));
+    if (reviewed.fingerprint !== request.options.confirmedBatchFingerprint) throw new Error("The scheduled plan changed. Review and confirm it again.");
+    const previous = req.params.id ? schedules.readSchedules().find((item) => item.id === req.params.id) : null;
+    record = schedules.saveSchedule({ ...req.body, request }, req.params.id || null, Date.now(), false);
+    if (record.wakeApplication) await windowsSchedules.updateWindowsTask(record);
+    else if (previous?.wakeApplication) await windowsSchedules.updateWindowsTask(previous, true);
+    res.json(schedules.activateSchedule(record.id, record.updatedAt));
+  } catch (error) {
+    if (record) schedules.pauseSchedule(record.id, error.message);
+    httpError(res, error);
+  }
+}
+app.post("/api/schedules", saveReviewedSchedule);
+app.put("/api/schedules/:id", saveReviewedSchedule);
+app.post("/api/schedules/:id/pause", async (req, res) => {
+  try {
+    const record = schedules.pauseSchedule(req.params.id);
+    if (record.wakeApplication) await windowsSchedules.updateWindowsTask(record, true);
+    res.json(record);
+  } catch (error) { httpError(res, error); }
+});
+app.delete("/api/schedules/:id", async (req, res) => {
+  try {
+    if (req.body.confirmed !== true) throw new Error("Confirm schedule deletion first.");
+    const record = schedules.readSchedules().find((item) => item.id === req.params.id);
+    if (!record) throw new Error("Schedule not found.");
+    if (record.lastStatus === "Running") throw new Error("Wait for the schedule to finish before deleting.");
+    schedules.pauseSchedule(record.id);
+    if (record.wakeApplication) await windowsSchedules.updateWindowsTask(record, true);
+    schedules.deleteSchedule(record.id);
+    res.json({ deleted: true });
+  } catch (error) { httpError(res, error); }
+});
+
 app.get("/api/status", (req, res) => {
   res.json({
     app: "Pebloy",
     version: packageMetadata.version,
-    runningTasks: runningTasks.size,
+    runningTasks: runningTasks.size + (schedulerRunning ? 1 : 0),
     profiles: listProfiles().length,
     port: req.socket.localPort,
   });
@@ -724,17 +1016,66 @@ app.get("/api/status", (req, res) => {
 
 const desiredPort = parseDesiredPort(process.env.PORT);
 
-listenOnAvailablePort(app, desiredPort)
-  .then(({ port }) => {
+const artifactRoot = process.env.ARTIFACTS_DIR || path.resolve(__dirname, "..", "artifacts");
+acquireRuntimeLocks([DATA_DIR, artifactRoot, LOG_DIR, ...["EXPORTS_DIR", "SCRIPTS_DIR", "REPORTS_DIR", "TEMP_DIR", "CODEDIFF_DIR", "LOG_ARCHIVE_DIR"].map((key) => process.env[key]).filter(Boolean)])
+  .then(async (ownership) => {
+    process.env.PEBLOY_RUNTIME_ID = ownership.runtimeId;
+    try {
+      schedules.recoverInterruptedSchedules();
+      return { ...await listenOnAvailablePort(app, desiredPort), ownership };
+    }
+    catch (error) { await ownership.release(); throw error; }
+  })
+  .then(({ server, port, ownership }) => {
+    let httpClosed = false;
+    let exiting = false;
+    const tickSchedules = async () => {
+      if (schedulerRunning || shuttingDown) return;
+      try { if (!schedulesEnabled()) return; }
+      catch (error) { console.error(`Scheduling skipped: ${error.message}`); return; }
+      schedulerRunning = true;
+      try { await schedules.runDueSchedules({ execute: executeBatchWorkflow, isBusy: () => shuttingDown || runningTasks.size > 0 }); }
+      catch (error) { console.error(`Scheduling stopped: ${error.message}`); }
+      finally { schedulerRunning = false; finishShutdown(); }
+    };
+    const schedulerTimer = setInterval(tickSchedules, 15000);
+    schedulerTimer.unref();
+    finishShutdown = () => {
+      if (!shuttingDown || !httpClosed || runningTasks.size || schedulerRunning || exiting) return;
+      exiting = true;
+      try { flushTaskLogs(); }
+      catch (error) { console.error(`Final task log flush failed: ${error.message}`); process.exitCode = 1; }
+      ownership.release().then(() => process.exit(process.exitCode || 0));
+    };
+    const shutdown = () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      clearInterval(schedulerTimer);
+      flushTaskLogs();
+      for (const client of sseClients) client.end();
+      sseClients.clear();
+      server.close(() => { httpClosed = true; finishShutdown(); });
+      server.closeIdleConnections?.();
+    };
+    process.once("SIGTERM", shutdown);
+    process.once("SIGINT", shutdown);
+    if (process.connected) {
+      process.once("disconnect", shutdown);
+      process.on("message", (message) => { if (message === "shutdown") shutdown(); });
+    }
+    process.once("exit", () => {
+      try { flushTaskLogs(); } catch (error) { console.error(`Task log flush failed: ${error.message}`); }
+    });
     writeServerInfo(port);
     const fallbackMessage = port === desiredPort ? "" : ` (requested ${desiredPort}; selected next available port)`;
     console.log(`Pebloy listening on http://${LOOPBACK_HOST}:${port}${fallbackMessage}`);
+    void tickSchedules();
     ensureSqlServerModule()
       .then(() => console.log("SqlServer PowerShell module ready."))
       .catch((err) => console.warn(`SqlServer module setup: ${err.message}`));
   })
   .catch((error) => {
-    console.error(`Pebloy failed to start: ${error.message}`);
+    console.error(`${STARTUP_FAILURE_PREFIX} ${error.message}`);
     if (error.stack) console.error(error.stack);
     process.exit(1);
   });

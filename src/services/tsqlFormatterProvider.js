@@ -1,30 +1,14 @@
 const poorSql = require("poor-mans-t-sql-formatter");
+const { splitGoBatches } = require("./sqlBatchService");
+const GO_LINE_PATTERN = /^[ \t]*GO(?:[ \t]+\d+)?[ \t]*;?[ \t]*$/i;
 
 const { DEFAULT_INTERACTIVE_FORMATTER_OPTIONS } = require("./formatterOptions");
 
 // GO is a batch separator understood by clients, not by the SQL parser.
 // Batches are formatted independently and GO lines (incl. "GO 5") preserved.
-const GO_LINE_PATTERN = /^[ \t]*GO(?:[ \t]+\d+)?[ \t]*;?[ \t]*$/i;
 
 function detectEol(text) {
   return text.includes("\r\n") ? "\r\n" : "\n";
-}
-
-function splitGoBatches(text) {
-  const lines = String(text).split(/\r?\n/);
-  const batches = [];
-  let current = [];
-
-  for (const line of lines) {
-    if (GO_LINE_PATTERN.test(line)) {
-      batches.push({ sql: current.join("\n"), separator: line.trim() });
-      current = [];
-    } else {
-      current.push(line);
-    }
-  }
-  batches.push({ sql: current.join("\n"), separator: null });
-  return batches;
 }
 
 function analyzeInput(text) {

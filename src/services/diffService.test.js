@@ -23,7 +23,7 @@ jest.mock("fs", () => ({
 const fs = require("fs");
 const { generateScriptsForProfile } = require("./scriptGenerationService");
 const { compareGeneratedArtifacts } = require("./dacfxService");
-const { compareObjects, exportReport } = require("./diffService");
+const { compareObjects, compareInWorker, exportReport, formatMarkdownReport } = require("./diffService");
 
 function makeGeneratedInfo(scripts) {
   return {
@@ -36,6 +36,26 @@ function makeGeneratedInfo(scripts) {
 
 describe("compareObjects", () => {
   beforeEach(() => jest.clearAllMocks());
+
+  it("exports standalone highlighted SQL safely and includes changes in clipboard Markdown", () => {
+    const report = { summary: { added: 0, missing: 0, changed: 1, unchanged: 0 }, details: [{
+      objectType: "VIEW", schemaName: "dbo", objectName: "<script>bad</script>", status: "Changed",
+      lineDiff: [{ status: "modified", leftLineNumber: 1, rightLineNumber: 1, leftText: "SELECT '<script>x</script>'", rightText: "SELECT 'new'" }],
+    }] };
+    exportReport("html-highlighted", report);
+    const html = require("./loggingService").writeReportArtifact.mock.calls[0][2];
+    expect(html).toContain("hljs-keyword");
+    expect(html).toContain("&lt;script&gt;");
+    expect(html).not.toContain("<script>");
+    expect(html).not.toContain("src=\"http");
+    expect(formatMarkdownReport(report)).toContain("- SELECT 'new'\n+ SELECT '<script>x</script>'");
+    expect(html).toContain("Target (current)");
+  });
+
+  it("rejects selections beyond the worker input budget", async () => {
+    const source = new Map([["VIEW|dbo|Large", { definition: "x".repeat(32 * 1024 * 1024 + 1) }]]);
+    await expect(compareInWorker(source, new Map())).rejects.toThrow("exceeds 32 MB");
+  });
 
   it("reports Added when object exists in source but not destination", async () => {
     generateScriptsForProfile
@@ -114,6 +134,49 @@ describe("compareObjects", () => {
     await expect(compareObjects({}, {}, [], { engine: "Legacy" })).rejects.toThrow("Select at least one object before running CodeDiff.");
   });
 
+  it("detects whitespace changes inside SQL string literals", async () => {
+    const object = { objectType: "VIEW", schemaName: "dbo", objectName: "Labels" };
+    generateScriptsForProfile
+      .mockResolvedValueOnce(makeGeneratedInfo([{ ...object, definitionText: "CREATE VIEW dbo.Labels AS SELECT N'A  B' AS label" }]))
+      .mockResolvedValueOnce(makeGeneratedInfo([{ ...object, definitionText: "CREATE VIEW dbo.Labels AS SELECT N'A B' AS label" }]));
+    const result = await compareObjects({}, {}, [object], { engine: "Legacy" });
+    expect(result.summary.changed).toBe(1);
+  });
+
+  it("aligns a realistic procedure change and marks the exact changed words", async () => {
+    const object = { objectType: "PROCEDURE", schemaName: "Sales", objectName: "GetOrders" };
+    const source = [
+      "CREATE PROCEDURE Sales.GetOrders @CustomerId int",
+      "AS",
+      "SELECT o.OrderId, o.Total",
+      "FROM Sales.Orders AS o",
+      "WHERE o.CustomerId = @CustomerId;",
+    ].join("\r\n");
+    const target = [
+      "CREATE PROCEDURE Sales.GetOrders @CustomerId int",
+      "AS",
+      "SELECT o.OrderId, o.Total, o.Status",
+      "FROM Sales.Orders AS o",
+      "WHERE o.CustomerId = @CustomerId",
+      "  AND o.IsDeleted = 0;",
+    ].join("\r\n");
+    generateScriptsForProfile
+      .mockResolvedValueOnce(makeGeneratedInfo([{ ...object, definitionText: source }]))
+      .mockResolvedValueOnce(makeGeneratedInfo([{ ...object, definitionText: target }]));
+
+    const [detail] = (await compareObjects({}, {}, [object], { engine: "Legacy" })).details;
+    expect(detail.status).toBe("Changed");
+    expect(detail.lineDiff.map((row) => row.status)).toEqual(["unchanged", "unchanged", "modified", "unchanged", "modified", "added"]);
+    const select = detail.lineDiff[2];
+    expect(select).toMatchObject({ leftLineNumber: 3, rightLineNumber: 3 });
+    expect(select.rightChanges.map(([start, end]) => select.rightText.slice(start, end)).join("")).toBe(", o.Status");
+    expect(select.leftChanges).toEqual([]);
+    const where = detail.lineDiff[4];
+    expect(where.leftChanges.map(([start, end]) => where.leftText.slice(start, end))).toEqual([";"]);
+    expect(where.rightChanges).toEqual([]);
+    expect(detail.lineDiff[5]).toMatchObject({ leftLineNumber: null, rightLineNumber: 6, rightText: "  AND o.IsDeleted = 0;" });
+  });
+
   it("batches the full selected object list once per database", async () => {
     const selectedObjects = [
       { objectType: "TABLE", schemaName: "dbo", objectName: "Users" },
@@ -170,7 +233,9 @@ describe("compareObjects", () => {
       destinationProfile: { serverName: "dst", databaseName: "dstDb" },
     });
     expect(result.engine).toBe("DacFx");
-    expect(result.summary.unchanged).toBe(1);
+    expect(result.summary.changed).toBe(1);
+    expect(result.details[0].semanticOperation).toBe("TextChange");
+    expect(result.details[0].lineDiff.length).toBeGreaterThan(0);
   });
 
   it("skips DacFx semantic compare for non-table selections and returns textual diff immediately", async () => {

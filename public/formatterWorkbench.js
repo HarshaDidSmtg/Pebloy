@@ -65,13 +65,7 @@
 
         globalScope.MonacoEnvironment = {
           getWorkerUrl() {
-            const baseUrl = `${globalScope.location.origin}/vendor/monaco/`;
-            const workerMainUrl = `${baseUrl}vs/base/worker/workerMain.js`;
-            const script = [
-              `self.MonacoEnvironment = { baseUrl: ${JSON.stringify(baseUrl)} };`,
-              `importScripts(${JSON.stringify(workerMainUrl)});`,
-            ].join(" ");
-            return `data:text/javascript;charset=utf-8,${encodeURIComponent(script)}`;
+            return "/monacoWorker.js";
           },
         };
 
@@ -197,13 +191,18 @@
     const border = normalizeColor(styles.getPropertyValue("--border"), "#3c3c3c");
     const lineHighlight = normalizeColor(styles.getPropertyValue("--surface-2"), "#2d2d2d");
     const selection = normalizeColor(styles.getPropertyValue("--accent-soft"), "#264f78");
+    const editorTheme = globalThis.PebloyThemes?.find((theme) => theme.id === document.body.dataset.theme)?.editor;
 
     monaco.editor.defineTheme("pebloy-dynamic", {
       base: isLightTheme() ? "vs" : "vs-dark",
-      inherit: true,
-      rules: [
-        { token: "keyword", foreground: accent.replace(/^#/, "") },
-        { token: "number", foreground: normalizeColor(styles.getPropertyValue("--warning-ink"), accent).replace(/^#/, "") },
+      inherit: editorTheme?.inherit ?? true,
+      rules: editorTheme?.rules || [
+        { token: "keyword.sql", foreground: accent.slice(1) },
+        { token: "number.sql", foreground: normalizeColor(styles.getPropertyValue("--warning-ink"), accent).slice(1) },
+        { token: "string.sql", foreground: normalizeColor(styles.getPropertyValue("--success-ink"), foreground).slice(1) },
+        { token: "comment.sql", foreground: muted.slice(1) },
+        { token: "operator.sql", foreground: foreground.slice(1) },
+        { token: "predefined.sql", foreground: normalizeColor(styles.getPropertyValue("--info-ink"), foreground).slice(1) },
       ],
       colors: {
         "editor.background": background,
@@ -220,6 +219,7 @@
         "editorBracketMatch.border": accent,
         "editorWidget.background": normalizeColor(styles.getPropertyValue("--surface-2"), background),
         "editorWidget.border": border,
+        ...editorTheme?.colors,
       },
     });
     monaco.editor.setTheme("pebloy-dynamic");
@@ -257,6 +257,7 @@
       filePath: "",
       fileToken: "",
       originalText: "",
+      savedText: "",
       progressTimer: null,
     };
 
@@ -382,7 +383,7 @@
 
     function applyEditorOptions() {
       createMonacoTheme(monaco);
-      const fontSize = Math.max(12, Math.round(parseFloat(getComputedStyle(document.body).fontSize || "14") - 1));
+      const fontSize = Math.max(12, Math.round(parseFloat(getComputedStyle(document.documentElement).fontSize || "14") - 1));
       const lineNumbers = state.editor.lineNumbers ? "on" : "off";
       const wrap = state.editor.wordWrap ? "on" : "off";
       const common = {
@@ -461,6 +462,8 @@
     }
 
     function loadTextIntoEditor(text, file = {}) {
+      if (currentText() !== session.savedText && !window.confirm("Discard unsaved SQL changes?")) return;
+      session.savedText = text;
       setModelText(monaco, mainModel, text);
       setModelText(monaco, originalModel, text);
       session.originalText = text;
@@ -476,6 +479,8 @@
     }
 
     function clearEditor() {
+      if (currentText() !== session.savedText && !window.confirm("Discard unsaved SQL changes?")) return false;
+      session.savedText = "";
       session.fileName = "";
       session.filePath = "";
       session.fileToken = "";
@@ -484,6 +489,7 @@
       setModelText(monaco, originalModel, "");
       resetBusy();
       updateEditorMode();
+      return true;
     }
 
     async function openViaDialog() {
@@ -519,6 +525,7 @@
           filters: FILE_FILTERS,
         });
         if (saved) {
+          session.savedText = text;
           session.fileName = saved.fileName || suggestedName;
           session.filePath = saved.filePath || "";
           session.fileToken = saved.fileToken || "";
@@ -529,6 +536,7 @@
       }
 
       context.downloadTextFile(suggestedName, text, "text/x-sql");
+      session.savedText = text;
       context.showToast(`Saved ${suggestedName}`);
     }
 
@@ -552,6 +560,7 @@
         fileToken: session.fileToken,
         content: text,
       });
+      session.savedText = text;
       session.fileName = saved.fileName || session.fileName;
       session.filePath = saved.filePath || session.filePath;
       session.fileToken = saved.fileToken || session.fileToken;
@@ -820,7 +829,7 @@
       );
     });
     document.getElementById("formatterClearBtn").addEventListener("click", () => {
-      clearEditor();
+      if (!clearEditor()) return;
       updateStatus("Interactive formatter is ready. All processing stays local to Pebloy.");
       context.showToast("Formatter cleared");
     });
@@ -875,6 +884,12 @@
       updateMetrics();
     });
 
+    window.addEventListener("beforeunload", (event) => {
+      if (currentText() === session.savedText) return;
+      event.preventDefault();
+      event.returnValue = "";
+    });
+
     attachFileDrop();
     setSidebarWidth(state.layout.sidebarWidth);
     renderOptions();
@@ -904,6 +919,7 @@
       applyEditorOptions();
     });
     themeObserver.observe(document.body, { attributes: true, attributeFilter: ["data-theme", "style"] });
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["style"] });
 
     const resizeObserver = new ResizeObserver(() => {
       editor.layout();

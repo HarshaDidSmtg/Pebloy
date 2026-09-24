@@ -2,6 +2,10 @@ function uniqueSteps(steps = []) {
   return [...new Set((Array.isArray(steps) ? steps : []).filter(Boolean))];
 }
 
+function requiresManualReview(value) {
+  return /Table delta requires manual review|Type has dependencies\. Use an explicitly reviewed|Target object has explicit permissions, ownership, or signatures|DROP\/CREATE requires VIEW DEFINITION|Signed module requires a reviewed|Module replacement requires VIEW DEFINITION/i.test(String(value?.message || value || ""));
+}
+
 function buildClientError(error, fallbackStatus = 400) {
   const message = String(error?.message || error || "Request failed.").trim() || "Request failed.";
   const lower = message.toLowerCase();
@@ -24,7 +28,12 @@ function buildClientError(error, fallbackStatus = 400) {
     status = 500;
   }
 
-  if (isTimeout) {
+  if (requiresManualReview(error)) {
+    status = 409;
+    resolutionSteps = ["Review the generated artifact and target dependencies/permissions with the database owner.", "Prepare an explicit metadata-preserving migration before retrying. Pebloy does not bypass this guard."];
+  } else if (/outcome is uncertain|outcome is unknown/i.test(message)) {
+    resolutionSteps = ["Inspect the target database and task log before retrying; execution may have completed.", "Reconcile successful objects before starting another deployment."];
+  } else if (isTimeout) {
     resolutionSteps = [
       "Verify the SQL Server host is reachable from this machine.",
       "Check firewall, VPN, instance name, and TCP port settings.",
@@ -99,9 +108,11 @@ function buildClientError(error, fallbackStatus = 400) {
     status,
     error: message,
     resolutionSteps: uniqueSteps(resolutionSteps),
+    ...(requiresManualReview(error) ? { outcome: "ReviewRequired" } : {}),
   };
 }
 
 module.exports = {
   buildClientError,
+  requiresManualReview,
 };

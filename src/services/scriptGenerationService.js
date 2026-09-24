@@ -1,6 +1,6 @@
 const fs = require("fs");
 const { CODEDIFF_DIR } = require("./paths");
-const { formatGeneratedSql } = require("./formatterService");
+const { formatGeneratedSqlAsync } = require("./formatterService");
 const { writeSqlFileSync } = require("./sqlFileEncoding");
 const {
   generateObjectScripts,
@@ -253,12 +253,23 @@ function buildCombinedStoredProcedureText(scripts = []) {
   const parts = [];
   for (const script of scripts) {
     const sqlText = toWindowsLineEndings(
-      normalizeExecutableSql(readScriptText(script), "PROCEDURE", {}, { strategy: "createOrAlter" })
+      normalizeExecutableSql(readScriptText(script), "PROCEDURE", { schemaName: script.schemaName, objectName: script.objectName }, {
+        strategy: "createOrAlter",
+        moduleMetadata: script.moduleMetadata || null,
+      })
     ).trim();
     if (!sqlText) continue;
     parts.push(sqlText, "GO");
   }
   return parts.join("\r\n\r\n").trim();
+}
+
+function refreshCombinedProcedureScript(scripts, combinedStoredProceduresPath) {
+  if (!combinedStoredProceduresPath) return;
+  const combinedText = buildCombinedStoredProcedureText(
+    scripts.filter((item) => String(item.objectType || "").toUpperCase() === "PROCEDURE")
+  );
+  if (combinedText) writeSqlFileSync(combinedStoredProceduresPath, combinedText);
 }
 
 async function syncProgrammableScriptsWithExactDefinitions({ profile, scripts = [], combinedStoredProceduresPath = null }) {
@@ -271,6 +282,7 @@ async function syncProgrammableScriptsWithExactDefinitions({ profile, scripts = 
   try {
     definitions = await fetchObjectDefinitionMap(profile, programmableScripts);
   } catch (error) {
+    refreshCombinedProcedureScript(scripts, combinedStoredProceduresPath);
     return {
       exactDefinitionsApplied: 0,
       exactDefinitionWarning: error.message || String(error),
@@ -336,14 +348,7 @@ async function syncProgrammableScriptsWithExactDefinitions({ profile, scripts = 
     exactDefinitionsApplied += 1;
   }
 
-  if (combinedStoredProceduresPath) {
-    const combinedText = buildCombinedStoredProcedureText(
-      (scripts || []).filter((item) => String(item.objectType || "").toUpperCase() === "PROCEDURE")
-    );
-    if (combinedText) {
-      writeSqlFileSync(combinedStoredProceduresPath, combinedText);
-    }
-  }
+  refreshCombinedProcedureScript(scripts, combinedStoredProceduresPath);
 
   return { exactDefinitionsApplied, exactDefinitionWarning: null, generationWarnings };
 }
@@ -362,19 +367,19 @@ function normalizeSelectedObjects(selectedObjects = []) {
 // Runs AFTER canonical validation so validation always sees raw generator
 // output; the formatter preserves semantics and falls back to the original
 // text for any batch it cannot parse.
-function maybeFormatGeneratedScripts(scripts, combinedStoredProceduresPath) {
-  let enabled = false;
+async function maybeFormatGeneratedScripts(scripts, combinedStoredProceduresPath, forceFormatting = false) {
+  let enabled = forceFormatting;
   try {
-    enabled = Boolean(require("./settingsService").getSettings()?.formatting?.formatGeneratedSql);
+    enabled ||= Boolean(require("./settingsService").getSettings()?.formatting?.formatGeneratedSql);
   } catch (_e) {
-    enabled = false;
+    if (forceFormatting) throw _e;
   }
   if (!enabled) return false;
 
   for (const script of scripts || []) {
     if (!script.scriptPath || !fs.existsSync(script.scriptPath)) continue;
     const original = script.definitionText || fs.readFileSync(script.scriptPath, "utf8");
-    const formatted = formatGeneratedSql(original);
+    const formatted = await formatGeneratedSqlAsync(original);
     if (formatted !== original) {
       writeSqlFileSync(script.scriptPath, formatted);
       script.definitionText = formatted;
@@ -383,7 +388,7 @@ function maybeFormatGeneratedScripts(scripts, combinedStoredProceduresPath) {
 
   if (combinedStoredProceduresPath && fs.existsSync(combinedStoredProceduresPath)) {
     const original = fs.readFileSync(combinedStoredProceduresPath, "utf8");
-    const formatted = formatGeneratedSql(original);
+    const formatted = await formatGeneratedSqlAsync(original);
     if (formatted !== original) {
       writeSqlFileSync(combinedStoredProceduresPath, formatted);
     }
@@ -406,10 +411,17 @@ function buildMissingScriptWarnings(requestedObjects, scripts) {
     ));
 }
 
-async function generateScriptsForProfile({ taskId, profile, selectedObjects, outputBasePath, appTaskMode = "backup" }) {
+async function generateScriptsForProfile({ taskId, profile, selectedObjects, outputBasePath, appTaskMode = "backup", forceFormatting = false }) {
   const cleanObjects = normalizeSelectedObjects(selectedObjects);
   if (!cleanObjects.length) {
     throw new Error("No valid objects supplied.");
+  }
+
+  if (profile?.kind === "Folder") {
+    if (forceFormatting) throw new Error("Format & Execute in Source requires a live database, not a folder.");
+    const result = await require("./folderSourceService").materializeFolderSource({ profile, selectedObjects: cleanObjects, outputBasePath, taskId });
+    result.formattingApplied = await maybeFormatGeneratedScripts(result.scripts, result.combinedStoredProceduresPath);
+    return result;
   }
 
   const generated = await generateObjectScripts({
@@ -421,6 +433,9 @@ async function generateScriptsForProfile({ taskId, profile, selectedObjects, out
   });
 
   const scripts = listGeneratedObjectScripts(generated.runRoot, generated.latestBuildPathFile);
+  const selectionOrder = new Map(cleanObjects.map((item, index) => [objectKey(item), index]));
+  scripts.sort((left, right) => (selectionOrder.get(objectKey(left)) ?? Number.MAX_SAFE_INTEGER) -
+    (selectionOrder.get(objectKey(right)) ?? Number.MAX_SAFE_INTEGER));
   const hasProcedures = cleanObjects.some((item) => item.objectType === "PROCEDURE");
   // Only trust the combined SP file this run produced — the run folder is
   // shared per day, and an older run's file may hold stale definitions.
@@ -433,7 +448,7 @@ async function generateScriptsForProfile({ taskId, profile, selectedObjects, out
     combinedStoredProceduresPath,
   });
   validateCanonicalSourceArtifacts(scripts);
-  const formattingApplied = maybeFormatGeneratedScripts(scripts, combinedStoredProceduresPath);
+  const formattingApplied = await maybeFormatGeneratedScripts(scripts, combinedStoredProceduresPath, forceFormatting);
 
   const generationWarnings = [
     ...(definitionSync.generationWarnings || []),

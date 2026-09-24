@@ -5,6 +5,8 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("electronAPI", {
   pickFolder: (options = {}) => ipcRenderer.invoke("system:pickFolder", options),
   pickFile: (options = {}) => ipcRenderer.invoke("system:pickFile", options),
+  saveFile: (options = {}) => ipcRenderer.invoke("formatter:saveAs", options),
+  overwriteFile: (options = {}) => ipcRenderer.invoke("formatter:overwrite", options),
   getVersion: () => ipcRenderer.invoke("app:getVersion"),
   checkForUpdates: () => ipcRenderer.invoke("updater:check"),
   downloadAndInstall: (url) => ipcRenderer.invoke("updater:download-and-install", url),

@@ -21,10 +21,14 @@ Repository: [HarshaDidSmtg/Pebloy](https://github.com/HarshaDidSmtg/Pebloy)
 | **Offline SQL Formatter** | Monaco-based T-SQL formatter workbench with local open/save/save-as, drag/drop, search/replace, compare mode, inline diff, and persisted interactive-only formatter preferences. |
 | **Native Picker Flow** | Folder browse actions and object-list file selection use the same native dialog flow when running in Electron, with backend picker fallbacks available. |
 | **Persistent App State** | Default paths, theme, font, working object inputs, and formatter UI/options are stored in `data/app-state.json` so they survive app restarts. |
+| **SQL Folder Sources** | Explicitly load a single database's per-object scripts for Backup, Code Diff, or guarded non-table deployment. Original files are not modified; table deployment still requires a live source for delta generation. |
+| **Multi-Target Deploy** | Review up to 20 target databases together, execute sequentially, and inspect separate target results and logs. Earlier targets may remain committed if a later target fails. |
+| **Schedules** | Optional; turn on **Scheduled Deployments** in Settings > Behavior. Reviewed once/daily/weekly jobs with optional signed-in-user Windows wake-up, fresh plan checks, and pause-on-failure recovery. See [scheduling requirements](INSTALLATION.md#local-schedules). |
+| **Code Diff Viewer** | GitHub/Beyond Compare-style review: split or unified view, word-level change highlighting, SQL syntax colors, expandable unchanged context, previous/next change navigation (Alt+Up/Down), a change overview strip, and object filtering. Reads target (current) → source (incoming), so + lines are what a deployment would introduce. |
 | **Factory Reset** | Clears saved profiles, preferences, logs, exports, reports, and temp artifacts so the project can be shared cleanly. |
 | **Dependency Ordering** | UDTs → Sequences → Tables → Views → Functions → Procedures → Synonyms → Triggers. |
 | **Audit Logging** | Every task produces a `.log` (human-readable) and `.json` (structured) file in `artifacts/logs/`, and the Logs tab opens the preferred text log directly. |
-| **Themes** | Light, Azure, Dark, Spider-Man, Batman. The active selection persists per machine in file-backed app state. |
+| **Themes** | Light, Dark, Porcelain, Batman, Sepia, Spider-Man, and Monochrome. New profiles follow the system appearance; explicit choices remain saved. Legacy selections resolve to their replacement palettes. |
 
 ---
 
@@ -118,7 +122,7 @@ pebloy/
 │       ├── formatterOptions.js         # Interactive formatter option normalization + capabilities
 │       ├── formatterService.js         # Shared generated-SQL formatting + interactive worker entry point
 │       ├── formatterWorker.js          # Local worker-thread formatter execution
-│       ├── settingsService.js          # Folder-name + deployment-order settings
+│       ├── settingsService.js          # Folder, formatting, time, execution settings
 │       ├── factoryResetService.js      # Runtime data/artifact reset
 │       ├── loggingService.js           # Per-task audit logs
 │       ├── systemService.js            # Folder picker / file open

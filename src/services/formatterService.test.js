@@ -1,6 +1,7 @@
 const {
   DEFAULT_INTERACTIVE_FORMATTER_OPTIONS,
   formatGeneratedSql,
+  formatGeneratedSqlAsync,
   formatInteractiveSql,
   formatSql,
   formatSqlAsync,
@@ -296,6 +297,14 @@ describe("formatInteractiveSql", () => {
 });
 
 describe("formatGeneratedSql", () => {
+  it("produces equivalent output through the bounded generated-script worker", async () => {
+    const sql = "SELECT N'A  B' AS text;\r\nGO\r\nSELECT 2;\r\n";
+    expect(await formatGeneratedSqlAsync(sql)).toBe(formatGeneratedSql(sql));
+  });
+
+  it("rejects generated scripts beyond the input budget", async () => {
+    await expect(formatGeneratedSqlAsync(" ".repeat(20 * 1024 * 1024 + 1))).rejects.toThrow("exceeds 20 MB");
+  });
   it("uses persisted formatter options for generated scripts", () => {
     getAppState.mockReturnValueOnce({
       ui: {

@@ -72,6 +72,11 @@ function performFactoryReset() {
   for (const filePath of DELETE_FILES) {
     deletedFiles += deleteFile(filePath);
   }
+  for (const name of fs.readdirSync(DATA_DIR)) {
+    if (/^(settings|app-state)\.json(?:\.last-good|\.[a-f0-9-]+\.corrupt)$/.test(name)) {
+      deletedFiles += deleteFile(path.join(DATA_DIR, name));
+    }
+  }
 
   for (const dirPath of CLEAR_DIRS) {
     clearedEntries += clearDirContents(dirPath);

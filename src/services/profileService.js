@@ -46,27 +46,47 @@ function getProfileWithSecret(profileId) {
   }
 
   let password = null;
-  if (profile.authenticationType === "Sql" && profile.secretReference) {
-    const secrets = readJson(SECRET_FILE, {});
-    const cipher = secrets[profile.secretReference];
-    if (cipher) {
-      try {
-        password = decryptPassword(cipher);
-      } catch (_err) {
-        password = null;
+  let secretError = null;
+  if (profile.authenticationType === "Sql") {
+    const missingPasswordMessage = `No stored password found for profile "${profile.profileLabel}". Re-enter and save the password.`;
+
+    if (!profile.secretReference) {
+      // Exporting/importing a profile carries the reference but never the secret itself.
+      secretError = missingPasswordMessage;
+    } else {
+      const secrets = readJson(SECRET_FILE, {});
+      const cipher = secrets[profile.secretReference];
+      if (!cipher) {
+        secretError = missingPasswordMessage;
+      } else {
+        try {
+          password = decryptPassword(cipher);
+        } catch (err) {
+          // DPAPI is scoped to the current Windows user and machine, so a copied or
+          // migrated secrets.json decrypts to nothing rather than the wrong password.
+          secretError = `Stored password for profile "${profile.profileLabel}" could not be decrypted (${err.message}). Re-enter and save the password.`;
+        }
       }
+    }
+
+    if (secretError) {
+      console.warn(`[profileService] ${secretError}`);
     }
   }
 
   return {
     ...profile,
     password,
+    secretError,
   };
 }
 
 function validate(payload, existingId = null) {
   const profiles = readJson(PROFILE_FILE, []);
   const authenticationType = normalizeAuthenticationType(payload.authenticationType);
+  if (payload.groupName != null && (typeof payload.groupName !== "string" || payload.groupName.trim().length > 80 || /[\r\n\t]/.test(payload.groupName))) {
+    throw new Error("Connection group must be text of at most 80 characters without line breaks or tabs.");
+  }
 
   if (!payload.profileLabel || !payload.serverName || !payload.databaseName || !authenticationType) {
     throw new Error("ProfileLabel, ServerName, DatabaseName, and AuthenticationType are required.");
@@ -113,6 +133,7 @@ function createProfile(payload) {
     username: authenticationType === "Sql" ? payload.username?.trim() || null : null,
     secretReference,
     environmentTag: payload.environmentTag?.trim() || null,
+    groupName: payload.groupName?.trim() || null,
     createdAt: now,
     updatedAt: now,
   };
@@ -138,17 +159,11 @@ function updateProfile(profileId, payload) {
   let secretReference = current.secretReference;
 
   if (authenticationType === "Windows") {
-    if (secretReference && secrets[secretReference]) {
-      delete secrets[secretReference];
-    }
     secretReference = null;
   }
 
-  if (authenticationType === "Sql" && !secretReference) {
-    secretReference = randomUUID();
-  }
-
   if (authenticationType === "Sql" && payload.password) {
+    secretReference = randomUUID();
     secrets[secretReference] = encryptPassword(payload.password);
   }
 
@@ -161,6 +176,7 @@ function updateProfile(profileId, payload) {
     username: authenticationType === "Sql" ? payload.username?.trim() || null : null,
     secretReference,
     environmentTag: payload.environmentTag?.trim() || null,
+    groupName: payload.groupName === undefined ? current.groupName || null : payload.groupName?.trim() || null,
     updatedAt: new Date().toISOString(),
   };
 
@@ -169,6 +185,11 @@ function updateProfile(profileId, payload) {
   writeJson(SECRET_FILE, secrets);
   profiles[index] = updated;
   writeJson(PROFILE_FILE, profiles);
+  if (current.secretReference && current.secretReference !== secretReference) {
+    delete secrets[current.secretReference];
+    try { writeJson(SECRET_FILE, secrets); }
+    catch (_error) { console.warn("[profileService] Profile saved; obsolete encrypted credential cleanup will need to be retried."); }
+  }
   return updated;
 }
 
